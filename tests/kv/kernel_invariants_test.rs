@@ -59,7 +59,7 @@ fn durable_format_descriptor_requires_version_checksum_and_recovery() {
     let descriptor = DurableFormatDescriptor {
         structure: "sstable",
         format_version: 1,
-        checksum: "crc32c",
+        checksum: "crc32c".into(),
         forward_compatible: true,
         independently_recoverable: true,
     };
@@ -86,7 +86,7 @@ fn kernel_validator_accepts_manifest_tracked_artifacts() {
         format: DurableFormatDescriptor {
             structure: "wal_segment",
             format_version: 1,
-            checksum: "record_crc32",
+            checksum: "record_crc32".into(),
             forward_compatible: true,
             independently_recoverable: true,
         },

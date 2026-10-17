@@ -2,6 +2,7 @@ use crate::kernel::{
     DurableFormatDescriptor, EngineCapability, PhysicalEngine, PhysicalEngineKind,
     StorageOperationMetrics,
 };
+use std::borrow::Cow;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SpecializedEngineContract {
@@ -23,7 +24,7 @@ impl SpecializedEngineContract {
             format: DurableFormatDescriptor {
                 structure,
                 format_version: 1,
-                checksum: "crc32c",
+                checksum: Cow::Borrowed("crc32c"),
                 forward_compatible: true,
                 independently_recoverable: true,
             },
