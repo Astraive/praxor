@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "trace_sha256": "e7e1a1ea32ee44d491b60930dcec3e6c622d10b929757b39dd3ae6313a1ad55e",
+  "scope": "Linux syscalls inside BEGIN/END markers; untimed; not device flushes",
+  "cases": [
+    {
+      "id": "candidate-r0-cf1-ops1",
+      "label": "candidate",
+      "source_revision": "f3ae6c47c6a5ffde7cdd2861717f0c0256cd463f",
+      "active_cfs": 1,
+      "batch_ops": 1,
+      "batches": 4,
+      "observed_syscalls": {
+        "fdatasync.wal_file.success": 4
+      }
+    },
+    {
+      "id": "candidate-r0-cf1-ops16",
+      "label": "candidate",
+      "source_revision": "f3ae6c47c6a5ffde7cdd2861717f0c0256cd463f",
+      "active_cfs": 1,
+      "batch_ops": 16,
+      "batches": 4,
+      "observed_syscalls": {
+        "fdatasync.wal_file.success": 4
+      }
+    },
+    {
+      "id": "candidate-r0-cf1-ops256",
+      "label": "candidate",
+      "source_revision": "f3ae6c47c6a5ffde7cdd2861717f0c0256cd463f",
+      "active_cfs": 1,
+      "batch_ops": 256,
+      "batches": 4,
+      "observed_syscalls": {
+        "fdatasync.wal_file.success": 4
+      }
+    },
+    {
+      "id": "candidate-r0-cf16-ops1",
+      "label": "candidate",
+      "source_revision": "f3ae6c47c6a5ffde7cdd2861717f0c0256cd463f",
+      "active_cfs": 16,
+      "batch_ops": 1,
+      "batches": 4,
+      "observed_syscalls": {
+        "fdatasync.wal_file.success": 4
+      }
+    },
+    {
+      "id": "candidate-r0-cf16-ops16",
+      "label": "candidate",
+      "source_revision": "f3ae6c47c6a5ffde7cdd2861717f0c0256cd463f",
+      "active_cfs": 16,
+      "batch_ops": 16,
+      "batches": 4,
+      "observed_syscalls": {
+        "fdatasync.wal_file.success": 4
+      }
+    },
+    {
+      "id": "candidate-r0-cf16-ops256",
+      "label": "candidate",
+      "source_revision": "f3ae6c47c6a5ffde7cdd2861717f0c0256cd463f",
+      "active_cfs": 16,
+      "batch_ops": 256,
+      "batches": 4,
+      "observed_syscalls": {
+        "fdatasync.wal_file.success": 4
+      }
+    },
+    {
+      "id": "candidate-r0-cf256-ops1",
+      "label": "candidate",
+      "source_revision": "f3ae6c47c6a5ffde7cdd2861717f0c0256cd463f",
+      "active_cfs": 256,
+      "batch_ops": 1,
+      "batches": 4,
+      "observed_syscalls": {
+        "fdatasync.wal_file.success": 4
+      }
+    },
+    {
+      "id": "candidate-r0-cf256-ops16",
+      "label": "candidate",
+      "source_revision": "f3ae6c47c6a5ffde7cdd2861717f0c0256cd463f",
+      "active_cfs": 256,
+      "batch_ops": 16,
+      "batches": 4,
+      "observed_syscalls": {
+        "fdatasync.wal_file.success": 4
+      }
+    },
+    {
+      "id": "candidate-r0-cf256-ops256",
+      "label": "candidate",
+      "source_revision": "f3ae6c47c6a5ffde7cdd2861717f0c0256cd463f",
+      "active_cfs": 256,
+      "batch_ops": 256,
+      "batches": 4,
+      "observed_syscalls": {
+        "fdatasync.wal_file.success": 4
+      }
+    }
+  ]
+}

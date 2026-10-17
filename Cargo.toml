@@ -36,6 +36,16 @@ name = "engine_write_path"
 path = "benches/durability/write_path_bench.rs"
 harness = false
 
+[[bench]]
+name = "write_amplification_matrix"
+path = "benches/durability/write_amplification_matrix.rs"
+harness = false
+
+[[bench]]
+name = "write_amplification_allocations"
+path = "benches/durability/write_amplification_allocations.rs"
+harness = false
+
 [features]
 default = ["cpu"]
 cpu = []
