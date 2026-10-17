@@ -1,0 +1,9 @@
+{
+  "collection":"users",
+  "operators":[
+    {"FilterExpression":{"Predicate":{"attribute":"age","operator":">=","value":"18"}}},
+    {"Order":{"attribute":"age","descending":true}},
+    {"Offset":1},
+    {"Limit":2}
+  ]
+}

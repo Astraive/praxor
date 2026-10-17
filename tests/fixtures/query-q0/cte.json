@@ -1,0 +1,14 @@
+{
+  "name":"adults",
+  "query":{
+    "language":"Sql","operation":"Select","collection":"users",
+    "filter":{"attribute":"age","operator":">=","value":"18"},
+    "filter_expression":{"Predicate":{"attribute":"age","operator":">=","value":"18"}},
+    "joins":[],"full_text":null,"vector":null,"traversal":null,"rank_by":null,
+    "order_by":{"attribute":"age","descending":true},"limit":2,"offset":1,
+    "distinct":false,"group_by":null,"having":null,"as_of":null,"mutation":null,
+    "ddl":null,"explain_analyze":false,"ctes":[],"window_functions":[],
+    "params":{"positional":[],"named":{}}
+  },
+  "recursive":false
+}
