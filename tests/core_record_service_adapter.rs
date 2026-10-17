@@ -162,6 +162,7 @@ fn construction_and_static_capability_checks_do_not_touch_the_existing_owner() {
         CoreRecordServiceCapability::LogicalCrud,
         CoreRecordServiceCapability::FixedMappingIndex,
         CoreRecordServiceCapability::DurableFlush,
+        CoreRecordServiceCapability::HistoricalPayload,
     ] {
         assert_eq!(service.require_capability(capability), Ok(()));
         assert_eq!(client.require_capability(capability), Ok(()));
@@ -170,7 +171,6 @@ fn construction_and_static_capability_checks_do_not_touch_the_existing_owner() {
         CoreRecordServiceCapability::LegacyPhysicalAdmin,
         CoreRecordServiceCapability::DynamicPluginAttachment,
         CoreRecordServiceCapability::DynamicCatalogDdl,
-        CoreRecordServiceCapability::HistoricalPayload,
     ] {
         let expected = Err(UnsupportedCoreRecordServiceCapability { capability });
         assert_eq!(service.require_capability(capability), expected);
@@ -397,6 +397,102 @@ fn service_client_and_returned_view_retain_the_single_writer_lease_until_final_d
     drop(records);
     let reopened = CoreDatabase::open(config).unwrap();
     assert_eq!(reopened.records().fetch(rid).unwrap(), b"live");
+}
+
+#[test]
+fn service_client_retained_token_survives_delete_reclaim_and_final_facade_drop() {
+    let (_dir, config, db) = database(WalSyncPolicy::Never);
+    let service = CorePrimitiveStorageService::new(db.records());
+    let client = LocalCorepraxisClient::new(service.clone());
+    let old = client
+        .put_record(
+            RequestContext::new("old"),
+            b"old payload".to_vec(),
+            vec![IndexInsert::new("kv", b"shared".to_vec())],
+        )
+        .unwrap()
+        .record_id;
+    client.flush(RequestContext::new("old-durable")).unwrap();
+    let held = service.records().pin_snapshot().unwrap();
+    let deleter = client.clone();
+    std::thread::spawn(move || deleter.delete_record(RequestContext::new("delete"), old))
+        .join()
+        .unwrap()
+        .unwrap();
+    let live = client
+        .put_record(
+            RequestContext::new("new"),
+            b"new payload".to_vec(),
+            vec![IndexInsert::new("kv", b"shared".to_vec())],
+        )
+        .unwrap()
+        .record_id;
+    client.flush(RequestContext::new("new-durable")).unwrap();
+    let report = client.records().reclaim_snapshot_history().unwrap();
+    assert!(report.rewrite_performed);
+    assert_eq!(
+        client.records().fetch_at_snapshot(old, &held).unwrap(),
+        b"old payload"
+    );
+    assert_eq!(
+        client
+            .records()
+            .fetch_by_index_at_snapshot("kv", b"shared", &held)
+            .unwrap(),
+        Some(b"old payload".to_vec())
+    );
+    assert_eq!(
+        client
+            .get_record(RequestContext::new("current-dead"), old)
+            .unwrap()
+            .value,
+        None
+    );
+    assert_eq!(
+        client
+            .get_record(RequestContext::new("current-live"), live)
+            .unwrap()
+            .value,
+        Some(b"new payload".to_vec())
+    );
+    db.kv().verify().unwrap();
+
+    let backup_dir = tempfile::tempdir().unwrap();
+    let backup = backup_dir.path().join("copy");
+    db.kv().backup_to(&backup).unwrap();
+    let mut restored_config = config.clone();
+    restored_config.data_dir = backup;
+    let restored = CoreDatabase::open(restored_config).unwrap();
+    assert!(matches!(
+        restored.records().fetch_at_snapshot(old, &held),
+        Err(PraxisError::ForeignRecordSnapshot { .. })
+    ));
+    drop(restored);
+
+    let retained = client.records();
+    drop(client);
+    drop(service);
+    drop(db);
+    assert!(matches!(
+        CoreDatabase::open(config.clone()),
+        Err(PraxisError::AlreadyOpen { .. })
+    ));
+    assert_eq!(
+        retained.fetch_at_snapshot(old, &held).unwrap(),
+        b"old payload"
+    );
+    drop(retained);
+    assert!(matches!(
+        CoreDatabase::open(config.clone()),
+        Err(PraxisError::AlreadyOpen { .. })
+    ));
+    drop(held);
+    let reopened = CoreDatabase::open(config).unwrap();
+    assert!(matches!(
+        reopened.records().fetch(old),
+        Err(PraxisError::KeyNotFound)
+    ));
+    assert_eq!(reopened.records().fetch(live).unwrap(), b"new payload");
 }
 
 #[test]

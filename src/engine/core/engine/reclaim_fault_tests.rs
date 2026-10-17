@@ -246,6 +246,9 @@ fn reclaim_process_cuts_reopen_at_the_installed_authority() {
             pointer_log.is_file(),
             "GC removed the live shared log at {phase}"
         );
+        let converged = db.kv().garbage_collect().unwrap();
+        assert_eq!(converged.files_reclaimed, 0, "phase {phase}");
+        assert_eq!(converged.bytes_reclaimed, 0, "phase {phase}");
         db.kv().verify().unwrap();
         println!(
             "phase={phase} installed={installed} segment={} job={:?} gc_files={} gc_bytes={} live_log={}",
