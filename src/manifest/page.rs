@@ -54,12 +54,16 @@ impl PageManifestStore {
                 &format!("unsupported page manifest version {}", bytes[4]),
             );
         }
-        let len = u32::from_le_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]) as usize;
+        let len = usize::try_from(u32::from_le_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]))
+            .map_err(|_| malformed(&self.path, "page manifest length exceeds address space"))?;
         let expected = u32::from_le_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]);
-        if bytes.len() < 13 + len {
-            return corrupt(&self.path, "truncated page manifest payload");
+        if len.checked_add(13) != Some(bytes.len()) {
+            return corrupt(
+                &self.path,
+                "page manifest length disagrees with file extent",
+            );
         }
-        let payload = &bytes[13..13 + len];
+        let payload = &bytes[13..];
         let actual = crc32c(payload);
         if actual != expected {
             return corrupt(
@@ -138,24 +142,65 @@ fn encode_manifest(manifest: &PageLayoutManifest) -> Vec<u8> {
 }
 
 fn decode_manifest(bytes: &[u8], path: &Path) -> Result<PageLayoutManifest> {
-    let mut reader = BinaryReader::new(bytes, path.to_path_buf());
-    let count = reader.read_u32()? as usize;
-    let mut files = Vec::with_capacity(count);
+    let mut reader = BinaryReader::new(bytes, path);
+    let count = usize::try_from(reader.read_u32()?)
+        .map_err(|_| malformed(path, "page manifest count exceeds address space"))?;
+    // Three string prefixes, a u32 version and one flag, after the count.
+    if count > reader.remaining() / 17 {
+        return corrupt(path, "page manifest count exceeds available rows");
+    }
+    let mut files = Vec::new();
+    files
+        .try_reserve_exact(count)
+        .map_err(|error| malformed(path, &format!("cannot reserve page manifest rows: {error}")))?;
     for _ in 0..count {
+        let file_path = read_string(&mut reader, path)?;
+        let format = read_string(&mut reader, path)?;
+        let format_version = u16::try_from(reader.read_u32()?)
+            .map_err(|_| malformed(path, "tracked format version exceeds u16 range"))?;
+        let checksum = read_string(&mut reader, path)?;
+        let recoverable = match reader.read_u8()? {
+            0 => false,
+            1 => true,
+            _ => return corrupt(path, "invalid page manifest recoverability flag"),
+        };
+        // Own strings only after the complete borrowed row has been checked.
         files.push(ManifestTrackedFile {
-            path: read_string(&mut reader)?,
-            format: read_string(&mut reader)?,
-            format_version: reader.read_u32()? as u16,
-            checksum: read_string(&mut reader)?,
-            recoverable: reader.read_u8()? != 0,
+            path: own_string(file_path, path)?,
+            format: own_string(format, path)?,
+            format_version,
+            checksum: own_string(checksum, path)?,
+            recoverable,
         });
+    }
+    if reader.remaining() != 0 {
+        return corrupt(path, "trailing page manifest payload bytes");
     }
     Ok(PageLayoutManifest { files })
 }
 
-fn read_string(reader: &mut BinaryReader<'_>) -> Result<String> {
-    String::from_utf8(reader.read_len_bytes()?)
-        .map_err(|err| PraxisError::InvalidConfig(err.to_string()))
+fn read_string<'a>(reader: &mut BinaryReader<'a>, path: &Path) -> Result<&'a str> {
+    std::str::from_utf8(reader.read_len_slice()?)
+        .map_err(|error| malformed(path, &format!("invalid page manifest UTF-8: {error}")))
+}
+
+fn own_string(value: &str, path: &Path) -> Result<String> {
+    let mut out = String::new();
+    out.try_reserve_exact(value.len()).map_err(|error| {
+        malformed(
+            path,
+            &format!("cannot reserve page manifest string: {error}"),
+        )
+    })?;
+    out.push_str(value);
+    Ok(out)
+}
+
+fn malformed(path: &Path, reason: &str) -> PraxisError {
+    PraxisError::Corrupt {
+        path: path.to_path_buf(),
+        reason: reason.to_string(),
+    }
 }
 
 fn corrupt<T>(path: &Path, reason: &str) -> Result<T> {

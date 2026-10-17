@@ -1,9 +1,10 @@
-use super::recovery::load_collection;
+use super::recovery::{load_collection, load_collection_with_manifest};
 use super::{PageOperation, PageRecordStore, RidDirectory};
 use crate::config::WalSyncPolicy;
 use crate::errors::{PraxisError, Result};
 use crate::identity::{Cid, Eid, Fid, Pid, Rid};
 use crate::layout::PraxisLayout;
+use crate::manifest::PageManifestStore;
 use crate::storage::root_format::{InspectionOptions, require_page_base_compatible};
 use crate::wal::page::owned::{WalLifecycle, read_owner_report, repair_validated};
 use crate::wal::{PageWal, PageWalMutation, PageWalRecord, PageWalWriter, read_page_wal_strict};
@@ -107,6 +108,9 @@ impl PageDatabase {
         let writer_lease = WriterLease::acquire(base.into())?;
         require_page_base_compatible(writer_lease.root(), InspectionOptions::for_admission())?;
         let layout = PraxisLayout::new(writer_lease.root());
+        // Validate once even if no collections are discovered, before any WAL
+        // repair/layout mutation; share this inventory across startup loads.
+        let manifest = PageManifestStore::open(layout.page_manifest_path().path).load()?;
         let wal_path = layout.logs_root().join("page.wal");
         let report = read_owner_report(&wal_path)?;
         let records = &report.records;
@@ -139,7 +143,7 @@ impl PageDatabase {
                     reason: "WAL history exists without the canonical RID directory/high-water; v1 cannot prove complete allocation history (see issue #41)".to_string(),
                 });
             }
-            let mut collection = load_collection(&layout, cid)?;
+            let mut collection = load_collection_with_manifest(&layout, cid, &manifest)?;
             collection.next_rid = collection
                 .next_rid
                 .max(high_water.get(&cid).copied().unwrap_or(1));
