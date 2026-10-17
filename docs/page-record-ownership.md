@@ -45,7 +45,7 @@ Catalog loads and saves hold the same root guard as page/WAL operations. Load do
 
 Supported live catalog loads wait for a complete successful save, or fail closed after an uncertain publication error. After all owners drop, v1 can still contain individually valid catalog files from different publication attempts. The format has no durable catalog generation witness to prove that all ten files belong to one completed save; [#41](https://github.com/Astraive/praxor/issues/41) tracks that crash/recovery boundary. [V1 catalog decoding](catalog-decoding.md) describes the checked count, string, ID, tag, envelope and input-role contract added for [#51](https://github.com/Astraive/praxor/issues/51).
 
-[V1 page manifest decoding](page-manifest-decoding.md) documents the separate checked inventory codec. A present manifest is validated before managed WAL repair/layout initialization even with no discovered collections. This validates its representation; #41 still owns required-inventory presence and acknowledgement completeness.
+[V1 page manifest decoding](page-manifest-decoding.md) documents the separate checked inventory codec. Managed startup checks [known v1 writer-role presence](page-inventory-presence.md) under the current root before WAL reads/repair and layout initialization, even when an entire non-WAL collection is missing. Unknown annotations, legacy manifest absence and exact-current-path checksum selection retain their behavior. #41 remains open for inventory and acknowledgement completeness; this check does not make multi-file publication crash atomic.
 
 ## Reopen, replay, and failure outcomes
 
