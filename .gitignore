@@ -1,3 +1,5 @@
 /target
 /target-alt
 /.venv/
+/scripts/__pycache__/
+/scripts/tests/__pycache__/
