@@ -309,8 +309,12 @@ fn legacy_metadata_is_rebuilt_then_binary_snapshot_roundtrips() {
     live.remove(b"b".as_slice());
     assert_live_metadata(&index, &live, 6);
     index.compact().unwrap();
-    assert_live_metadata(&index, &live, 2);
+    assert_live_metadata(&index, &live, 6);
+    assert_eq!(index.get_at(b"a", 10), Some(RecordId(1)));
+    assert_eq!(index.get_at(b"b", 30), Some(RecordId(2)));
     index.flush().unwrap();
     let index = LsmIndex::open("kv", dir.path()).unwrap();
-    assert_live_metadata(&index, &live, 2);
+    assert_live_metadata(&index, &live, 6);
+    assert_eq!(index.get_at(b"a", 10), Some(RecordId(1)));
+    assert_eq!(index.get_at(b"b", 30), Some(RecordId(2)));
 }
