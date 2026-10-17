@@ -22,7 +22,7 @@ fn queued_old_policy_batch_is_rejected_whole_without_consuming_sequence() {
     let writer = engine.inner.write_serialization.lock();
     let (normalized, generations) = engine.normalize_batch_with_cf_policies(batch).unwrap();
     assert!(matches!(normalized.ops()[0], BatchOp::PutWithExpiry { .. }));
-    let bytes = WalRecord::encoded_batch_len(&normalized);
+    let bytes = WalRecord::checked_encoded_batch_len(&normalized).unwrap();
     let stale = engine
         .inner
         .group_commit
@@ -45,7 +45,7 @@ fn queued_old_policy_batch_is_rejected_whole_without_consuming_sequence() {
     let mut healthy = WriteBatch::new();
     healthy.put_default("healthy", "new");
     let (healthy, generations) = engine.normalize_batch_with_cf_policies(healthy).unwrap();
-    let bytes = WalRecord::encoded_batch_len(&healthy);
+    let bytes = WalRecord::checked_encoded_batch_len(&healthy).unwrap();
     let healthy = engine
         .inner
         .group_commit

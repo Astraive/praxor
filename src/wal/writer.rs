@@ -1,7 +1,7 @@
 use crate::config::WalSyncPolicy;
 use crate::errors::{PraxisError, Result};
 use crate::io::{BinaryWriter, sync_parent_dir};
-use crate::wal::record::{WAL_MAGIC, WAL_RECORD_HEADER_LEN, WalRecord};
+use crate::wal::record::{RecordPrefix, WAL_MAGIC, WAL_V2_MAGIC, WalRecord, parse_record_prefix};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -78,7 +78,7 @@ impl Wal {
 
     pub fn should_rotate(&self, next_record_len: usize, max_segment_bytes: usize) -> bool {
         self.bytes_written > WAL_FILE_HEADER_LEN as u64
-            && self.bytes_written + next_record_len as u64 > max_segment_bytes as u64
+            && self.bytes_written.saturating_add(next_record_len as u64) > max_segment_bytes as u64
     }
 
     pub fn append(&mut self, record: &WalRecord) -> Result<()> {
@@ -92,7 +92,7 @@ impl Wal {
     /// The core coordinator explicitly syncs its closed group. Public callers
     /// of append retain the configured EveryBatch behavior above.
     pub(crate) fn append_unsynced(&mut self, record: &WalRecord) -> Result<()> {
-        let encoded = record.encode();
+        let encoded = record.try_encode()?;
         self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(&encoded)?;
         self.bytes_written += encoded.len() as u64;
@@ -151,28 +151,23 @@ impl Wal {
 }
 
 /// Return the decoded records and the end of the last complete record.
-/// A short final header, or a valid header whose payload extends past EOF,
-/// is an incomplete append. A complete header with bad magic, or a complete
-/// record that fails decoding/checksum validation, is corruption and must
-/// never be silently discarded. Headerless legacy WALs use the same rules.
+/// Framing, checksum and legacy length-probe decisions live in the same parser
+/// used by direct decoding. Only a torn suffix may be repaired; Corrupt never
+/// returns a boundary that Wal::open could silently truncate.
 fn replay_records(bytes: &[u8], path: &Path) -> Result<(Vec<WalRecord>, usize)> {
     let mut offset = file_payload_offset(bytes, path)?;
     let mut records = Vec::new();
-    while bytes.len() - offset >= WAL_RECORD_HEADER_LEN {
-        let magic = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
-        if magic != WAL_MAGIC {
-            return Err(PraxisError::Corrupt {
-                path: path.to_path_buf(),
-                reason: format!("bad WAL magic at offset {offset}"),
-            });
+    while offset < bytes.len() {
+        match parse_record_prefix(&bytes[offset..], path)? {
+            RecordPrefix::Complete {
+                record,
+                encoded_len,
+            } => {
+                records.push(record);
+                offset += encoded_len;
+            }
+            RecordPrefix::Torn => break,
         }
-        let len = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
-        if len > bytes.len() - offset - WAL_RECORD_HEADER_LEN {
-            break;
-        }
-        let end = offset + WAL_RECORD_HEADER_LEN + len;
-        records.push(WalRecord::decode(&bytes[offset..end], path)?);
-        offset = end;
     }
     Ok((records, offset))
 }
@@ -191,7 +186,11 @@ fn file_payload_offset(bytes: &[u8], path: &Path) -> Result<usize> {
         // Wal::open will complete the header before reusing the segment.
         return Ok(bytes.len());
     }
-    if bytes.len() < 4 && WAL_MAGIC.to_le_bytes().starts_with(bytes) {
+    if bytes.len() < 4
+        && [WAL_MAGIC, WAL_V2_MAGIC]
+            .iter()
+            .any(|magic| magic.to_le_bytes().starts_with(bytes))
+    {
         return Ok(0);
     }
     if bytes.len() < 4 {
@@ -201,8 +200,8 @@ fn file_payload_offset(bytes: &[u8], path: &Path) -> Result<usize> {
         });
     }
     let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    if magic == WAL_MAGIC {
-        return Ok(0); // Legacy headerless WAL.
+    if matches!(magic, WAL_MAGIC | WAL_V2_MAGIC) {
+        return Ok(0); // Headerless legacy, current or mixed record stream.
     }
     if magic != WAL_FILE_MAGIC || bytes.len() < WAL_FILE_HEADER_LEN {
         return Err(PraxisError::Corrupt {
