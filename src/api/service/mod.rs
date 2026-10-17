@@ -1,13 +1,12 @@
 use crate::errors::Result;
 use crate::identity::{Aid, Cid, Did, Eid, FieldId, Rid};
 use crate::kernel::{KernelSnapshot, StorageKernel};
-use crate::record::PageRecordStore;
+use crate::record::{PageDatabase, PageRecordStore};
 use crate::slog;
 use crate::store::{
     BatchRecord, CompactionStats, IndexInsert, RecordId, StorageEngine, StorageEngineStats,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -178,8 +177,7 @@ pub struct PrimitiveStorageService {
 
 #[derive(Clone)]
 pub struct PagePrimitiveStorageService {
-    root: PathBuf,
-    stores: Arc<Mutex<BTreeMap<(Cid, Eid), PageRecordStore>>>,
+    database: PageDatabase,
 }
 
 impl PrimitiveStorageService {
@@ -333,11 +331,12 @@ impl PrimitiveStorageService {
 }
 
 impl PagePrimitiveStorageService {
-    pub fn open(root: impl Into<PathBuf>) -> Self {
-        Self {
-            root: root.into(),
-            stores: Arc::new(Mutex::new(BTreeMap::new())),
-        }
+    pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
+        Ok(Self::new(PageDatabase::open(root)?))
+    }
+
+    pub fn new(database: PageDatabase) -> Self {
+        Self { database }
     }
 
     pub fn put_page_record(&self, request: PutPageRecordRequest) -> Result<PutPageRecordResponse> {
@@ -422,15 +421,7 @@ impl PagePrimitiveStorageService {
         eid: Eid,
         operation: impl FnOnce(&mut PageRecordStore) -> Result<T>,
     ) -> Result<T> {
-        let mut stores = self.stores.lock().expect("page service mutex poisoned");
-        if let std::collections::btree_map::Entry::Vacant(entry) = stores.entry((cid, eid)) {
-            entry.insert(PageRecordStore::open(&self.root, cid, eid)?);
-        }
-        operation(
-            stores
-                .get_mut(&(cid, eid))
-                .expect("page store exists after insertion"),
-        )
+        operation(&mut self.database.entity(cid, eid)?)
     }
 }
 

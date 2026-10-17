@@ -722,7 +722,32 @@ impl Inspector {
                 add_scaffold(&mut expected, &entity, PAGE_ENTITY_DIRS, PAGE_ENTITY_FILES);
             }
         }
-        self.scaffold_walk(root, &mut expected, 0)?;
+        // A managed page owner may create its WAL before its first Put. The
+        // exact header is optional on an otherwise complete empty scaffold;
+        // record-bearing or malformed files do not establish authority here.
+        let page_wal = root.join("logs/page.wal");
+        let empty_page_wal = match fs::symlink_metadata(&page_wal) {
+            Ok(meta) => {
+                if is_alias(&meta) || !meta.is_file() || meta.len() != 16 {
+                    return Err(damaged(
+                        &page_wal,
+                        "empty page WAL must be an exact v1 header",
+                    ));
+                }
+                let bytes = self.control(&page_wal)?;
+                let mut header = [0_u8; 16];
+                header[..4].copy_from_slice(&0x5450_5746_u32.to_le_bytes());
+                header[4..8].copy_from_slice(&1_u32.to_le_bytes());
+                if bytes != header {
+                    return Err(damaged(&page_wal, "invalid empty page WAL v1 header"));
+                }
+                expected.insert(page_wal.clone(), false);
+                Some(page_wal)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(damaged(&page_wal, &err.to_string())),
+        };
+        self.scaffold_walk(root, &mut expected, 0, empty_page_wal.as_deref())?;
         if let Some(path) = expected.keys().next() {
             return Err(diagnostic(
                 path,
@@ -757,6 +782,7 @@ impl Inspector {
         root: &Path,
         expected: &mut BTreeMap<PathBuf, bool>,
         depth: usize,
+        empty_page_wal: Option<&Path>,
     ) -> ProbeResult<()> {
         if depth > 32 {
             return Err(diagnostic(
@@ -774,7 +800,8 @@ impl Inspector {
                     "entry is outside the exact empty page scaffold",
                 ));
             };
-            if directory != meta.is_dir() || (!directory && meta.len() != 0) {
+            let validated_header = empty_page_wal == Some(path.as_path()) && meta.len() == 16;
+            if directory != meta.is_dir() || (!directory && meta.len() != 0 && !validated_header) {
                 return Err(diagnostic(
                     &path,
                     DiagnosticKind::MissingAuthority,
@@ -782,7 +809,7 @@ impl Inspector {
                 ));
             }
             if directory {
-                self.scaffold_walk(&path, expected, depth + 1)?;
+                self.scaffold_walk(&path, expected, depth + 1, empty_page_wal)?;
             }
         }
         Ok(())

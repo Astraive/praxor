@@ -8,9 +8,13 @@ use crate::layout::PraxisLayout;
 use crate::manifest::PageManifestStore;
 use crate::page::{RecordPage, SlotDirectoryEntry};
 use crate::segments::{BlobLocation, BlobStore};
-use crate::wal::{PageWal, PageWalMutation, PageWalRecord};
+use crate::wal::{
+    PageWal, PageWalMutation, PageWalRecord, PageWalWriter, validate_page_wal_identity,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
@@ -18,6 +22,11 @@ const RID_DIRECTORY_MAGIC: u32 = 0x5452_4944;
 const RID_DIRECTORY_VERSION: u8 = 1;
 const TYPED_RECORD_MAGIC: u32 = 0x5456_4944;
 const TYPED_RECORD_VERSION: u8 = 1;
+
+mod database;
+mod recovery;
+use database::CollectionState;
+pub use database::PageDatabase;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FieldOffset {
@@ -38,16 +47,25 @@ pub struct RidDirectory {
     mappings: BTreeMap<Rid, SlotAddress>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct PageRecordStore {
-    layout: PraxisLayout,
+    database: PageDatabase,
+    cid: Cid,
+    eid: Eid,
+    fid: Fid,
+}
+
+struct PageOperation<'a> {
+    layout: &'a PraxisLayout,
     cid: Cid,
     eid: Eid,
     fid: Fid,
     current_pid: Pid,
     next_rid: u64,
-    next_sid: u16,
-    directory: RidDirectory,
+    next_sid: u32,
+    directory: Cow<'a, RidDirectory>,
+    deleted: Cow<'a, BTreeSet<Rid>>,
+    side_effects: Cell<bool>,
 }
 
 impl RecordSlot {
@@ -206,9 +224,18 @@ impl RidDirectory {
         }
         let mut reader = BinaryReader::new(payload, path.to_path_buf());
         let next_rid = reader.read_u64()?;
-        let next_sid = reader.read_u32()? as u16;
+        let next_sid = u16::try_from(reader.read_u32()?)
+            .ok()
+            .filter(|sid| *sid != 0)
+            .ok_or_else(|| PraxisError::Corrupt {
+                path: path.to_path_buf(),
+                reason: "invalid next SID in RID directory".to_string(),
+            })?;
         let current_pid = Pid(reader.read_u32()?);
         let count = reader.read_u32()? as usize;
+        if next_rid == 0 || current_pid.is_null() || count > payload.len().saturating_sub(20) / 28 {
+            return corrupt(path, "invalid RID directory counters or entry count");
+        }
         let mut directory = Self::default();
         for _ in 0..count {
             let rid = Rid(reader.read_u64()?);
@@ -217,9 +244,23 @@ impl RidDirectory {
                 eid: Eid(reader.read_u32()?),
                 fid: Fid(reader.read_u32()?),
                 pid: Pid(reader.read_u32()?),
-                sid: Sid(reader.read_u32()? as u16),
+                sid: Sid(
+                    u16::try_from(reader.read_u32()?).map_err(|_| PraxisError::Corrupt {
+                        path: path.to_path_buf(),
+                        reason: "RID directory SID exceeds its identifier range".to_string(),
+                    })?,
+                ),
             };
-            directory.insert(rid, address);
+            if rid.is_null()
+                || address.cid.is_null()
+                || address.eid.is_null()
+                || address.fid.is_null()
+                || address.pid.is_null()
+                || address.sid.is_null()
+                || directory.mappings.insert(rid, address).is_some()
+            {
+                return corrupt(path, "invalid or duplicate RID directory identity");
+            }
         }
         Ok((directory, next_rid, next_sid, current_pid))
     }
@@ -227,50 +268,228 @@ impl RidDirectory {
 
 impl PageRecordStore {
     pub fn open(base: impl Into<PathBuf>, cid: Cid, eid: Eid) -> Result<Self> {
-        let layout = PraxisLayout::new(base);
-        layout.create_all()?;
-        layout.ensure_entity_tree(cid, eid)?;
-        let map_path = layout.critical_map_path(cid, "rid_to_slot").path;
-        let (directory, next_rid, next_sid, current_pid) =
-            if map_path.exists() && map_path.metadata()?.len() > 0 {
-                RidDirectory::load_binary(&map_path)?
-            } else {
-                (RidDirectory::default(), 1, 1, Pid(1))
-            };
-        Ok(Self {
-            layout,
-            cid,
-            eid,
-            fid: Fid(1),
-            current_pid,
-            next_rid,
-            next_sid,
-            directory,
-        })
+        PageDatabase::open(base)?.entity(cid, eid)
     }
 
     pub fn put(&mut self, fields: &[(FieldId, &[u8])]) -> Result<Rid> {
-        let rid = Rid(self.next_rid);
-        self.apply_put(rid, fields)?;
-        Ok(rid)
+        self.with_mutation(|operation| operation.put(fields))
     }
 
     pub fn put_durable(&mut self, wal: &mut PageWal, fields: &[(FieldId, &[u8])]) -> Result<Rid> {
-        let rid = Rid(self.next_rid);
-        wal.append_put(self.cid, self.eid, rid, fields)?;
+        self.with_wal_mutation(wal, |operation, writer| {
+            operation.put_durable(writer, fields)
+        })
+    }
+
+    pub fn delete_durable(&mut self, wal: &mut PageWal, rid: Rid) -> Result<()> {
+        self.with_wal_mutation(wal, |operation, writer| {
+            operation.delete_durable(writer, rid)
+        })
+    }
+
+    pub fn put_typed(&mut self, fields: &[(FieldId, PraxisValue)]) -> Result<Rid> {
+        self.with_mutation(|operation| operation.put_typed(fields))
+    }
+
+    pub fn get(&self, rid: Rid) -> Result<Vec<u8>> {
+        self.with_read(|operation| operation.get(rid))
+    }
+
+    pub fn get_typed_field_bytes(&self, rid: Rid, field: FieldId) -> Result<Vec<u8>> {
+        self.with_read(|operation| operation.get_typed_field_bytes(rid, field))
+    }
+
+    pub fn delete(&mut self, rid: Rid) -> Result<()> {
+        self.with_mutation(|operation| operation.delete(rid))
+    }
+
+    pub fn directory(&self) -> Result<RidDirectory> {
+        self.with_read(|operation| Ok(operation.directory.as_ref().clone()))
+    }
+
+    pub fn layout(&self) -> &PraxisLayout {
+        &self.database.inner.layout
+    }
+
+    pub fn replay_page_wal(&mut self, records: &[PageWalRecord]) -> Result<()> {
+        self.with_mutation(|operation| operation.replay_page_wal(records))
+    }
+
+    pub fn apply_page_wal_record(&mut self, record: &PageWalRecord) -> Result<()> {
+        self.with_mutation(|operation| operation.apply_page_wal_record(record))
+    }
+}
+
+impl<'a> PageOperation<'a> {
+    fn borrowed(
+        layout: &'a PraxisLayout,
+        cid: Cid,
+        eid: Eid,
+        fid: Fid,
+        collection: &'a CollectionState,
+    ) -> Self {
+        let cursor = collection
+            .cursors
+            .get(&(eid, fid))
+            .copied()
+            .unwrap_or_default();
+        Self {
+            layout,
+            cid,
+            eid,
+            fid,
+            current_pid: cursor.current_pid,
+            next_rid: collection.next_rid,
+            next_sid: cursor.next_sid,
+            directory: Cow::Borrowed(&collection.directory),
+            deleted: Cow::Borrowed(&collection.deleted),
+            side_effects: Cell::new(false),
+        }
+    }
+
+    fn candidate(
+        layout: &'a PraxisLayout,
+        cid: Cid,
+        eid: Eid,
+        fid: Fid,
+        collection: &CollectionState,
+    ) -> Self {
+        let cursor = collection
+            .cursors
+            .get(&(eid, fid))
+            .copied()
+            .unwrap_or_default();
+        Self {
+            layout,
+            cid,
+            eid,
+            fid,
+            current_pid: cursor.current_pid,
+            next_rid: collection.next_rid,
+            next_sid: cursor.next_sid,
+            directory: Cow::Owned(collection.directory.clone()),
+            deleted: Cow::Owned(collection.deleted.clone()),
+            side_effects: Cell::new(false),
+        }
+    }
+
+    fn next_rid(&self) -> Result<Rid> {
+        if self.next_rid == 0 || self.next_rid == u64::MAX {
+            return Err(PraxisError::WriteStalled {
+                reason: "page collection RID space is exhausted".to_string(),
+            });
+        }
+        Ok(Rid(self.next_rid))
+    }
+
+    fn validate_record_size(fields: &[(FieldId, &[u8])]) -> Result<()> {
+        let size = fields
+            .iter()
+            .try_fold(16_usize, |size, (_, bytes)| size.checked_add(bytes.len()));
+        if size.is_none_or(|size| size > crate::page::DEFAULT_PAGE_SIZE as usize) {
+            return Err(PraxisError::WriteStalled {
+                reason: "record cannot fit in a fresh page".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn scope_address(&self, rid: Rid) -> Result<SlotAddress> {
+        let address = self.directory.resolve(rid)?;
+        if address.cid != self.cid || address.eid != self.eid {
+            return Err(PraxisError::KeyNotFound);
+        }
+        Ok(address)
+    }
+
+    fn page_path(&self, fid: Fid, pid: Pid) -> PathBuf {
+        self.layout.page_path(self.cid, self.eid, fid, pid).path
+    }
+
+    fn load_page_at(&self, fid: Fid, pid: Pid) -> Result<RecordPage> {
+        let path = self.page_path(fid, pid);
+        RecordPage::from_bytes(&std::fs::read(&path)?, path)
+    }
+
+    fn write_page_at(&self, fid: Fid, pid: Pid, page: &RecordPage) -> Result<()> {
+        self.side_effects.set(true);
+        self.layout.ensure_frame_tree(self.cid, self.eid, fid)?;
+        let path = self.page_path(fid, pid);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp_path = path.with_extension("tmp");
+        let bytes = page.to_bytes();
+        std::fs::write(&tmp_path, &bytes)?;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&tmp_path)?
+            .sync_all()?;
+        #[cfg(windows)]
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+        std::fs::rename(&tmp_path, &path)?;
+        self.manifest_store()
+            .track_bytes(&path, "record-page", 1, &bytes)
+    }
+
+    fn with_frame<T>(&mut self, fid: Fid, action: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        let original = self.fid;
+        self.fid = fid;
+        let result = action(self);
+        self.fid = original;
+        result
+    }
+
+    fn rollover_pid(&self) -> Result<Pid> {
+        self.current_pid
+            .0
+            .checked_add(1)
+            .map(Pid)
+            .ok_or_else(|| PraxisError::WriteStalled {
+                reason: "page PID space is exhausted".to_string(),
+            })
+    }
+
+    fn put(&mut self, fields: &[(FieldId, &[u8])]) -> Result<Rid> {
+        let rid = self.next_rid()?;
+        Self::validate_record_size(fields)?;
         self.apply_put(rid, fields)?;
         Ok(rid)
     }
 
-    pub fn delete_durable(&mut self, wal: &mut PageWal, rid: Rid) -> Result<()> {
-        wal.append_delete(self.cid, self.eid, rid)?;
+    fn put_durable(&mut self, wal: &mut PageWalWriter, fields: &[(FieldId, &[u8])]) -> Result<Rid> {
+        let rid = self.next_rid()?;
+        Self::validate_record_size(fields)?;
+        self.prepare_slot(&RecordSlot::from_fields(
+            Sid(u16::try_from(self.next_sid).unwrap_or(1)),
+            fields,
+        ))?;
+        let prepared = wal.prepare_put(self.cid, self.eid, rid, fields)?;
+        self.side_effects.set(true);
+        wal.append_prepared(prepared)?;
+        self.apply_put(rid, fields)?;
+        Ok(rid)
+    }
+
+    fn delete_durable(&mut self, wal: &mut PageWalWriter, rid: Rid) -> Result<()> {
+        self.get(rid)?;
+        let prepared = wal.prepare_delete(self.cid, self.eid, rid)?;
+        self.side_effects.set(true);
+        wal.append_prepared(prepared)?;
         self.delete(rid)
     }
 
-    pub fn put_typed(&mut self, fields: &[(FieldId, PraxisValue)]) -> Result<Rid> {
+    fn put_typed(&mut self, fields: &[(FieldId, PraxisValue)]) -> Result<Rid> {
+        self.next_rid()?;
         let encoded = self.encode_typed_record(fields)?;
         self.put(&[(FieldId::Dynamic(Did(0xffff)), encoded.as_slice())])
     }
+
+    /* Existing typed record codec and physical persistence helpers operate only on
+     * one borrowed read view or an unpublished operation-local candidate below. */
 
     pub fn get_typed_field_bytes(&self, rid: Rid, field: FieldId) -> Result<Vec<u8>> {
         let body = self.get(rid)?;
@@ -297,6 +516,10 @@ impl PageRecordStore {
                         reason: "external typed cell has non-overflow pointer".to_string(),
                     });
                 };
+                let path = self.layout.overflow_blob_path(self.cid, self.eid).path;
+                if !path.is_file() {
+                    return corrupt(&path, "typed record overflow file is missing");
+                }
                 self.overflow_store()?.read(&BlobLocation {
                     family: None,
                     file_id: page_id,
@@ -321,6 +544,13 @@ impl PageRecordStore {
                         reason: "segment typed cell has non-segment pointer".to_string(),
                     });
                 };
+                let path = self
+                    .layout
+                    .segment_blob_path(self.cid, self.eid, family)
+                    .path;
+                if !path.is_file() {
+                    return corrupt(&path, "typed record segment file is missing");
+                }
                 self.segment_store(family)?.read(&BlobLocation {
                     family: Some(family),
                     file_id: segment_id,
@@ -336,6 +566,7 @@ impl PageRecordStore {
     }
 
     pub fn replay_page_wal(&mut self, records: &[PageWalRecord]) -> Result<()> {
+        self.validate_replay(records)?;
         for record in records {
             self.apply_page_wal_record(record)?;
         }
@@ -343,6 +574,7 @@ impl PageRecordStore {
     }
 
     pub fn apply_page_wal_record(&mut self, record: &PageWalRecord) -> Result<()> {
+        self.validate_replay(std::slice::from_ref(record))?;
         match &record.mutation {
             PageWalMutation::Put {
                 cid,
@@ -350,7 +582,7 @@ impl PageRecordStore {
                 rid,
                 fields,
             } if *cid == self.cid && *eid == self.eid => {
-                if self.directory.resolve(*rid).is_ok() && self.get(*rid).is_ok() {
+                if self.directory.resolve(*rid).is_ok() {
                     return Ok(());
                 }
                 let borrowed: Vec<(FieldId, &[u8])> = fields
@@ -360,7 +592,7 @@ impl PageRecordStore {
                 self.apply_put(*rid, &borrowed)
             }
             PageWalMutation::Delete { cid, eid, rid } if *cid == self.cid && *eid == self.eid => {
-                if self.directory.resolve(*rid).is_err() || self.get(*rid).is_err() {
+                if self.directory.resolve(*rid).is_err() || self.deleted.contains(rid) {
                     return Ok(());
                 }
                 self.delete(*rid)
@@ -369,65 +601,149 @@ impl PageRecordStore {
         }
     }
 
+    fn validate_replay<'record>(
+        &self,
+        records: impl IntoIterator<Item = &'record PageWalRecord>,
+    ) -> Result<()> {
+        let path = self.layout.logs_root().join("page.wal");
+        let mut previous = 0;
+        enum ReplayIdentity<'a> {
+            Put(&'a [(FieldId, Vec<u8>)]),
+            Deleted,
+        }
+        // A delete is terminal, including a delete of an as-yet unknown RID.
+        // Borrow complete tuples so equal flattened bodies cannot hide changed
+        // field identities, boundaries, or ordering within the log.
+        let mut seen = BTreeMap::new();
+        for record in records {
+            validate_page_wal_identity(record, &path)?;
+            if record.sequence <= previous {
+                return corrupt(&path, "replay sequence must strictly increase");
+            }
+            previous = record.sequence;
+            let (cid, eid, rid) = match &record.mutation {
+                PageWalMutation::Put { cid, eid, rid, .. }
+                | PageWalMutation::Delete { cid, eid, rid } => (*cid, *eid, *rid),
+            };
+            if cid != self.cid || eid != self.eid {
+                continue;
+            }
+            if let Ok(address) = self.directory.resolve(rid)
+                && (address.cid != cid || address.eid != eid)
+            {
+                return corrupt(&path, "replay RID is bound to a different entity");
+            }
+            match &record.mutation {
+                PageWalMutation::Put { fields, .. } => {
+                    let borrowed: Vec<_> = fields
+                        .iter()
+                        .map(|(field, bytes)| (*field, bytes.as_slice()))
+                        .collect();
+                    Self::validate_record_size(&borrowed)?;
+                    let body: Vec<u8> = fields
+                        .iter()
+                        .flat_map(|(_, bytes)| bytes.iter().copied())
+                        .collect();
+                    match seen.get(&rid) {
+                        Some(ReplayIdentity::Deleted) => {
+                            return corrupt(&path, "replay Put follows a terminal delete");
+                        }
+                        Some(ReplayIdentity::Put(earlier)) if *earlier != fields.as_slice() => {
+                            return corrupt(&path, "conflicting repeated replay Put");
+                        }
+                        _ => {}
+                    }
+                    if self.directory.resolve(rid).is_ok()
+                        && !self.deleted.contains(&rid)
+                        && self.get(rid)? != body
+                    {
+                        return corrupt(&path, "replay Put conflicts with existing bytes");
+                    }
+                    seen.insert(rid, ReplayIdentity::Put(fields));
+                }
+                PageWalMutation::Delete { .. } => {
+                    seen.insert(rid, ReplayIdentity::Deleted);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn apply_put(&mut self, rid: Rid, fields: &[(FieldId, &[u8])]) -> Result<()> {
-        let sid = Sid(self.next_sid);
+        Self::validate_record_size(fields)?;
+        if rid.is_null() || rid.0 == u64::MAX {
+            return Err(PraxisError::WriteStalled {
+                reason: "page RID is outside the allocatable range".to_string(),
+            });
+        }
+        let sid = Sid(u16::try_from(self.next_sid).unwrap_or(1));
         let slot = RecordSlot::from_fields(sid, fields);
         let address = self.write_slot(&slot)?;
-        self.directory.insert(rid, address);
-        self.next_rid = self.next_rid.max(rid.0.saturating_add(1));
-        self.next_sid = self.next_sid.saturating_add(1).max(1);
+        self.directory.to_mut().insert(rid, address);
+        self.deleted.to_mut().remove(&rid);
+        self.next_rid =
+            self.next_rid.max(
+                rid.0
+                    .checked_add(1)
+                    .ok_or_else(|| PraxisError::WriteStalled {
+                        reason: "page RID space is exhausted".to_string(),
+                    })?,
+            );
+        self.next_sid = u32::from(address.sid.0) + 1;
         self.flush_directory()?;
         Ok(())
     }
 
     pub fn get(&self, rid: Rid) -> Result<Vec<u8>> {
-        let address = self.directory.resolve(rid)?;
-        let page = self.load_page(address.pid)?;
+        let address = self.scope_address(rid)?;
+        let page = self.load_page_at(address.fid, address.pid)?;
         page.get(address.sid)?
             .map(|bytes| bytes.to_vec())
             .ok_or(PraxisError::KeyNotFound)
     }
 
     pub fn delete(&mut self, rid: Rid) -> Result<()> {
-        let address = self.directory.resolve(rid)?;
-        let mut page = self.load_page(address.pid)?;
+        let address = self.scope_address(rid)?;
+        let mut page = self.load_page_at(address.fid, address.pid)?;
         page.delete(address.sid)?;
-        self.write_page(address.pid, &page)?;
-        self.write_slot_metadata(address.pid, page.slots())?;
+        self.write_page_at(address.fid, address.pid, &page)?;
+        self.with_frame(address.fid, |operation| {
+            operation.write_slot_metadata(address.pid, page.slots())
+        })?;
+        self.deleted.to_mut().insert(rid);
+        self.flush_directory()?;
         Ok(())
     }
 
-    pub fn directory(&self) -> &RidDirectory {
-        &self.directory
-    }
-
-    pub fn layout(&self) -> &PraxisLayout {
-        &self.layout
+    fn prepare_slot(&self, slot: &RecordSlot) -> Result<(Pid, Sid, RecordPage)> {
+        let mut pid = self.current_pid;
+        let mut sid = slot.sid;
+        let mut page = if self.next_sid > u32::from(u16::MAX) {
+            pid = self.rollover_pid()?;
+            sid = Sid(1);
+            RecordPage::new(self.next_rid)
+        } else {
+            self.load_or_create_page(pid)?
+        };
+        let mut prepared = slot.clone();
+        prepared.sid = sid;
+        match prepared.install_into_page(&mut page) {
+            Ok(()) => {}
+            Err(PraxisError::WriteStalled { .. }) => {
+                pid = self.rollover_pid()?;
+                sid = Sid(1);
+                prepared.sid = sid;
+                page = RecordPage::new(self.next_rid);
+                prepared.install_into_page(&mut page)?;
+            }
+            Err(error) => return Err(error),
+        }
+        Ok((pid, sid, page))
     }
 
     fn write_slot(&mut self, slot: &RecordSlot) -> Result<SlotAddress> {
-        let mut page = self.load_or_create_page(self.current_pid)?;
-        if let Err(PraxisError::WriteStalled { .. }) = slot.install_into_page(&mut page) {
-            self.current_pid = Pid(self.current_pid.0.saturating_add(1));
-            self.next_sid = 1;
-            let sid = Sid(self.next_sid);
-            let relocated = RecordSlot {
-                sid,
-                body: slot.body.clone(),
-                fields: slot.fields.clone(),
-            };
-            let mut next = RecordPage::new(self.next_rid);
-            relocated.install_into_page(&mut next)?;
-            self.write_page(self.current_pid, &next)?;
-            self.write_slot_metadata(self.current_pid, next.slots())?;
-            return Ok(SlotAddress {
-                cid: self.cid,
-                eid: self.eid,
-                fid: self.fid,
-                pid: self.current_pid,
-                sid,
-            });
-        }
+        let (pid, sid, page) = self.prepare_slot(slot)?;
+        self.current_pid = pid;
         self.write_page(self.current_pid, &page)?;
         self.write_slot_metadata(self.current_pid, page.slots())?;
         Ok(SlotAddress {
@@ -435,7 +751,7 @@ impl PageRecordStore {
             eid: self.eid,
             fid: self.fid,
             pid: self.current_pid,
-            sid: slot.sid,
+            sid,
         })
     }
 
@@ -452,48 +768,15 @@ impl PageRecordStore {
     }
 
     fn load_page(&self, pid: Pid) -> Result<RecordPage> {
-        let path = self
-            .layout
-            .page_path(self.cid, self.eid, self.fid, pid)
-            .path;
-        RecordPage::from_bytes(&std::fs::read(&path)?, path)
+        self.load_page_at(self.fid, pid)
     }
 
     fn write_page(&self, pid: Pid, page: &RecordPage) -> Result<()> {
-        self.layout
-            .ensure_frame_tree(self.cid, self.eid, self.fid)?;
-        let path = self
-            .layout
-            .page_path(self.cid, self.eid, self.fid, pid)
-            .path;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp_path = path.with_extension("tmp");
-        std::fs::write(&tmp_path, page.to_bytes())?;
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&tmp_path)?
-            .sync_all()?;
-        #[cfg(windows)]
-        if path.exists() {
-            std::fs::remove_file(&path)?;
-        }
-        std::fs::rename(&tmp_path, path)?;
-        self.manifest_store().track_bytes(
-            &self
-                .layout
-                .page_path(self.cid, self.eid, self.fid, pid)
-                .path,
-            "record-page",
-            1,
-            &page.to_bytes(),
-        )?;
-        Ok(())
+        self.write_page_at(self.fid, pid, page)
     }
 
     fn write_slot_metadata(&self, pid: Pid, slots: &[SlotDirectoryEntry]) -> Result<()> {
+        self.side_effects.set(true);
         let root = self
             .layout
             .slot_directory_root(self.cid, self.eid, self.fid, pid);
@@ -533,9 +816,14 @@ impl PageRecordStore {
     }
 
     fn flush_directory(&self) -> Result<()> {
+        self.side_effects.set(true);
         let path = self.layout.critical_map_path(self.cid, "rid_to_slot").path;
-        self.directory
-            .save_binary(&path, self.next_rid, self.next_sid, self.current_pid)?;
+        self.directory.save_binary(
+            &path,
+            self.next_rid,
+            u16::try_from(self.next_sid).unwrap_or(u16::MAX),
+            self.current_pid,
+        )?;
         self.manifest_store().track_bytes(
             &path,
             "rid-directory",
@@ -547,9 +835,13 @@ impl PageRecordStore {
 
     fn encode_typed_record(&self, fields: &[(FieldId, PraxisValue)]) -> Result<Vec<u8>> {
         let mut cells = Vec::with_capacity(fields.len());
+        let mut payloads = Vec::with_capacity(fields.len());
         for (field, value) in fields {
             let encoded = DataTypeRegistry::encode(value)?;
             let payload = value.payload_bytes()?;
+            let payload_len = u32::try_from(payload.len()).map_err(|_| {
+                PraxisError::InvalidConfig("typed payload exceeds its v1 length field".to_string())
+            })?;
             let cell = match encoded.storage_class {
                 StorageClass::Inline => TypedFieldCell {
                     field: *field,
@@ -558,24 +850,20 @@ impl PageRecordStore {
                     inline_bytes: encoded.inline_bytes,
                     pointer: None,
                 },
-                StorageClass::External => {
-                    let location = self.overflow_store()?.append(&payload)?;
-                    TypedFieldCell {
-                        field: *field,
-                        type_code: encoded.type_code,
-                        storage_class: StorageClass::External,
-                        inline_bytes: Vec::new(),
-                        pointer: Some(ExternalPointer::Overflow {
-                            page_id: location.file_id,
-                            offset: location.offset as u32,
-                            len: location.len,
-                            checksum: location.checksum,
-                        }),
-                    }
-                }
+                StorageClass::External => TypedFieldCell {
+                    field: *field,
+                    type_code: encoded.type_code,
+                    storage_class: StorageClass::External,
+                    inline_bytes: Vec::new(),
+                    pointer: Some(ExternalPointer::Overflow {
+                        page_id: 1,
+                        offset: 0,
+                        len: payload_len,
+                        checksum: crc32c(&payload),
+                    }),
+                },
                 StorageClass::Segment => {
                     let family = pointer_family(encoded.pointer)?;
-                    let location = self.segment_store(family)?.append(&payload)?;
                     TypedFieldCell {
                         field: *field,
                         type_code: encoded.type_code,
@@ -583,9 +871,9 @@ impl PageRecordStore {
                         inline_bytes: Vec::new(),
                         pointer: Some(ExternalPointer::Segment {
                             family,
-                            segment_id: location.file_id,
-                            offset: location.offset,
-                            len: location.len,
+                            segment_id: 1,
+                            offset: 0,
+                            len: payload_len,
                         }),
                     }
                 }
@@ -597,7 +885,98 @@ impl PageRecordStore {
                     pointer: encoded.pointer,
                 },
             };
+            payloads.push(
+                if matches!(
+                    cell.storage_class,
+                    StorageClass::External | StorageClass::Segment
+                ) {
+                    Some(payload)
+                } else {
+                    None
+                },
+            );
             cells.push(cell);
+        }
+        // Fixed-width placeholders have exactly the final pointer shape. Validate
+        // every type, encoded length and destination page before any blob append.
+        let preflight_body = encode_typed_cells(&cells)?;
+        Self::validate_record_size(&[(FieldId::Dynamic(Did(0xffff)), &preflight_body)])?;
+        let sid = Sid(u16::try_from(self.next_sid).unwrap_or(1));
+        self.prepare_slot(&RecordSlot::from_fields(
+            sid,
+            &[(FieldId::Dynamic(Did(0xffff)), &preflight_body)],
+        ))?;
+        let mut offsets = BTreeMap::new();
+        let mut blobs = Vec::new();
+        for (index, payload) in payloads.into_iter().enumerate() {
+            let Some(payload) = payload else {
+                continue;
+            };
+            let family = match cells[index].pointer.clone() {
+                Some(ExternalPointer::Segment { family, .. }) => Some(family),
+                _ => None,
+            };
+            let path = match family {
+                Some(family) => {
+                    self.layout
+                        .segment_blob_path(self.cid, self.eid, family)
+                        .path
+                }
+                None => self.layout.overflow_blob_path(self.cid, self.eid).path,
+            };
+            let offset = match offsets.get(&path) {
+                Some(offset) => *offset,
+                None => match std::fs::metadata(&path) {
+                    Ok(metadata) if metadata.is_file() && metadata.len() >= 5 => metadata.len(),
+                    Ok(_) => return corrupt(&path, "typed blob is not a valid appendable file"),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => 5,
+                    Err(error) => return Err(error.into()),
+                },
+            };
+            let len = u32::try_from(payload.len()).map_err(|_| {
+                PraxisError::InvalidConfig("typed payload exceeds its v1 length field".to_string())
+            })?;
+            let next = offset
+                .checked_add(8)
+                .and_then(|value| value.checked_add(u64::from(len)))
+                .ok_or_else(|| PraxisError::WriteStalled {
+                    reason: "typed blob offset space is exhausted".to_string(),
+                })?;
+            offsets.insert(path.clone(), next);
+            let location = BlobLocation {
+                family,
+                file_id: 1,
+                offset,
+                len,
+                checksum: crc32c(&payload),
+            };
+            cells[index].pointer = Some(match family {
+                Some(family) => ExternalPointer::Segment {
+                    family,
+                    segment_id: 1,
+                    offset,
+                    len,
+                },
+                None => ExternalPointer::Overflow {
+                    page_id: 1,
+                    offset: u32::try_from(offset).map_err(|_| PraxisError::WriteStalled {
+                        reason: "v1 typed overflow offset space is exhausted".to_string(),
+                    })?,
+                    len,
+                    checksum: location.checksum,
+                },
+            });
+            blobs.push((payload, location, path));
+        }
+        for (payload, expected, path) in blobs {
+            self.side_effects.set(true);
+            let actual = match expected.family {
+                Some(family) => self.segment_store(family)?.append(&payload)?,
+                None => self.overflow_store()?.append(&payload)?,
+            };
+            if actual != expected {
+                return corrupt(&path, "typed blob append moved after preflight");
+            }
         }
         encode_typed_cells(&cells)
     }
@@ -646,11 +1025,11 @@ impl PageRecordStore {
             rid_to_entity.write_u32(address.eid.0);
 
             commit_state.write_u64(rid.0);
-            commit_state.write_u8(1);
+            commit_state.write_u8(u8::from(!self.deleted.contains(rid)));
         }
         let mut sequence = BinaryWriter::new();
         sequence.write_u64(self.next_rid);
-        sequence.write_u32(self.next_sid as u32);
+        sequence.write_u32(self.next_sid.min(u32::from(u16::MAX)));
         sequence.write_u32(self.current_pid.0);
 
         write_sidecar(&page_path, rid_to_page.into_inner())?;
@@ -686,6 +1065,45 @@ struct TypedFieldCell {
 }
 
 fn encode_typed_cells(cells: &[TypedFieldCell]) -> Result<Vec<u8>> {
+    u32::try_from(cells.len()).map_err(|_| {
+        PraxisError::InvalidConfig("typed field count exceeds its v1 length field".to_string())
+    })?;
+    let mut encoded_len = 17_usize; // v1 envelope plus the cell count.
+    for cell in cells {
+        u32::try_from(cell.inline_bytes.len()).map_err(|_| {
+            PraxisError::InvalidConfig("typed inline field exceeds its v1 length field".to_string())
+        })?;
+        let pointer_len = match &cell.pointer {
+            None => 1,
+            Some(ExternalPointer::Overflow { .. }) => 21,
+            Some(ExternalPointer::Segment { .. }) => 22,
+            Some(ExternalPointer::Catalog { catalog, .. }) => {
+                u32::try_from(catalog.len()).map_err(|_| {
+                    PraxisError::InvalidConfig(
+                        "typed catalog name exceeds its v1 length field".to_string(),
+                    )
+                })?;
+                catalog
+                    .len()
+                    .checked_add(13)
+                    .ok_or_else(|| PraxisError::WriteStalled {
+                        reason: "typed record length overflow".to_string(),
+                    })?
+            }
+        };
+        encoded_len = encoded_len
+            .checked_add(11)
+            .and_then(|len| len.checked_add(cell.inline_bytes.len()))
+            .and_then(|len| len.checked_add(pointer_len))
+            .ok_or_else(|| PraxisError::WriteStalled {
+                reason: "typed record length overflow".to_string(),
+            })?;
+        if encoded_len > crate::page::DEFAULT_PAGE_SIZE as usize - 16 {
+            return Err(PraxisError::WriteStalled {
+                reason: "typed record metadata cannot fit in a fresh page".to_string(),
+            });
+        }
+    }
     let mut payload = BinaryWriter::new();
     payload.write_u32(cells.len() as u32);
     for cell in cells {
