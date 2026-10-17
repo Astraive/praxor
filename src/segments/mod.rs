@@ -1,5 +1,6 @@
 pub mod block;
 pub mod bloom;
+pub(crate) mod codec;
 pub mod external;
 pub mod format;
 pub mod reader;

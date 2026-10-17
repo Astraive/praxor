@@ -145,65 +145,30 @@ fn encode_block_entries(
     bloom_filter: &mut BloomFilter,
     mut partitioned_bloom_filter: Option<&mut crate::segments::PartitionedBloomFilter>,
 ) -> Result<Vec<u8>> {
-    let mut payload = BinaryWriter::new();
-    payload.write_u32(entries.len() as u32);
+    let mut raw = Vec::with_capacity(entries.len());
     for entry in entries {
         bloom_filter.insert(&bloom_key(&entry.cf.0, &entry.key));
         if let Some(partitioned) = partitioned_bloom_filter.as_deref_mut() {
             partitioned.insert(&bloom_key(&entry.cf.0, &entry.key));
         }
-        payload.write_len_bytes(entry.cf.0.as_bytes());
-        payload.write_len_bytes(&entry.key);
-        payload.write_u64(entry.version.sequence);
-        match &entry.version.value {
-            StoredValue::Put(value) => {
-                if value.len() > options.large_value_threshold {
-                    let pointer = options.value_log.append(value)?;
-                    payload.write_u8(3);
-                    payload.write_len_bytes(pointer.path.as_bytes());
-                    payload.write_u64(pointer.offset);
-                    payload.write_u64(pointer.len);
-                    payload.write_u32(pointer.checksum);
-                } else {
-                    payload.write_u8(1);
-                    payload.write_len_bytes(value);
-                }
+        let mut entry = entry.clone();
+        let mut blob_expiry = None;
+        entry.version.value = match &entry.version.value {
+            StoredValue::Put(value) if value.len() > options.large_value_threshold => {
+                StoredValue::BlobPointer(options.value_log.append(value)?)
             }
             StoredValue::PutWithExpiry {
                 value,
                 expires_at_ms,
-            } => {
-                if value.len() > options.large_value_threshold {
-                    let pointer = options.value_log.append(value)?;
-                    payload.write_u8(4);
-                    payload.write_u64(*expires_at_ms);
-                    payload.write_len_bytes(pointer.path.as_bytes());
-                    payload.write_u64(pointer.offset);
-                    payload.write_u64(pointer.len);
-                    payload.write_u32(pointer.checksum);
-                } else {
-                    payload.write_u8(5);
-                    payload.write_u64(*expires_at_ms);
-                    payload.write_len_bytes(value);
-                }
+            } if value.len() > options.large_value_threshold => {
+                blob_expiry = Some(*expires_at_ms);
+                StoredValue::BlobPointer(options.value_log.append(value)?)
             }
-            StoredValue::Merge(value) => {
-                payload.write_u8(6);
-                payload.write_len_bytes(value);
-            }
-            StoredValue::BlobPointer(pointer) => {
-                payload.write_u8(3);
-                payload.write_len_bytes(pointer.path.as_bytes());
-                payload.write_u64(pointer.offset);
-                payload.write_u64(pointer.len);
-                payload.write_u32(pointer.checksum);
-            }
-            StoredValue::Delete => {
-                payload.write_u8(2);
-            }
-        }
+            value => value.clone(),
+        };
+        raw.push(crate::segments::codec::RawEntry { entry, blob_expiry });
     }
-    Ok(payload.into_inner())
+    crate::segments::codec::encode_entries(&raw)
 }
 
 fn encode_footer(index: &[BlockIndexEntry]) -> Vec<u8> {

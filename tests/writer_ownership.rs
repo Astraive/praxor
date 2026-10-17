@@ -264,6 +264,11 @@ fn restore_cannot_replace_a_live_root_or_primary_and_releases_ownership_after_co
         assert_eq!(contents(&target), before);
         owner.assert_marker();
         drop(owner);
+        if !matches!(kind, Kind::Core) {
+            assert!(PraxisEngine::restore_from_backup(&backup, &target).is_err());
+            assert_eq!(contents(&target), before);
+            continue;
+        }
         PraxisEngine::restore_from_backup(&backup, &target).unwrap();
         let restored = PraxisEngine::open(PraxisConfig::new(&target)).unwrap();
         assert_eq!(
@@ -275,7 +280,9 @@ fn restore_cannot_replace_a_live_root_or_primary_and_releases_ownership_after_co
     let store = RecordStore::open(target.join("primary")).unwrap();
     denied(PraxisEngine::restore_from_backup(&backup, &target));
     drop(store);
-    PraxisEngine::restore_from_backup(&backup, &target).unwrap();
+    let before = contents(&target);
+    assert!(PraxisEngine::restore_from_backup(&backup, &target).is_err());
+    assert_eq!(contents(&target), before);
 }
 
 struct Process(Child);
@@ -300,6 +307,11 @@ fn backup_cannot_replace_a_live_destination_or_its_nested_primary() {
         assert_eq!(contents(&target), before);
         owner.assert_marker();
         drop(owner);
+        if !matches!(kind, Kind::Core) {
+            assert!(source.backup_to(&target).is_err());
+            assert_eq!(contents(&target), before);
+            continue;
+        }
         source.backup_to(&target).unwrap();
         let reopened = PraxisEngine::open(PraxisConfig::new(&target)).unwrap();
         assert_eq!(
@@ -311,7 +323,9 @@ fn backup_cannot_replace_a_live_destination_or_its_nested_primary() {
     let store = RecordStore::open(target.join("primary")).unwrap();
     denied(source.backup_to(&target));
     drop(store);
-    source.backup_to(&target).unwrap();
+    let before = contents(&target);
+    assert!(source.backup_to(&target).is_err());
+    assert_eq!(contents(&target), before);
 }
 
 #[test]
@@ -430,8 +444,8 @@ fn destination_cleanup_never_follows_a_directory_alias_into_another_writer() {
         }
         panic!("cannot create symlink: {error}");
     }
-    source.backup_to(&target).unwrap();
-    assert!(!alias.exists());
+    assert!(source.backup_to(&target).is_err());
+    assert!(alias.exists());
     assert_eq!(contents(&outside), before);
     owner.assert_marker();
 }
