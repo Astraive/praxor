@@ -93,6 +93,12 @@ impl IndexInsert {
     }
 }
 
+/// Publishes primary records and index changes after their ordered WAL group
+/// is durable. A failed WAL write/sync has an ambiguous commit outcome; a
+/// plugin error after commit or a partially failed compaction can also leave
+/// in-memory state incomplete. In those cases reads, mutations and maintenance
+/// return `RecoveryRequired` until the handle is closed and reopened. Recovery
+/// applies complete groups and discards only incomplete terminal groups.
 pub struct StorageEngine {
     root: PathBuf,
     store: RecordStore,
@@ -110,6 +116,7 @@ pub struct StorageEngine {
     write_latency: LatencyTracker,
     compaction_latency: LatencyTracker,
     opened_at: Instant,
+    recovery_required: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -302,6 +309,7 @@ impl StorageEngine {
             write_latency: LatencyTracker::new(4096),
             compaction_latency: LatencyTracker::new(1024),
             opened_at: Instant::now(),
+            recovery_required: false,
         })
     }
 
@@ -326,109 +334,41 @@ impl StorageEngine {
         namespace: impl Into<String>,
         plugin: Box<dyn IndexPlugin>,
     ) -> Result<()> {
-        let index_type = index_type.into();
-        KernelInvariantValidator::validate_index_registration(
-            &index_type,
-            plugin.storage_layout(),
-        )?;
-        self.indexes.insert(index_type.clone(), plugin);
-        self.manifest
-            .plugin_namespaces
-            .insert(index_type.clone(), namespace.into());
-        self.replay_for_index(&index_type)?;
-        Ok(())
+        self.ensure_ready()?;
+        let prior_sequence = self.manifest.last_sequence;
+        let result = (|| {
+            let index_type = index_type.into();
+            KernelInvariantValidator::validate_index_registration(
+                &index_type,
+                plugin.storage_layout(),
+            )?;
+            self.indexes.insert(index_type.clone(), plugin);
+            self.manifest
+                .plugin_namespaces
+                .insert(index_type.clone(), namespace.into());
+            let replay = self.replay_for_index(&index_type);
+            if replay.is_err() {
+                self.recovery_required = true;
+            }
+            replay
+        })();
+        self.finish_mutation(prior_sequence, result)
     }
 
     pub fn put(&mut self, value: &[u8], index_inserts: &[IndexInsert]) -> Result<RecordId> {
-        let started = Instant::now();
-        self.ensure_indexes_exist(
-            index_inserts
-                .iter()
-                .map(|insert| insert.index_type.as_str()),
-        )?;
-        let rid = self.store.put(value)?;
-        let location = self.store.location(rid)?;
-        let mut entries = Vec::with_capacity(index_inserts.len() + 1);
-        entries.push(StorageWalEntry {
-            sequence: 0,
-            index_type: "primary".to_string(),
-            key: encode_location(location),
-            rid: Some(rid),
-            operation: StorageWalOperation::Put,
-        });
-        for insert in index_inserts {
-            entries.push(StorageWalEntry {
-                sequence: 0,
-                index_type: insert.index_type.clone(),
-                key: insert.key.clone(),
-                rid: Some(rid),
-                operation: StorageWalOperation::Put,
-            });
-        }
-        self.append_wal_batch(&mut entries)?;
-        KernelInvariantValidator::validate_write(
-            true,
-            false,
-            StorageOperationMetrics {
-                latency_us: started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
-                bytes_written: value.len() as u64,
-                io_ops: entries.len() as u64,
-                ..StorageOperationMetrics::default()
-            },
-        )?;
-        for (insert, wal_entry) in index_inserts.iter().zip(entries.iter().skip(1)) {
-            let plugin = self.indexes.get_mut(&insert.index_type).ok_or_else(|| {
-                PraxisError::InvalidConfig(format!("unknown index plugin: {}", insert.index_type))
-            })?;
-            plugin.put_with_sequence(&insert.key, rid, wal_entry.sequence)?;
-        }
-        self.flush_directory_if_needed(1)?;
-        KernelInvariantValidator::validate_write(
-            true,
-            true,
-            StorageOperationMetrics {
-                latency_us: started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
-                bytes_written: value.len() as u64,
-                io_ops: entries.len() as u64,
-                ..StorageOperationMetrics::default()
-            },
-        )?;
-        self.metrics.writes.fetch_add(1, Ordering::Relaxed);
-        self.metrics
-            .write_bytes
-            .fetch_add(value.len() as u64, Ordering::Relaxed);
-        record_latency(&self.write_latency, started);
-        Ok(rid)
-    }
-
-    pub fn put_batch(&mut self, records: &[BatchRecord<'_>]) -> Result<Vec<RecordId>> {
-        let started = Instant::now();
-        if records.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        self.ensure_indexes_exist(
-            records
-                .iter()
-                .flat_map(|record| record.index_inserts.iter())
-                .map(|insert| insert.index_type.as_str()),
-        )?;
-
-        let mut rids = Vec::with_capacity(records.len());
-        let mut entries = Vec::with_capacity(
-            records.len()
-                + records
+        self.ensure_ready()?;
+        let prior_sequence = self.manifest.last_sequence;
+        let result = (|| {
+            let started = Instant::now();
+            self.ensure_indexes_exist(
+                index_inserts
                     .iter()
-                    .map(|record| record.index_inserts.len())
-                    .sum::<usize>(),
-        );
-        let mut total_value_bytes = 0_u64;
-
-        for record in records {
-            let rid = self.store.put_unsynced(record.value)?;
-            let location = self.store.location(rid)?;
-            total_value_bytes += record.value.len() as u64;
-            rids.push(rid);
+                    .map(|insert| insert.index_type.as_str()),
+            )?;
+            let prepared = self.store.prepare_put(value)?;
+            let rid = prepared.rid;
+            let location = prepared.location;
+            let mut entries = Vec::with_capacity(index_inserts.len() + 1);
             entries.push(StorageWalEntry {
                 sequence: 0,
                 index_type: "primary".to_string(),
@@ -436,7 +376,7 @@ impl StorageEngine {
                 rid: Some(rid),
                 operation: StorageWalOperation::Put,
             });
-            for insert in record.index_inserts {
+            for insert in index_inserts {
                 entries.push(StorageWalEntry {
                     sequence: 0,
                     index_type: insert.index_type.clone(),
@@ -445,26 +385,21 @@ impl StorageEngine {
                     operation: StorageWalOperation::Put,
                 });
             }
-        }
-
-        self.store.sync_active_segment()?;
-        self.append_wal_batch(&mut entries)?;
-        KernelInvariantValidator::validate_write(
-            true,
-            false,
-            StorageOperationMetrics {
-                latency_us: started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
-                bytes_written: total_value_bytes,
-                io_ops: entries.len() as u64,
-                ..StorageOperationMetrics::default()
-            },
-        )?;
-
-        let mut entry_cursor = 0;
-        for (record, rid) in records.iter().zip(rids.iter().copied()) {
-            entry_cursor += 1; // primary WAL entry
-            for insert in record.index_inserts {
-                let wal_entry = &entries[entry_cursor];
+            StorageWal::validate_batch(&entries)?;
+            self.store.sync_active_segment()?;
+            self.append_wal_batch(&mut entries)?;
+            self.store.publish_puts(&[prepared]);
+            KernelInvariantValidator::validate_write(
+                true,
+                false,
+                StorageOperationMetrics {
+                    latency_us: started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+                    bytes_written: value.len() as u64,
+                    io_ops: entries.len() as u64,
+                    ..StorageOperationMetrics::default()
+                },
+            )?;
+            for (insert, wal_entry) in index_inserts.iter().zip(entries.iter().skip(1)) {
                 let plugin = self.indexes.get_mut(&insert.index_type).ok_or_else(|| {
                     PraxisError::InvalidConfig(format!(
                         "unknown index plugin: {}",
@@ -472,74 +407,188 @@ impl StorageEngine {
                     ))
                 })?;
                 plugin.put_with_sequence(&insert.key, rid, wal_entry.sequence)?;
-                entry_cursor += 1;
             }
-        }
+            self.flush_directory_if_needed(1)?;
+            KernelInvariantValidator::validate_write(
+                true,
+                true,
+                StorageOperationMetrics {
+                    latency_us: started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+                    bytes_written: value.len() as u64,
+                    io_ops: entries.len() as u64,
+                    ..StorageOperationMetrics::default()
+                },
+            )?;
+            self.metrics.writes.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .write_bytes
+                .fetch_add(value.len() as u64, Ordering::Relaxed);
+            record_latency(&self.write_latency, started);
+            Ok(rid)
+        })();
+        self.finish_mutation(prior_sequence, result)
+    }
 
-        self.flush_directory_if_needed(records.len() as u64)?;
-        KernelInvariantValidator::validate_write(
-            true,
-            true,
-            StorageOperationMetrics {
-                latency_us: started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
-                bytes_written: total_value_bytes,
-                io_ops: entries.len() as u64,
-                ..StorageOperationMetrics::default()
-            },
-        )?;
-        self.metrics
-            .writes
-            .fetch_add(records.len() as u64, Ordering::Relaxed);
-        self.metrics
-            .write_bytes
-            .fetch_add(total_value_bytes, Ordering::Relaxed);
-        record_latency(&self.write_latency, started);
-        Ok(rids)
+    pub fn put_batch(&mut self, records: &[BatchRecord<'_>]) -> Result<Vec<RecordId>> {
+        self.ensure_ready()?;
+        let prior_sequence = self.manifest.last_sequence;
+        let result = (|| {
+            let started = Instant::now();
+            if records.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            self.ensure_indexes_exist(
+                records
+                    .iter()
+                    .flat_map(|record| record.index_inserts.iter())
+                    .map(|insert| insert.index_type.as_str()),
+            )?;
+
+            let mut rids = Vec::with_capacity(records.len());
+            let mut entries = Vec::with_capacity(
+                records.len()
+                    + records
+                        .iter()
+                        .map(|record| record.index_inserts.len())
+                        .sum::<usize>(),
+            );
+            let mut total_value_bytes = 0_u64;
+            let mut prepared_puts = Vec::with_capacity(records.len());
+
+            for record in records {
+                let prepared = self.store.prepare_put(record.value)?;
+                let rid = prepared.rid;
+                let location = prepared.location;
+                prepared_puts.push(prepared);
+                total_value_bytes += record.value.len() as u64;
+                rids.push(rid);
+                entries.push(StorageWalEntry {
+                    sequence: 0,
+                    index_type: "primary".to_string(),
+                    key: encode_location(location),
+                    rid: Some(rid),
+                    operation: StorageWalOperation::Put,
+                });
+                for insert in record.index_inserts {
+                    entries.push(StorageWalEntry {
+                        sequence: 0,
+                        index_type: insert.index_type.clone(),
+                        key: insert.key.clone(),
+                        rid: Some(rid),
+                        operation: StorageWalOperation::Put,
+                    });
+                }
+            }
+
+            StorageWal::validate_batch(&entries)?;
+            self.store.sync_active_segment()?;
+            self.append_wal_batch(&mut entries)?;
+            self.store.publish_puts(&prepared_puts);
+            KernelInvariantValidator::validate_write(
+                true,
+                false,
+                StorageOperationMetrics {
+                    latency_us: started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+                    bytes_written: total_value_bytes,
+                    io_ops: entries.len() as u64,
+                    ..StorageOperationMetrics::default()
+                },
+            )?;
+
+            let mut entry_cursor = 0;
+            for (record, rid) in records.iter().zip(rids.iter().copied()) {
+                entry_cursor += 1; // primary WAL entry
+                for insert in record.index_inserts {
+                    let wal_entry = &entries[entry_cursor];
+                    let plugin = self.indexes.get_mut(&insert.index_type).ok_or_else(|| {
+                        PraxisError::InvalidConfig(format!(
+                            "unknown index plugin: {}",
+                            insert.index_type
+                        ))
+                    })?;
+                    plugin.put_with_sequence(&insert.key, rid, wal_entry.sequence)?;
+                    entry_cursor += 1;
+                }
+            }
+
+            self.flush_directory_if_needed(records.len() as u64)?;
+            KernelInvariantValidator::validate_write(
+                true,
+                true,
+                StorageOperationMetrics {
+                    latency_us: started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+                    bytes_written: total_value_bytes,
+                    io_ops: entries.len() as u64,
+                    ..StorageOperationMetrics::default()
+                },
+            )?;
+            self.metrics
+                .writes
+                .fetch_add(records.len() as u64, Ordering::Relaxed);
+            self.metrics
+                .write_bytes
+                .fetch_add(total_value_bytes, Ordering::Relaxed);
+            record_latency(&self.write_latency, started);
+            Ok(rids)
+        })();
+        self.finish_mutation(prior_sequence, result)
     }
 
     pub fn put_index(&mut self, index_type: &str, key: &[u8], rid: RecordId) -> Result<()> {
-        let started = Instant::now();
-        self.ensure_indexes_exist(std::iter::once(index_type))?;
-        if !self.store.contains(rid) {
-            self.metrics.write_errors.fetch_add(1, Ordering::Relaxed);
-            return Err(PraxisError::KeyNotFound);
-        }
-        let sequence = self.append_wal(StorageWalEntry {
-            sequence: 0,
-            index_type: index_type.to_string(),
-            key: key.to_vec(),
-            rid: Some(rid),
-            operation: StorageWalOperation::Put,
-        })?;
-        let plugin = self.indexes.get_mut(index_type).ok_or_else(|| {
-            PraxisError::InvalidConfig(format!("unknown index plugin: {index_type}"))
-        })?;
-        plugin.put_with_sequence(key, rid, sequence)?;
-        self.metrics.writes.fetch_add(1, Ordering::Relaxed);
-        record_latency(&self.write_latency, started);
-        Ok(())
+        self.ensure_ready()?;
+        let prior_sequence = self.manifest.last_sequence;
+        let result = (|| {
+            let started = Instant::now();
+            self.ensure_indexes_exist(std::iter::once(index_type))?;
+            if !self.store.contains(rid) {
+                self.metrics.write_errors.fetch_add(1, Ordering::Relaxed);
+                return Err(PraxisError::KeyNotFound);
+            }
+            let sequence = self.append_wal(StorageWalEntry {
+                sequence: 0,
+                index_type: index_type.to_string(),
+                key: key.to_vec(),
+                rid: Some(rid),
+                operation: StorageWalOperation::Put,
+            })?;
+            let plugin = self.indexes.get_mut(index_type).ok_or_else(|| {
+                PraxisError::InvalidConfig(format!("unknown index plugin: {index_type}"))
+            })?;
+            plugin.put_with_sequence(key, rid, sequence)?;
+            self.metrics.writes.fetch_add(1, Ordering::Relaxed);
+            record_latency(&self.write_latency, started);
+            Ok(())
+        })();
+        self.finish_mutation(prior_sequence, result)
     }
 
     pub fn delete_index(&mut self, index_type: &str, key: &[u8]) -> Result<()> {
-        let started = Instant::now();
-        self.ensure_indexes_exist(std::iter::once(index_type))?;
-        let sequence = self.append_wal(StorageWalEntry {
-            sequence: 0,
-            index_type: index_type.to_string(),
-            key: key.to_vec(),
-            rid: None,
-            operation: StorageWalOperation::Delete,
-        })?;
-        let plugin = self.indexes.get_mut(index_type).ok_or_else(|| {
-            PraxisError::InvalidConfig(format!("unknown index plugin: {index_type}"))
-        })?;
-        plugin.delete_with_sequence(key, sequence)?;
-        self.metrics.deletes.fetch_add(1, Ordering::Relaxed);
-        record_latency(&self.write_latency, started);
-        Ok(())
+        self.ensure_ready()?;
+        let prior_sequence = self.manifest.last_sequence;
+        let result = (|| {
+            let started = Instant::now();
+            self.ensure_indexes_exist(std::iter::once(index_type))?;
+            let sequence = self.append_wal(StorageWalEntry {
+                sequence: 0,
+                index_type: index_type.to_string(),
+                key: key.to_vec(),
+                rid: None,
+                operation: StorageWalOperation::Delete,
+            })?;
+            let plugin = self.indexes.get_mut(index_type).ok_or_else(|| {
+                PraxisError::InvalidConfig(format!("unknown index plugin: {index_type}"))
+            })?;
+            plugin.delete_with_sequence(key, sequence)?;
+            self.metrics.deletes.fetch_add(1, Ordering::Relaxed);
+            record_latency(&self.write_latency, started);
+            Ok(())
+        })();
+        self.finish_mutation(prior_sequence, result)
     }
 
     pub fn lookup_rid(&self, index_type: &str, key: &[u8]) -> Result<Option<RecordId>> {
+        self.ensure_ready()?;
         let plugin = self.indexes.get(index_type).ok_or_else(|| {
             PraxisError::InvalidConfig(format!("unknown index plugin: {index_type}"))
         })?;
@@ -552,6 +601,7 @@ impl StorageEngine {
         key: &[u8],
         sequence: u64,
     ) -> Result<Option<RecordId>> {
+        self.ensure_ready()?;
         let plugin = self.indexes.get(index_type).ok_or_else(|| {
             PraxisError::InvalidConfig(format!("unknown index plugin: {index_type}"))
         })?;
@@ -559,6 +609,7 @@ impl StorageEngine {
     }
 
     pub fn fetch(&self, rid: RecordId) -> Result<Vec<u8>> {
+        self.ensure_ready()?;
         let started = Instant::now();
         let result = self.store.get(rid);
         record_latency(&self.read_latency, started);
@@ -586,57 +637,82 @@ impl StorageEngine {
     }
 
     pub fn delete_record(&mut self, rid: RecordId) -> Result<()> {
-        let started = Instant::now();
-        let _sequence = self.append_wal(StorageWalEntry {
-            sequence: 0,
-            index_type: "primary".to_string(),
-            key: Vec::new(),
-            rid: Some(rid),
-            operation: StorageWalOperation::Delete,
-        })?;
-        self.store.delete(rid)?;
-        self.flush_directory_if_needed(1)?;
-        self.metrics.deletes.fetch_add(1, Ordering::Relaxed);
-        record_latency(&self.write_latency, started);
-        Ok(())
-    }
-
-    pub fn delete_records(&mut self, rids: &[RecordId]) -> Result<()> {
-        if rids.is_empty() {
-            return Ok(());
-        }
-
-        let started = Instant::now();
-        let mut entries: Vec<StorageWalEntry> = rids
-            .iter()
-            .copied()
-            .map(|rid| StorageWalEntry {
+        self.ensure_ready()?;
+        let prior_sequence = self.manifest.last_sequence;
+        let result = (|| {
+            if !self.store.contains_record(rid) {
+                return Err(PraxisError::KeyNotFound);
+            }
+            let started = Instant::now();
+            let _sequence = self.append_wal(StorageWalEntry {
                 sequence: 0,
                 index_type: "primary".to_string(),
                 key: Vec::new(),
                 rid: Some(rid),
                 operation: StorageWalOperation::Delete,
-            })
-            .collect();
-        self.append_wal_batch(&mut entries)?;
-        for rid in rids {
-            self.store.delete(*rid)?;
-        }
-        self.flush_directory_if_needed(rids.len() as u64)?;
-        self.metrics
-            .deletes
-            .fetch_add(rids.len() as u64, Ordering::Relaxed);
-        record_latency(&self.write_latency, started);
-        Ok(())
+            })?;
+            self.store.delete(rid)?;
+            self.flush_directory_if_needed(1)?;
+            self.metrics.deletes.fetch_add(1, Ordering::Relaxed);
+            record_latency(&self.write_latency, started);
+            Ok(())
+        })();
+        self.finish_mutation(prior_sequence, result)
+    }
+
+    pub fn delete_records(&mut self, rids: &[RecordId]) -> Result<()> {
+        self.ensure_ready()?;
+        let prior_sequence = self.manifest.last_sequence;
+        let result = (|| {
+            if rids.is_empty() {
+                return Ok(());
+            }
+            if rids.iter().any(|rid| !self.store.contains_record(*rid)) {
+                return Err(PraxisError::KeyNotFound);
+            }
+
+            let started = Instant::now();
+            let mut entries: Vec<StorageWalEntry> = rids
+                .iter()
+                .copied()
+                .map(|rid| StorageWalEntry {
+                    sequence: 0,
+                    index_type: "primary".to_string(),
+                    key: Vec::new(),
+                    rid: Some(rid),
+                    operation: StorageWalOperation::Delete,
+                })
+                .collect();
+            self.append_wal_batch(&mut entries)?;
+            for rid in rids {
+                self.store.delete(*rid)?;
+            }
+            self.flush_directory_if_needed(rids.len() as u64)?;
+            self.metrics
+                .deletes
+                .fetch_add(rids.len() as u64, Ordering::Relaxed);
+            record_latency(&self.write_latency, started);
+            Ok(())
+        })();
+        self.finish_mutation(prior_sequence, result)
     }
 
     pub fn delete_by_index(&mut self, index_type: &str, key: &[u8]) -> Result<Option<RecordId>> {
-        let rid = self.lookup_rid(index_type, key)?;
-        self.delete_index(index_type, key)?;
-        if let Some(rid) = rid {
-            self.delete_record(rid)?;
-        }
-        Ok(rid)
+        self.ensure_ready()?;
+        let prior_sequence = self.manifest.last_sequence;
+        let result = (|| {
+            let rid = self.lookup_rid(index_type, key)?;
+            if let Some(rid) = rid {
+                self.delete_record_with_index_cleanup(
+                    rid,
+                    &[IndexInsert::new(index_type, key.to_vec())],
+                )?;
+            } else {
+                self.delete_index(index_type, key)?;
+            }
+            Ok(rid)
+        })();
+        self.finish_mutation(prior_sequence, result)
     }
 
     pub fn delete_record_with_index_cleanup(
@@ -644,26 +720,67 @@ impl StorageEngine {
         rid: RecordId,
         index_keys: &[IndexInsert],
     ) -> Result<()> {
-        self.ensure_indexes_exist(index_keys.iter().map(|insert| insert.index_type.as_str()))?;
-        for index_key in index_keys {
-            self.delete_index(&index_key.index_type, &index_key.key)?;
-        }
-        self.delete_record(rid)
+        self.ensure_ready()?;
+        let prior_sequence = self.manifest.last_sequence;
+        let result = (|| {
+            self.ensure_indexes_exist(index_keys.iter().map(|insert| insert.index_type.as_str()))?;
+            if !self.store.contains_record(rid) {
+                return Err(PraxisError::KeyNotFound);
+            }
+            let started = Instant::now();
+            let mut entries: Vec<_> = index_keys
+                .iter()
+                .map(|key| StorageWalEntry {
+                    sequence: 0,
+                    index_type: key.index_type.clone(),
+                    key: key.key.clone(),
+                    rid: None,
+                    operation: StorageWalOperation::Delete,
+                })
+                .collect();
+            entries.push(StorageWalEntry {
+                sequence: 0,
+                index_type: "primary".into(),
+                key: Vec::new(),
+                rid: Some(rid),
+                operation: StorageWalOperation::Delete,
+            });
+            self.append_wal_batch(&mut entries)?;
+            for (key, entry) in index_keys.iter().zip(&entries) {
+                self.indexes
+                    .get_mut(&key.index_type)
+                    .expect("indexes prevalidated")
+                    .delete_with_sequence(&key.key, entry.sequence)?;
+            }
+            self.store.delete(rid)?;
+            self.flush_directory_if_needed(1)?;
+            self.metrics
+                .deletes
+                .fetch_add(entries.len() as u64, Ordering::Relaxed);
+            record_latency(&self.write_latency, started);
+            Ok(())
+        })();
+        self.finish_mutation(prior_sequence, result)
     }
 
     pub fn compact_primary(&mut self) -> Result<CompactionStats> {
-        let started = Instant::now();
-        let job_id = compaction_job_id(self.manifest.last_sequence);
-        let prepared = self.prepare_primary_compaction()?;
-        let cleaned_segments = self
-            .store
-            .complete_compaction_cleanup(&prepared.old_segment_ids, prepared.new_segment_id)?;
-        self.append_manifest_edit(ManifestEdit::CompactionCleanupComplete {
-            job_id,
-            cleaned_segments,
-        })?;
-        record_latency(&self.compaction_latency, started);
-        Ok(prepared.stats)
+        self.ensure_ready()?;
+        let prior_sequence = self.manifest.last_sequence;
+        let result = (|| {
+            let started = Instant::now();
+            let job_id = compaction_job_id(self.manifest.last_sequence);
+            let prepared = self.prepare_primary_compaction()?;
+            let cleaned_segments = self
+                .store
+                .complete_compaction_cleanup(&prepared.old_segment_ids, prepared.new_segment_id)?;
+            self.append_manifest_edit(ManifestEdit::CompactionCleanupComplete {
+                job_id,
+                cleaned_segments,
+            })?;
+            record_latency(&self.compaction_latency, started);
+            Ok(prepared.stats)
+        })();
+        self.finish_mutation(prior_sequence, result)
     }
 
     pub fn compact_indexes(&mut self) -> Result<Vec<IndexCompactionReport>> {
@@ -676,41 +793,51 @@ impl StorageEngine {
         &mut self,
         index_types: &[impl AsRef<str>],
     ) -> Result<Vec<IndexCompactionReport>> {
-        let mut reports = Vec::with_capacity(index_types.len());
-        for index_name in index_types {
-            let index_name = index_name.as_ref();
-            let plugin = self.indexes.get_mut(index_name).ok_or_else(|| {
-                PraxisError::InvalidConfig(format!("unknown index plugin: {index_name}"))
-            })?;
-            let before = plugin.stats();
-            plugin.compact()?;
-            plugin.flush()?;
-            let after = plugin.stats();
-            reports.push(IndexCompactionReport {
-                index_type: index_name.to_string(),
-                before,
-                after,
-            });
-            *self
-                .manifest
-                .index_compaction_runs
-                .entry(index_name.to_string())
-                .or_insert(0) += 1;
-            self.manifest
-                .last_compacted_at_sequence
-                .insert(index_name.to_string(), self.manifest.last_sequence);
-        }
-        self.bump_manifest_version()?;
-        Ok(reports)
+        self.ensure_ready()?;
+        let prior_sequence = self.manifest.last_sequence;
+        let result = (|| {
+            let mut reports = Vec::with_capacity(index_types.len());
+            for index_name in index_types {
+                let index_name = index_name.as_ref();
+                let plugin = self.indexes.get_mut(index_name).ok_or_else(|| {
+                    PraxisError::InvalidConfig(format!("unknown index plugin: {index_name}"))
+                })?;
+                let before = plugin.stats();
+                plugin.compact()?;
+                plugin.flush()?;
+                let after = plugin.stats();
+                reports.push(IndexCompactionReport {
+                    index_type: index_name.to_string(),
+                    before,
+                    after,
+                });
+                *self
+                    .manifest
+                    .index_compaction_runs
+                    .entry(index_name.to_string())
+                    .or_insert(0) += 1;
+                self.manifest
+                    .last_compacted_at_sequence
+                    .insert(index_name.to_string(), self.manifest.last_sequence);
+            }
+            self.bump_manifest_version()?;
+            Ok(reports)
+        })();
+        self.finish_mutation(prior_sequence, result)
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        self.store.flush()?;
-        self.dirty_directory_entries = 0;
-        for plugin in self.indexes.values_mut() {
-            plugin.flush()?;
-        }
-        self.bump_manifest_version()
+        self.ensure_ready()?;
+        let prior_sequence = self.manifest.last_sequence;
+        let result = (|| {
+            self.store.flush()?;
+            self.dirty_directory_entries = 0;
+            for plugin in self.indexes.values_mut() {
+                plugin.flush()?;
+            }
+            self.bump_manifest_version()
+        })();
+        self.finish_mutation(prior_sequence, result)
     }
 
     pub fn cache_mut(&mut self) -> &mut UnifiedBlockCache {
@@ -854,24 +981,29 @@ impl StorageEngine {
         &mut self,
         options: MaintenanceCycleOptions,
     ) -> Result<MaintenanceCycleReport> {
-        let suggested = self.suggest_index_compactions(options.stale_version_threshold);
-        let selected: Vec<String> = suggested
-            .iter()
-            .take(options.max_jobs)
-            .map(|job| job.index_type.clone())
-            .collect();
-        let executed = if selected.is_empty() {
-            Vec::new()
-        } else {
-            self.compact_selected_indexes(&selected)?
-        };
-        self.manifest.maintenance_cycles_run += 1;
-        self.manifest.last_maintenance_at_sequence = Some(self.manifest.last_sequence);
-        self.save_manifest_metadata_only()?;
-        Ok(MaintenanceCycleReport {
-            suggested,
-            executed,
-        })
+        self.ensure_ready()?;
+        let prior_sequence = self.manifest.last_sequence;
+        let result = (|| {
+            let suggested = self.suggest_index_compactions(options.stale_version_threshold);
+            let selected: Vec<String> = suggested
+                .iter()
+                .take(options.max_jobs)
+                .map(|job| job.index_type.clone())
+                .collect();
+            let executed = if selected.is_empty() {
+                Vec::new()
+            } else {
+                self.compact_selected_indexes(&selected)?
+            };
+            self.manifest.maintenance_cycles_run += 1;
+            self.manifest.last_maintenance_at_sequence = Some(self.manifest.last_sequence);
+            self.save_manifest_metadata_only()?;
+            Ok(MaintenanceCycleReport {
+                suggested,
+                executed,
+            })
+        })();
+        self.finish_mutation(prior_sequence, result)
     }
 
     pub fn wal_path(&self) -> &Path {
@@ -879,24 +1011,27 @@ impl StorageEngine {
     }
 
     fn append_wal(&mut self, mut entry: StorageWalEntry) -> Result<u64> {
-        self.manifest.last_sequence += 1;
-        entry.sequence = self.manifest.last_sequence;
-        let wal_bytes = estimated_wal_entry_bytes(&entry);
-        self.wal.append(&entry)?;
-        self.metrics.wal_records.fetch_add(1, Ordering::Relaxed);
-        self.metrics
-            .wal_bytes
-            .fetch_add(wal_bytes, Ordering::Relaxed);
+        self.append_wal_batch(std::slice::from_mut(&mut entry))?;
         Ok(entry.sequence)
     }
 
     fn append_wal_batch(&mut self, entries: &mut [StorageWalEntry]) -> Result<()> {
+        self.ensure_ready()?;
+        let count = u64::try_from(entries.len())
+            .map_err(|_| PraxisError::InvalidConfig("WAL sequence count overflow".into()))?;
+        let end = self
+            .manifest
+            .last_sequence
+            .checked_add(count)
+            .ok_or_else(|| PraxisError::InvalidConfig("WAL sequence exhausted".into()))?;
+        let mut next = self.manifest.last_sequence;
         for entry in entries.iter_mut() {
-            self.manifest.last_sequence += 1;
-            entry.sequence = self.manifest.last_sequence;
+            next += 1;
+            entry.sequence = next;
         }
         let wal_bytes = entries.iter().map(estimated_wal_entry_bytes).sum();
         self.wal.append_batch(entries)?;
+        self.manifest.last_sequence = end;
         self.metrics
             .wal_records
             .fetch_add(entries.len() as u64, Ordering::Relaxed);
@@ -963,13 +1098,47 @@ impl StorageEngine {
     }
 
     fn prepare_primary_compaction(&mut self) -> Result<PreparedCompaction> {
+        // A relocation set is one atomic group. Validate its size before
+        // compact_prepare mutates or persists any directory locations.
+        let preflight = self
+            .store
+            .indirection
+            .live_rids()
+            .map(|rid| {
+                Ok(StorageWalEntry {
+                    sequence: 0,
+                    index_type: "primary".into(),
+                    key: encode_location(self.store.location(rid)?),
+                    rid: Some(rid),
+                    operation: StorageWalOperation::Put,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        StorageWal::validate_batch(&preflight)?;
+        self.manifest
+            .last_sequence
+            .checked_add(
+                u64::try_from(preflight.len()).map_err(|_| {
+                    PraxisError::InvalidConfig("WAL sequence count overflow".into())
+                })?,
+            )
+            .ok_or_else(|| PraxisError::InvalidConfig("WAL sequence exhausted".into()))?;
+        drop(preflight);
         let job_id = compaction_job_id(self.manifest.last_sequence);
         let old_segments = self.store.live_segment_ids()?;
         self.append_manifest_edit(ManifestEdit::CompactionStarted {
             job_id: job_id.clone(),
             old_segments: old_segments.clone(),
         })?;
-        let prepared = self.store.compact_prepare()?;
+        let prepared = match self.store.compact_prepare() {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // compact_prepare may have moved some in-memory mappings
+                // before a later source read/IO fails, without advancing WAL.
+                self.recovery_required = true;
+                return Err(error);
+            }
+        };
         // Recovery replays the complete primary WAL, including the physical
         // locations written before compaction. Persist replacement locations
         // before installing the compaction or deleting any source segments.
@@ -1003,6 +1172,29 @@ impl StorageEngine {
     fn append_manifest_edit(&mut self, edit: ManifestEdit) -> Result<()> {
         self.manifest.append_edit(edit);
         self.bump_manifest_version()
+    }
+
+    // Validation errors before any WAL/IO leave the handle usable. Once a
+    // sequence is durable or an IO outcome is uncertain, errors require reopen.
+    // compact_prepare and index replay also set the flag explicitly when they
+    // can mutate state without advancing the sequence.
+    fn finish_mutation<T>(&mut self, prior_sequence: u64, result: Result<T>) -> Result<T> {
+        if result.is_err()
+            && (self.manifest.last_sequence != prior_sequence
+                || self.wal.requires_recovery()
+                || matches!(&result, Err(PraxisError::Io(_))))
+        {
+            self.recovery_required = true;
+        }
+        result
+    }
+
+    fn ensure_ready(&self) -> Result<()> {
+        if self.recovery_required || self.wal.requires_recovery() {
+            Err(PraxisError::RecoveryRequired)
+        } else {
+            Ok(())
+        }
     }
 
     fn bump_manifest_version(&mut self) -> Result<()> {
@@ -1281,4 +1473,51 @@ fn estimated_wal_entry_bytes(entry: &StorageWalEntry) -> u64 {
 
 fn record_latency(tracker: &LatencyTracker, started: Instant) {
     tracker.record(started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
+}
+
+#[cfg(test)]
+mod atomic_group_tests {
+    use super::*;
+    use std::io::{Seek, SeekFrom, Write};
+
+    #[test]
+    fn partial_compaction_relocation_error_requires_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = StorageEngine::open(dir.path(), 1024).unwrap();
+        engine.put(b"one", &[]).unwrap();
+        engine.put(b"two", &[]).unwrap();
+        engine.put(b"three", &[]).unwrap();
+        engine.flush().unwrap();
+        // Select the second RID in the same stable in-memory iteration used by
+        // compact_prepare, so one mapping moves before the corrupt read fails.
+        let order: Vec<_> = engine.store.indirection.live_rids().collect();
+        let loc = engine.store.location(order[1]).unwrap();
+        let path = dir
+            .path()
+            .join("primary")
+            .join("records")
+            .join(format!("{:08x}.trec", loc.segment_id));
+        let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.seek(SeekFrom::Start(loc.record_offset + 8)).unwrap();
+        file.write_all(&[0xff]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        assert!(matches!(
+            engine.compact_primary(),
+            Err(PraxisError::Corrupt { .. })
+        ));
+        assert!(matches!(
+            engine.fetch(order[0]),
+            Err(PraxisError::RecoveryRequired)
+        ));
+        assert!(matches!(
+            engine.put(b"later", &[]),
+            Err(PraxisError::RecoveryRequired)
+        ));
+        assert!(matches!(engine.flush(), Err(PraxisError::RecoveryRequired)));
+        assert!(matches!(
+            engine.compact_primary(),
+            Err(PraxisError::RecoveryRequired)
+        ));
+    }
 }
