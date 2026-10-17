@@ -1,16 +1,129 @@
-//! Bounded syntax, detached binding, and pure in-memory SELECT row semantics.
-//! The public compiler and distinct EXPLAIN artifact follow in later checkpoints.
+//! Strict, process-local Q1 SELECT compiler and pure in-memory row semantics.
+//! This does not authorize product storage, routing, or persisted catalog reads.
 mod binder;
 mod catalog;
 mod evaluator;
+mod explain;
 mod lexer;
 mod syntax;
 
 #[cfg(test)]
 mod stage4_tests;
 
+pub use binder::{BoundSelect, ParameterValue, TypedParameters};
+pub use catalog::{QueryCatalogAuthority, QueryCatalogView};
+pub use evaluator::{ProjectedRow, execute_in_memory};
+pub use explain::{ExplainV1, PredicateShapeOp};
+
+use super::parser::{LogicalPlan, QueryOperation};
+use std::fmt;
+
+/// Accepted source forms for the Q1 compiler. Legacy plans are inspected only
+/// for deterministic refusal because they lack projection and literal provenance.
+#[derive(Clone, Copy)]
+pub enum CompileInput<'a> {
+    Sql(&'a str),
+    LegacyPlan(&'a LogicalPlan),
+}
+
+impl fmt::Debug for CompileInput<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Sql(_) => "CompileInput::Sql(<redacted>)",
+            Self::LegacyPlan(_) => "CompileInput::LegacyPlan(<redacted>)",
+        })
+    }
+}
+
+/// Only `Select` carries an executable capability; `Explain` carries no rows or
+/// bound values and cannot be passed to `execute_in_memory`.
+#[derive(Debug)]
+pub enum CompiledStatement {
+    Select(BoundSelect),
+    Explain(ExplainV1),
+}
+
+fn unsupported_legacy_feature(plan: &LogicalPlan) -> Option<&'static str> {
+    if plan.operation != QueryOperation::Select {
+        Some("operation")
+    } else if !plan.joins.is_empty() {
+        Some("join")
+    } else if plan.full_text.is_some() {
+        Some("full_text")
+    } else if plan.vector.is_some() {
+        Some("vector")
+    } else if plan.traversal.is_some() {
+        Some("traversal")
+    } else if plan.rank_by.is_some() {
+        Some("rank")
+    } else if plan.order_by.is_some() {
+        Some("order_by")
+    } else if plan.limit.is_some() {
+        Some("limit")
+    } else if plan.offset.is_some() {
+        Some("offset")
+    } else if plan.distinct {
+        Some("distinct")
+    } else if plan.group_by.is_some() {
+        Some("group_by")
+    } else if plan.having.is_some() {
+        Some("having")
+    } else if plan.as_of.is_some() {
+        Some("as_of")
+    } else if plan.mutation.is_some() {
+        Some("mutation")
+    } else if plan.ddl.is_some() {
+        Some("ddl")
+    } else if !plan.ctes.is_empty() {
+        Some("cte")
+    } else if !plan.window_functions.is_empty() {
+        Some("window")
+    } else if plan.explain_analyze {
+        Some("explain_analyze")
+    } else if !plan.params.positional.is_empty() || !plan.params.named.is_empty() {
+        Some("legacy_parameters")
+    } else {
+        None
+    }
+}
+
+/// Compile one SQL SELECT or EXPLAIN SELECT against a detached catalog view.
+///
+/// The source is capped at 64 KiB UTF-8, 4096 tokens, and 64 nested boolean
+/// groups/NOTs. Positional placeholders are `$1..$256`; every supplied value
+/// must be referenced. Join, grouping, history, ordering, limit, mutation,
+/// specialized search/vector/graph clauses, and multiple statements are refused.
+/// Legacy `LogicalPlan` values can never be promoted to a bound select.
+pub fn compile(
+    input: CompileInput<'_>,
+    values: &TypedParameters,
+    catalog: &QueryCatalogView,
+) -> Result<CompiledStatement, QueryCompileError> {
+    match input {
+        CompileInput::Sql(sql) => {
+            let syntax = syntax::parse_sql(sql)?;
+            let explain = syntax.explain;
+            let bound = binder::bind_syntax(syntax, values, catalog)?;
+            if explain {
+                Ok(CompiledStatement::Explain(ExplainV1::from_bound(&bound)))
+            } else {
+                Ok(CompiledStatement::Select(bound))
+            }
+        }
+        CompileInput::LegacyPlan(plan) => {
+            if let Some(feature) = unsupported_legacy_feature(plan) {
+                return Err(QueryCompileError::UnsupportedFeature {
+                    feature,
+                    span: None,
+                });
+            }
+            Err(QueryCompileError::LegacyPlanUnbound)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct ByteSpan {
+pub struct ByteSpan {
     pub start: usize,
     pub end: usize,
 }
@@ -514,7 +627,7 @@ pub(super) enum ParseError {
 }
 
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
-pub(super) enum QueryCompileError {
+pub enum QueryCompileError {
     #[error("query syntax error: {code}")]
     Syntax { code: &'static str, span: ByteSpan },
     #[error("unsupported query feature: {feature}")]
@@ -543,6 +656,8 @@ pub(super) enum QueryCompileError {
     StaleCatalog,
     #[error("foreign catalog view")]
     ForeignCatalog,
+    #[error("legacy logical plans lack bound projection and literal provenance")]
+    LegacyPlanUnbound,
     #[error("row data contract violation: {code}")]
     DataContract { code: &'static str },
     #[error("invalid bound predicate: {code}")]

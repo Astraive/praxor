@@ -281,7 +281,7 @@ fn referenced_fields_are_validated_even_when_predicate_would_skip_a_row() {
 }
 
 #[test]
-fn stale_foreign_and_explain_plans_are_refused_before_row_validation() {
+fn stale_and_foreign_plans_are_refused_before_row_validation() {
     let owner = users_owner();
     let malformed = row("orders", "bad", &[]);
     let select = bind_sql(
@@ -308,19 +308,6 @@ fn stale_foreign_and_explain_plans_are_refused_before_row_validation() {
     assert!(matches!(
         execute_in_memory(&owner, &select, &[]),
         Err(QueryCompileError::StaleCatalog)
-    ));
-    let explain = bind_sql(
-        "EXPLAIN SELECT name FROM users",
-        &TypedParameters::default(),
-        &owner.view(),
-    )
-    .unwrap();
-    assert!(matches!(
-        execute_in_memory(&owner, &explain, &[malformed]),
-        Err(QueryCompileError::UnsupportedFeature {
-            feature: "explain_execution",
-            span: None
-        })
     ));
 }
 

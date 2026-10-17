@@ -9,8 +9,9 @@ use serde_json::Value;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
+/// A document logical ID and ordered projection pairs from an in-memory scan.
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct ProjectedRow {
+pub struct ProjectedRow {
     pub id: RecordId,
     pub fields: Vec<(String, Value)>,
 }
@@ -222,18 +223,16 @@ fn predicate_result(
     }
 }
 
-pub(super) fn execute_in_memory(
+/// Scan the supplied immutable records in slice order with three-valued WHERE
+/// semantics. Validates owner/revision before any row and again before return;
+/// every referenced field is type-checked on every row, including filtered rows.
+/// This helper does not access a provider or promise storage result ordering.
+pub fn execute_in_memory(
     authority: &QueryCatalogAuthority,
     select: &BoundSelect,
     rows: &[Record],
 ) -> Result<Vec<ProjectedRow>, QueryCompileError> {
     authority.validate_bound(select)?;
-    if select.explain {
-        return Err(QueryCompileError::UnsupportedFeature {
-            feature: "explain_execution",
-            span: None,
-        });
-    }
     let fields = referenced_fields(select);
     let mut results = Vec::new();
     for row in rows {
