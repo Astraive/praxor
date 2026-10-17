@@ -1,5 +1,7 @@
 //! Strict syntax stage for the bounded, engine-owned SELECT compiler.
 //! Binding, execution, and the public entrypoint follow in later checkpoints.
+mod binder;
+mod catalog;
 mod lexer;
 mod syntax;
 
@@ -7,6 +9,484 @@ mod syntax;
 pub(super) struct ByteSpan {
     pub start: usize,
     pub end: usize,
+}
+
+#[cfg(test)]
+mod stage3_tests {
+    use super::QueryCompileError;
+    use super::binder::{BoundPredicateOp, ParameterValue, TypedParameters, bind_sql};
+    use super::catalog::QueryCatalogAuthority;
+    use crate::catalog::schema::{
+        AttributeSchema, AttributeType, Catalog, CollectionSchema, IntegerType, ScalarType,
+    };
+    use std::collections::BTreeMap;
+
+    fn schema(name: &str, fields: &[(&str, AttributeType)]) -> CollectionSchema {
+        fields
+            .iter()
+            .fold(CollectionSchema::new(name), |schema, (field, kind)| {
+                schema.with_attribute(AttributeSchema::new(*field, kind.clone()))
+            })
+    }
+
+    fn authority(collection: CollectionSchema) -> QueryCatalogAuthority {
+        let mut catalog = Catalog::new();
+        catalog.create_collection(collection).unwrap();
+        QueryCatalogAuthority::new(catalog)
+    }
+
+    fn bind(
+        sql: &str,
+        catalog: &QueryCatalogAuthority,
+    ) -> Result<super::binder::BoundSelect, QueryCompileError> {
+        bind_sql(sql, &TypedParameters::default(), &catalog.view())
+    }
+
+    #[test]
+    fn catalog_view_is_detached_versioned_and_owner_bound() {
+        let mut old = Catalog::new();
+        old.create_collection(schema("users", &[("name", AttributeType::Text)]))
+            .unwrap();
+        let mut retained_copy = old.clone();
+        let owner = QueryCatalogAuthority::new(old);
+        let view = owner.view();
+        assert_eq!(view.revision(), 1);
+        retained_copy.drop_collection("users").unwrap();
+        let selected =
+            bind_sql("SELECT name FROM users", &TypedParameters::default(), &view).unwrap();
+        assert_eq!(selected.collection(), "users");
+        assert_eq!(selected.projection_names(), ["name"]);
+        assert!(owner.validate_bound(&selected).is_ok());
+
+        let foreign = authority(schema("users", &[("name", AttributeType::Text)]));
+        assert!(matches!(
+            foreign.validate_bound(&selected),
+            Err(QueryCompileError::ForeignCatalog)
+        ));
+        assert!(matches!(
+            foreign.validate_view(&view),
+            Err(QueryCompileError::ForeignCatalog)
+        ));
+
+        owner
+            .replace_collection(schema(
+                "users",
+                &[("age", AttributeType::Integer(IntegerType::Int4))],
+            ))
+            .unwrap();
+        assert_eq!(owner.view().revision(), 2);
+        assert!(view.schemas["users"].attributes.contains_key("name"));
+        assert!(!view.schemas["users"].attributes.contains_key("age"));
+        assert!(owner.view().schemas["users"].attributes.contains_key("age"));
+        assert!(
+            !owner.view().schemas["users"]
+                .attributes
+                .contains_key("name")
+        );
+        assert!(matches!(
+            owner.validate_bound(&selected),
+            Err(QueryCompileError::StaleCatalog)
+        ));
+        assert!(matches!(
+            bind_sql("SELECT name FROM users", &TypedParameters::default(), &view),
+            Err(QueryCompileError::StaleCatalog)
+        ));
+
+        owner.drop_collection("users").unwrap();
+        assert_eq!(owner.view().revision(), 3);
+        owner
+            .replace_collection(schema("users", &[("name", AttributeType::Text)]))
+            .unwrap();
+        assert_eq!(owner.view().revision(), 4);
+        assert!(matches!(
+            owner.validate_bound(&selected),
+            Err(QueryCompileError::StaleCatalog)
+        ));
+    }
+
+    #[test]
+    fn named_projection_resolves_only_referenced_fields_and_star_uses_catalog_order() {
+        let owner = authority(schema(
+            "docs",
+            &[
+                ("title", AttributeType::Text),
+                ("payload", AttributeType::Json),
+            ],
+        ));
+        let selected = bind("SELECT title FROM docs", &owner).unwrap();
+        assert_eq!(selected.projection_names(), ["title"]);
+        assert!(
+            matches!(bind("SELECT * FROM docs", &owner), Err(QueryCompileError::UnsupportedFieldType { field, .. }) if field == "payload")
+        );
+        assert!(
+            matches!(bind("SELECT payload FROM docs", &owner), Err(QueryCompileError::UnsupportedFieldType { field, .. }) if field == "payload")
+        );
+        assert!(
+            matches!(bind("SELECT unknown FROM docs", &owner), Err(QueryCompileError::UnknownField { field, .. }) if field == "unknown")
+        );
+        assert!(matches!(
+            bind("SELECT title, title FROM docs", &owner),
+            Err(QueryCompileError::Syntax {
+                code: "duplicate_projection",
+                ..
+            })
+        ));
+
+        let ordered = authority(schema(
+            "users",
+            &[
+                ("name", AttributeType::Text),
+                ("age", AttributeType::Integer(IntegerType::Int4)),
+                ("active", AttributeType::Boolean),
+            ],
+        ));
+        assert_eq!(
+            bind("SELECT * FROM users", &ordered)
+                .unwrap()
+                .projection_names(),
+            ["active", "age", "name"]
+        );
+        assert_eq!(
+            bind("SELECT name, age FROM users", &ordered)
+                .unwrap()
+                .projection_names(),
+            ["name", "age"]
+        );
+        assert!(matches!(
+            bind("SELECT name FROM missing", &ordered),
+            Err(QueryCompileError::UnknownCollection { .. })
+        ));
+    }
+
+    #[test]
+    fn integer_literals_obey_exact_declared_signed_and_unsigned_ranges() {
+        let owner = authority(schema(
+            "ints",
+            &[
+                ("s2", AttributeType::Integer(IntegerType::Int2)),
+                ("s4", AttributeType::Integer(IntegerType::Int4)),
+                ("s8", AttributeType::Integer(IntegerType::Int8)),
+                ("scalar", AttributeType::Scalar(ScalarType::Integer)),
+                ("u8", AttributeType::Integer(IntegerType::Uint8)),
+            ],
+        ));
+        for sql in [
+            "SELECT s2 FROM ints WHERE s2 = -32768",
+            "SELECT s2 FROM ints WHERE s2 = 32767",
+            "SELECT s4 FROM ints WHERE s4 = -2147483648",
+            "SELECT s4 FROM ints WHERE s4 = 2147483647",
+            "SELECT s8 FROM ints WHERE s8 = -9223372036854775808",
+            "SELECT s8 FROM ints WHERE s8 = 9223372036854775807",
+            "SELECT scalar FROM ints WHERE scalar = -9223372036854775808",
+            "SELECT scalar FROM ints WHERE scalar = 9223372036854775807",
+            "SELECT u8 FROM ints WHERE u8 = 0",
+            "SELECT u8 FROM ints WHERE u8 = 18446744073709551615",
+        ] {
+            assert!(bind(sql, &owner).is_ok(), "{sql}");
+        }
+        for sql in [
+            "SELECT s2 FROM ints WHERE s2 = -32769",
+            "SELECT s2 FROM ints WHERE s2 = 32768",
+            "SELECT s4 FROM ints WHERE s4 = -2147483649",
+            "SELECT s4 FROM ints WHERE s4 = 2147483648",
+            "SELECT s8 FROM ints WHERE s8 = -9223372036854775809",
+            "SELECT s8 FROM ints WHERE s8 = 9223372036854775808",
+            "SELECT scalar FROM ints WHERE scalar = -9223372036854775809",
+            "SELECT scalar FROM ints WHERE scalar = 9223372036854775808",
+            "SELECT u8 FROM ints WHERE u8 = -1",
+            "SELECT u8 FROM ints WHERE u8 = 18446744073709551616",
+        ] {
+            assert!(
+                matches!(
+                    bind(sql, &owner),
+                    Err(QueryCompileError::TypeMismatch { .. })
+                ),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_parameters_do_not_cross_domains_or_reuse_different_field_types() {
+        let owner = authority(schema(
+            "ints",
+            &[
+                ("s2", AttributeType::Integer(IntegerType::Int2)),
+                ("s4", AttributeType::Integer(IntegerType::Int4)),
+                ("s8", AttributeType::Integer(IntegerType::Int8)),
+                ("u8", AttributeType::Integer(IntegerType::Uint8)),
+            ],
+        ));
+        let signed = TypedParameters {
+            positional: vec![ParameterValue::I64(1)],
+            named: BTreeMap::new(),
+        };
+        let unsigned = TypedParameters {
+            positional: vec![ParameterValue::U64(1)],
+            named: BTreeMap::new(),
+        };
+        let null = TypedParameters {
+            positional: vec![ParameterValue::Null],
+            named: BTreeMap::new(),
+        };
+        assert!(bind_sql("SELECT s2 FROM ints WHERE s2 = $1", &signed, &owner.view()).is_ok());
+        assert!(
+            bind_sql(
+                "SELECT u8 FROM ints WHERE u8 = $1",
+                &unsigned,
+                &owner.view()
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            bind_sql("SELECT u8 FROM ints WHERE u8 = $1", &signed, &owner.view()),
+            Err(QueryCompileError::Parameter {
+                code: "incompatible_type",
+                ..
+            })
+        ));
+        assert!(matches!(
+            bind_sql(
+                "SELECT s8 FROM ints WHERE s8 = $1",
+                &unsigned,
+                &owner.view()
+            ),
+            Err(QueryCompileError::Parameter {
+                code: "incompatible_type",
+                ..
+            })
+        ));
+        assert!(matches!(
+            bind_sql(
+                "SELECT s2 FROM ints WHERE s2 = $1 AND s4 = $1",
+                &null,
+                &owner.view()
+            ),
+            Err(QueryCompileError::Parameter {
+                code: "incompatible_reuse",
+                ..
+            })
+        ));
+        assert!(matches!(
+            bind_sql(
+                "SELECT s2 FROM ints WHERE s2 = $1",
+                &TypedParameters::default(),
+                &owner.view()
+            ),
+            Err(QueryCompileError::Parameter {
+                code: "missing",
+                ..
+            })
+        ));
+        assert!(matches!(
+            bind_sql(
+                "SELECT s2 FROM ints WHERE s2 = $1",
+                &TypedParameters {
+                    positional: vec![ParameterValue::I64(1), ParameterValue::I64(2)],
+                    named: BTreeMap::new()
+                },
+                &owner.view()
+            ),
+            Err(QueryCompileError::Parameter { code: "extra", .. })
+        ));
+        assert!(matches!(
+            bind_sql(
+                "SELECT s2 FROM ints WHERE s2 = $2",
+                &TypedParameters {
+                    positional: vec![ParameterValue::I64(1), ParameterValue::I64(2)],
+                    named: BTreeMap::new()
+                },
+                &owner.view()
+            ),
+            Err(QueryCompileError::Parameter { code: "gap", .. })
+        ));
+    }
+
+    #[test]
+    fn supplied_positional_parameters_are_bounded_before_index_conversion() {
+        let owner = authority(schema(
+            "ints",
+            &[("s2", AttributeType::Integer(IntegerType::Int2))],
+        ));
+        for supplied_count in [257, 65_537] {
+            let parameters = TypedParameters {
+                positional: vec![ParameterValue::I64(1); supplied_count],
+                named: BTreeMap::new(),
+            };
+            assert!(matches!(
+                bind_sql(
+                    "SELECT s2 FROM ints WHERE s2 = $1",
+                    &parameters,
+                    &owner.view()
+                ),
+                Err(QueryCompileError::LimitExceeded {
+                    code: "positional_parameters",
+                    span: None
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn named_parameter_namespace_is_exact_and_reused_without_text_rewriting() {
+        let owner = authority(schema("tokens", &[("name", AttributeType::Text)]));
+        let hostile = ParameterValue::Text("x' OR TRUE --".into());
+        let values = TypedParameters {
+            positional: vec![],
+            named: BTreeMap::from([("needle".into(), hostile)]),
+        };
+        let plan = bind_sql(
+            "SELECT name FROM tokens WHERE name = :needle OR name = @needle",
+            &values,
+            &owner.view(),
+        )
+        .unwrap();
+        assert_eq!(plan.projection_names(), ["name"]);
+        assert_eq!(plan.predicate.as_ref().unwrap().len(), 3);
+        for operator in plan.predicate.as_ref().unwrap().iter().take(2) {
+            let BoundPredicateOp::Compare { value, .. } = operator else {
+                panic!("expected bound comparison")
+            };
+            assert_eq!(value, &ParameterValue::Text("x' OR TRUE --".into()));
+        }
+        assert!(matches!(
+            bind_sql(
+                "SELECT name FROM tokens WHERE name = :Needle",
+                &values,
+                &owner.view()
+            ),
+            Err(QueryCompileError::Parameter {
+                code: "missing",
+                ..
+            })
+        ));
+        assert!(matches!(
+            bind_sql(
+                "SELECT name FROM tokens WHERE name = :needle",
+                &TypedParameters {
+                    positional: vec![],
+                    named: BTreeMap::from([
+                        ("needle".into(), ParameterValue::Text("Ada".into())),
+                        ("extra".into(), ParameterValue::Text("x".into()))
+                    ])
+                },
+                &owner.view()
+            ),
+            Err(QueryCompileError::Parameter { code: "extra", .. })
+        ));
+        assert!(matches!(
+            bind_sql(
+                "SELECT name FROM tokens WHERE name = :needle",
+                &TypedParameters::default(),
+                &owner.view()
+            ),
+            Err(QueryCompileError::Parameter {
+                code: "missing",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn flat_boolean_predicate_binds_iteratively_without_recursive_left_spine() {
+        let owner = authority(schema(
+            "ints",
+            &[("s2", AttributeType::Integer(IntegerType::Int2))],
+        ));
+        let sql = format!(
+            "SELECT s2 FROM ints WHERE {}",
+            (0..1_000)
+                .map(|_| "s2 = 1")
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        );
+        let plan = bind(&sql, &owner).unwrap();
+        assert_eq!(plan.predicate.as_ref().unwrap().len(), 1_999);
+    }
+
+    #[test]
+    fn scalar_bool_and_text_bind_exact_types_and_ten_positional_slots() {
+        let scalars = authority(schema(
+            "scalars",
+            &[
+                ("flag", AttributeType::Scalar(ScalarType::Boolean)),
+                ("label", AttributeType::Scalar(ScalarType::Text)),
+            ],
+        ));
+        let boolean = TypedParameters {
+            positional: vec![ParameterValue::Bool(true)],
+            named: BTreeMap::new(),
+        };
+        assert!(
+            bind_sql(
+                "SELECT label FROM scalars WHERE flag = $1",
+                &boolean,
+                &scalars.view()
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            bind_sql(
+                "SELECT label FROM scalars WHERE flag = $1",
+                &TypedParameters {
+                    positional: vec![ParameterValue::Text("true".into())],
+                    named: BTreeMap::new()
+                },
+                &scalars.view()
+            ),
+            Err(QueryCompileError::Parameter {
+                code: "incompatible_type",
+                ..
+            })
+        ));
+        assert!(bind("SELECT label FROM scalars WHERE label < 'Ž'", &scalars).is_ok());
+        assert!(matches!(
+            bind("SELECT label FROM scalars WHERE flag < TRUE", &scalars),
+            Err(QueryCompileError::UnsupportedFeature {
+                feature: "boolean_order",
+                ..
+            })
+        ));
+
+        let ints = authority(schema(
+            "ints",
+            &[("s2", AttributeType::Integer(IntegerType::Int2))],
+        ));
+        let params = TypedParameters {
+            positional: vec![ParameterValue::I64(1); 10],
+            named: BTreeMap::new(),
+        };
+        let sql = format!(
+            "SELECT s2 FROM ints WHERE {}",
+            (1..=10)
+                .map(|index| format!("s2 = ${index}"))
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        );
+        assert_eq!(
+            bind_sql(&sql, &params, &ints.view())
+                .unwrap()
+                .predicate
+                .as_ref()
+                .unwrap()
+                .len(),
+            19
+        );
+        assert!(matches!(
+            bind_sql(
+                "SELECT s2 FROM ints WHERE s2 = $1",
+                &TypedParameters {
+                    positional: vec![ParameterValue::I64(32_768)],
+                    named: BTreeMap::new()
+                },
+                &ints.view()
+            ),
+            Err(QueryCompileError::Parameter {
+                code: "incompatible_type",
+                ..
+            })
+        ));
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -27,6 +507,64 @@ pub(super) enum ParseError {
         code: &'static str,
         span: ByteSpan,
     },
+}
+
+#[derive(Debug, Eq, PartialEq, thiserror::Error)]
+pub(super) enum QueryCompileError {
+    #[error("query syntax error: {code}")]
+    Syntax { code: &'static str, span: ByteSpan },
+    #[error("unsupported query feature: {feature}")]
+    UnsupportedFeature {
+        feature: &'static str,
+        span: Option<ByteSpan>,
+    },
+    #[error("unknown collection")]
+    UnknownCollection {
+        name: String,
+        span: Option<ByteSpan>,
+    },
+    #[error("unknown field")]
+    UnknownField { field: String, span: ByteSpan },
+    #[error("unsupported field type")]
+    UnsupportedFieldType { field: String, span: ByteSpan },
+    #[error("parameter error: {code}")]
+    Parameter {
+        code: &'static str,
+        reference: String,
+        span: Option<ByteSpan>,
+    },
+    #[error("query type mismatch")]
+    TypeMismatch { field: String, span: ByteSpan },
+    #[error("stale catalog view")]
+    StaleCatalog,
+    #[error("foreign catalog view")]
+    ForeignCatalog,
+    #[error("query limit exceeded: {code}")]
+    LimitExceeded {
+        code: &'static str,
+        span: Option<ByteSpan>,
+    },
+}
+
+impl From<ParseError> for QueryCompileError {
+    fn from(error: ParseError) -> Self {
+        match error {
+            ParseError::Syntax { code, span } => Self::Syntax { code, span },
+            ParseError::UnsupportedFeature { feature, span } => Self::UnsupportedFeature {
+                feature,
+                span: Some(span),
+            },
+            ParseError::Parameter { code, span } => Self::Parameter {
+                code,
+                reference: "<lexical>".into(),
+                span: Some(span),
+            },
+            ParseError::LimitExceeded { code, span } => Self::LimitExceeded {
+                code,
+                span: Some(span),
+            },
+        }
+    }
 }
 
 #[cfg(test)]
