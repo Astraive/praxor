@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PraxisError {
+    #[error("database is already open for writing: {path}")]
+    AlreadyOpen { path: PathBuf },
     #[error("storage handle requires recovery; close and reopen it before continuing")]
     RecoveryRequired,
     #[error(

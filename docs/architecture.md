@@ -388,3 +388,7 @@ Praxis should evolve toward:
 - FoundationDB-style determinism.
 
 All of that should share one canonical value layer, one WAL/recovery system, one snapshot/MVCC model, one cache/memory/IO architecture, and one replication primitive layer.
+
+Supported durable writers follow the [exclusive ownership contract](writer-ownership.md).
+Independent handles retain OS leases; legitimate sharing uses explicit owners
+and clones. Raw physical utilities remain offline building blocks.

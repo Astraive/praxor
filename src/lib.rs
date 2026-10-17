@@ -49,6 +49,7 @@ pub mod transactions;
 pub mod types;
 pub mod values;
 pub mod wal;
+mod writer_lease;
 
 pub use catalog::schema::{
     AttributeSchema, AttributeType, Catalog, CollectionSchema, DistanceMetric, StorageClass,
