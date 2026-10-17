@@ -41,6 +41,11 @@ gpu-vulkan = ["gpu"]
 gpu-metal = ["gpu"]
 
 [[bench]]
+name = "group_commit"
+path = "benches/durability/group_commit_bench.rs"
+harness = false
+
+[[bench]]
 name = "kv_storage"
 path = "benches/kv/storage_bench.rs"
 harness = false

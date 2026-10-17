@@ -7,6 +7,14 @@ pub struct EngineMetrics {
     pub reads: AtomicU64,
     pub deletes: AtomicU64,
     pub wal_records: AtomicU64,
+    /// Requests admitted to the core commit path (not WAL rotation/header syncs).
+    pub write_admissions: AtomicU64,
+    pub commit_groups: AtomicU64,
+    pub commit_batches: AtomicU64,
+    pub commit_syncs: AtomicU64,
+    pub commit_sync_attempts: AtomicU64,
+    pub commit_queue_wait_ns: AtomicU64,
+    pub commit_sync_ns: AtomicU64,
     pub wal_bytes: AtomicU64,
     pub write_bytes: AtomicU64,
     pub read_errors: AtomicU64,
@@ -28,11 +36,19 @@ pub struct EngineMetrics {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EngineMetricsSnapshot {
     pub writes: u64,
     pub reads: u64,
     pub deletes: u64,
     pub wal_records: u64,
+    pub write_admissions: u64,
+    pub commit_groups: u64,
+    pub commit_batches: u64,
+    pub commit_syncs: u64,
+    pub commit_sync_attempts: u64,
+    pub commit_queue_wait_ns: u64,
+    pub commit_sync_ns: u64,
     pub wal_bytes: u64,
     pub write_bytes: u64,
     pub read_errors: u64,
@@ -60,6 +76,13 @@ impl EngineMetrics {
             reads: self.reads.load(Ordering::Relaxed),
             deletes: self.deletes.load(Ordering::Relaxed),
             wal_records: self.wal_records.load(Ordering::Relaxed),
+            write_admissions: self.write_admissions.load(Ordering::Relaxed),
+            commit_groups: self.commit_groups.load(Ordering::Relaxed),
+            commit_batches: self.commit_batches.load(Ordering::Relaxed),
+            commit_syncs: self.commit_syncs.load(Ordering::Relaxed),
+            commit_sync_attempts: self.commit_sync_attempts.load(Ordering::Relaxed),
+            commit_queue_wait_ns: self.commit_queue_wait_ns.load(Ordering::Relaxed),
+            commit_sync_ns: self.commit_sync_ns.load(Ordering::Relaxed),
             wal_bytes: self.wal_bytes.load(Ordering::Relaxed),
             write_bytes: self.write_bytes.load(Ordering::Relaxed),
             read_errors: self.read_errors.load(Ordering::Relaxed),
