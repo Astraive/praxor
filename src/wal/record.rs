@@ -1,3 +1,4 @@
+use crate::core_records::codec::Envelope;
 use crate::errors::{PraxisError, Result};
 use crate::io::{BinaryReader, BinaryWriter, crc32c};
 use crate::transactions::{BatchOp, WriteBatch};
@@ -24,6 +25,86 @@ pub struct WalRecord {
 pub(crate) enum RecordPrefix {
     Complete {
         record: WalRecord,
+        encoded_len: usize,
+    },
+    Torn,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CoreWalRecord {
+    User(WalRecord),
+    Record {
+        sequence: u64,
+        envelope: Envelope,
+        batch: WriteBatch,
+    },
+}
+
+impl CoreWalRecord {
+    pub(crate) fn sequence(&self) -> u64 {
+        match self {
+            Self::User(record) => record.sequence,
+            Self::Record { sequence, .. } => *sequence,
+        }
+    }
+    pub(crate) fn batch(&self) -> &WriteBatch {
+        match self {
+            Self::User(record) => &record.batch,
+            Self::Record { batch, .. } => batch,
+        }
+    }
+    pub(crate) fn into_user(self, source: &Path) -> Result<WalRecord> {
+        match self {
+            Self::User(record) => Ok(record),
+            Self::Record { .. } => Err(PraxisError::RecordAuthorityWalRequired {
+                path: source.to_path_buf(),
+            }),
+        }
+    }
+    pub(crate) fn try_encode(&self) -> Result<Vec<u8>> {
+        let Self::Record {
+            sequence,
+            envelope,
+            batch,
+        } = self
+        else {
+            return match self {
+                Self::User(record) => record.try_encode(),
+                _ => unreachable!(),
+            };
+        };
+        let ordinary_len = WalRecord::checked_encoded_batch_len(batch)?;
+        checked_payload_add(ordinary_len - WAL_RECORD_HEADER_LEN, 5 + Envelope::LEN)?;
+        let count = checked_u32(batch.len(), "operation count")?
+            .checked_add(1)
+            .ok_or_else(|| invalid("WAL operation count overflow"))?;
+        let envelope = envelope.encode(*sequence)?;
+        let ordinary = WalRecord {
+            sequence: *sequence,
+            batch: batch.clone(),
+        }
+        .try_encode()?;
+        let mut payload =
+            Vec::with_capacity(ordinary.len() - WAL_RECORD_HEADER_LEN + 5 + Envelope::LEN);
+        payload.extend(sequence.to_le_bytes());
+        payload.extend(count.to_le_bytes());
+        payload.push(5);
+        payload.extend((Envelope::LEN as u32).to_le_bytes());
+        payload.extend(envelope);
+        payload.extend(&ordinary[WAL_RECORD_HEADER_LEN + PAYLOAD_HEADER_LEN..]);
+        let mut out = Vec::with_capacity(payload.len() + WAL_RECORD_HEADER_LEN);
+        out.extend(WAL_V2_MAGIC.to_le_bytes());
+        out.extend((payload.len() as u32).to_le_bytes());
+        out.extend(crc32c(&payload).to_le_bytes());
+        out.extend(crc32c(&out).to_le_bytes());
+        out.extend(payload);
+        Ok(out)
+    }
+}
+
+pub(crate) enum CoreRecordPrefix {
+    Complete {
+        record: CoreWalRecord,
         encoded_len: usize,
     },
     Torn,
@@ -176,8 +257,21 @@ fn corrupt(source: &Path, reason: impl Into<String>) -> PraxisError {
 /// Short terminal headers retain the existing torn-suffix policy. A complete
 /// v2 header must authenticate its length before EOF can classify it as torn.
 pub(crate) fn parse_record_prefix(bytes: &[u8], source: &Path) -> Result<RecordPrefix> {
+    match parse_core_record_prefix(bytes, source)? {
+        CoreRecordPrefix::Complete {
+            record,
+            encoded_len,
+        } => Ok(RecordPrefix::Complete {
+            record: record.into_user(source)?,
+            encoded_len,
+        }),
+        CoreRecordPrefix::Torn => Ok(RecordPrefix::Torn),
+    }
+}
+
+pub(crate) fn parse_core_record_prefix(bytes: &[u8], source: &Path) -> Result<CoreRecordPrefix> {
     if bytes.len() < LEGACY_RECORD_HEADER_LEN {
-        return Ok(RecordPrefix::Torn);
+        return Ok(CoreRecordPrefix::Torn);
     }
     let magic = u32::from_le_bytes(bytes[..4].try_into().unwrap());
     let header_len = match magic {
@@ -186,7 +280,7 @@ pub(crate) fn parse_record_prefix(bytes: &[u8], source: &Path) -> Result<RecordP
         _ => return Err(corrupt(source, "bad WAL record magic")),
     };
     if bytes.len() < header_len {
-        return Ok(RecordPrefix::Torn);
+        return Ok(CoreRecordPrefix::Torn);
     }
     if magic == WAL_V2_MAGIC {
         let expected_header = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
@@ -207,7 +301,7 @@ pub(crate) fn parse_record_prefix(bytes: &[u8], source: &Path) -> Result<RecordP
             // corruption, even when a later record follows it. Probe without
             // allocating fields or constructing a batch. Truly incomplete
             // legacy bodies retain their historical torn-tail policy.
-            if let Some((_, consumed)) = walk_payload(available, source, |_| {})?
+            if let Some((_, _, consumed)) = walk_payload(available, source, |_| {})?
                 && crc32c(&available[..consumed]) == expected
             {
                 return Err(corrupt(
@@ -216,22 +310,32 @@ pub(crate) fn parse_record_prefix(bytes: &[u8], source: &Path) -> Result<RecordP
                 ));
             }
         }
-        return Ok(RecordPrefix::Torn);
+        return Ok(CoreRecordPrefix::Torn);
     }
     let payload = &available[..len];
     if crc32c(payload) != expected {
         return Err(corrupt(source, "WAL checksum mismatch"));
     }
-    let Some((sequence, consumed)) = walk_payload(payload, source, |_| {})? else {
+    let Some((sequence, envelope, consumed)) = walk_payload(payload, source, |_| {})? else {
         return Err(corrupt(source, "truncated WAL payload"));
     };
     if consumed != payload.len() {
         return Err(corrupt(source, "trailing WAL payload bytes"));
     }
+    if magic == WAL_MAGIC && envelope.is_some() {
+        return Err(corrupt(source, "record authority requires v2 WAL framing"));
+    }
     let mut batch = WriteBatch::new();
     walk_payload(payload, source, |op| batch.push_op(op.into_owned()))?;
-    Ok(RecordPrefix::Complete {
-        record: WalRecord { sequence, batch },
+    Ok(CoreRecordPrefix::Complete {
+        record: match envelope {
+            Some(envelope) => CoreWalRecord::Record {
+                sequence,
+                envelope,
+                batch,
+            },
+            None => CoreWalRecord::User(WalRecord { sequence, batch }),
+        },
         encoded_len: header_len + len,
     })
 }
@@ -309,7 +413,7 @@ fn walk_payload<'a>(
     payload: &'a [u8],
     source: &Path,
     mut visit: impl FnMut(BorrowedOp<'a>),
-) -> Result<Option<(u64, usize)>> {
+) -> Result<Option<(u64, Option<Envelope>, usize)>> {
     if payload.len() < PAYLOAD_HEADER_LEN {
         return Ok(None);
     }
@@ -322,11 +426,25 @@ fn walk_payload<'a>(
     if ops > reader.remaining() / MIN_OP_LEN {
         return Ok(None);
     }
-    for _ in 0..ops {
+    let mut envelope = None;
+    for index in 0..ops {
         if reader.remaining() == 0 {
             return Ok(None);
         }
         let tag = reader.read_u8()?;
+        if tag == 5 {
+            if index != 0 {
+                return Err(corrupt(
+                    source,
+                    "record authority control must occur once and first",
+                ));
+            }
+            let Some(bytes) = partial_field(&mut reader)? else {
+                return Ok(None);
+            };
+            envelope = Some(Envelope::decode(bytes, sequence, source)?);
+            continue;
+        }
         if !matches!(tag, 1..=4) {
             return Err(corrupt(source, format!("unknown WAL op tag {tag}")));
         }
@@ -363,12 +481,101 @@ fn walk_payload<'a>(
         };
         visit(op);
     }
-    Ok(Some((sequence, reader.position())))
+    Ok(Some((sequence, envelope, reader.position())))
 }
 
 #[cfg(test)]
 mod limit_tests {
     use super::*;
+    use crate::core_records::codec::Kind;
+
+    fn bootstrap() -> CoreWalRecord {
+        CoreWalRecord::Record {
+            sequence: 1,
+            batch: WriteBatch::new(),
+            envelope: Envelope {
+                kind: Kind::Bootstrap,
+                database_id: [0x11; 16],
+                prior_rid: 0,
+                new_rid: 0,
+                prior_compatibility_sequence: 0,
+                new_compatibility_sequence: 0,
+                prior_append_ordinal: 0,
+                new_append_ordinal: 0,
+                record_count: 0,
+                logical_entry_count: 0,
+            },
+        }
+    }
+
+    fn frame(payload: &[u8]) -> Vec<u8> {
+        let mut bytes = WAL_V2_MAGIC.to_le_bytes().to_vec();
+        bytes.extend((payload.len() as u32).to_le_bytes());
+        bytes.extend(crc32c(payload).to_le_bytes());
+        bytes.extend(crc32c(&bytes).to_le_bytes());
+        bytes.extend(payload);
+        bytes
+    }
+
+    #[test]
+    fn typed_control_retains_envelope_and_torn_boundaries_without_legacy_downgrade() {
+        let value = bootstrap();
+        let bytes = value.try_encode().unwrap();
+        let path = Path::new("typed");
+        match parse_core_record_prefix(&bytes, path).unwrap() {
+            CoreRecordPrefix::Complete {
+                record,
+                encoded_len,
+            } => {
+                assert_eq!(record, value);
+                assert_eq!(encoded_len, bytes.len());
+            }
+            _ => panic!("complete typed record lost"),
+        }
+        assert!(matches!(
+            WalRecord::decode(&bytes, path),
+            Err(PraxisError::RecordAuthorityWalRequired { .. })
+        ));
+        for cut in 0..bytes.len() {
+            assert!(
+                matches!(
+                    parse_core_record_prefix(&bytes[..cut], path).unwrap(),
+                    CoreRecordPrefix::Torn
+                ),
+                "cut{cut}"
+            );
+        }
+        assert_eq!(bytes.len(), 16 + 12 + 5 + 88);
+        assert_eq!(u32::from_le_bytes(bytes[20..24].try_into().unwrap()), 0); // high half of sequence
+        assert_eq!(&bytes[24..33], &[1, 0, 0, 0, 5, 88, 0, 0, 0]);
+    }
+
+    #[test]
+    fn typed_control_cannot_follow_an_operation_or_repeat_or_use_legacy_frame() {
+        let path = Path::new("typed");
+        let bytes = bootstrap().try_encode().unwrap();
+        let control = &bytes[28..];
+        let mut batch = WriteBatch::new();
+        batch.delete_default("x");
+        let ordinary = WalRecord { sequence: 1, batch }.try_encode().unwrap();
+        for body in [
+            [control, control].concat(),
+            [&ordinary[28..], control].concat(),
+        ] {
+            let mut payload = 1u64.to_le_bytes().to_vec();
+            payload.extend(2u32.to_le_bytes());
+            payload.extend(body);
+            assert!(parse_core_record_prefix(&frame(&payload), path).is_err());
+        }
+        let mut legacy = WAL_MAGIC.to_le_bytes().to_vec();
+        legacy.extend(((bytes.len() - 16) as u32).to_le_bytes());
+        legacy.extend(crc32c(&bytes[16..]).to_le_bytes());
+        legacy.extend(&bytes[16..]);
+        assert!(parse_core_record_prefix(&legacy, path).is_err());
+        let mut payload = bytes[16..].to_vec();
+        payload[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(parse_core_record_prefix(&frame(&payload), path).is_err());
+    }
 
     #[test]
     fn payload_limit_and_arithmetic_are_checked_without_large_allocations() {

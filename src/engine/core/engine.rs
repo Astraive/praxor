@@ -56,6 +56,33 @@ impl PraxisEngine {
             crate::storage::root_format::InspectionOptions::for_admission(),
         )?
         .require_compatible(crate::storage::root_format::RootOwner::Core)?;
+        if writer_lease.root().join("MANIFEST").exists() {
+            let manifest = crate::manifest::Manifest::decode(
+                &fs::read(writer_lease.root().join("MANIFEST"))?,
+                &writer_lease.root().join("MANIFEST"),
+            )?;
+            if manifest.record_authority.is_some() {
+                return Err(PraxisError::RecordAuthorityOpenRequired {
+                    path: writer_lease.root().to_path_buf(),
+                });
+            }
+        }
+        Self::open_owned(config, writer_lease, None)
+    }
+
+    pub(crate) fn open_records(
+        config: PraxisConfig,
+        lease: WriterLease,
+        manifest: crate::manifest::Manifest,
+    ) -> Result<Self> {
+        Self::open_owned(config, lease, Some(manifest))
+    }
+
+    fn open_owned(
+        config: PraxisConfig,
+        writer_lease: WriterLease,
+        record_manifest: Option<crate::manifest::Manifest>,
+    ) -> Result<Self> {
         slog::Logger::init(config.logging.clone());
         let accelerator: Arc<dyn Accelerator> = match config.accelerator {
             AcceleratorBackend::Cpu => Arc::new(CpuAccelerator),
@@ -63,15 +90,33 @@ impl PraxisEngine {
             AcceleratorBackend::Vulkan => Arc::new(GpuAccelerator::new(GpuBackendKind::Vulkan)),
             AcceleratorBackend::Metal => Arc::new(GpuAccelerator::new(GpuBackendKind::Metal)),
         };
-        let layout = DiskLayout::create(writer_lease.root())?;
+        let records = record_manifest.is_some();
+        let layout = if records {
+            DiskLayout::at(writer_lease.root())
+        } else {
+            DiskLayout::create(writer_lease.root())?
+        };
         let manifest_store = ManifestStore::new(layout.manifest_path());
-        let mut manifest = manifest_store.load_or_create(&config)?;
+        let mut manifest = match record_manifest {
+            Some(manifest) => manifest,
+            None => manifest_store.load_or_create(&config)?,
+        };
+        manifest.validate_and_upgrade(manifest_store.path())?;
         if manifest.effective_config != config.persisted() {
             return Err(PraxisError::ConfigMismatch(
                 "open config differs from persisted effective engine config".to_string(),
             ));
         }
-        if job_state::reconcile_unfinished_jobs(&mut manifest) {
+        let validated_records = if records {
+            Some(crate::core_records::recovery::validate_owner(
+                writer_lease.root(),
+                &manifest,
+                accelerator.as_ref(),
+            )?)
+        } else {
+            None
+        };
+        if !records && job_state::reconcile_unfinished_jobs(&mut manifest) {
             manifest_store.save_with_policy(&manifest, config.direct_io)?;
         }
         let mut segment_index: BTreeMap<(ColumnFamily, Key), Vec<crate::types::VersionedValue>> =
@@ -110,19 +155,25 @@ impl PraxisEngine {
                 chain.sort_by_key(|version| version.sequence);
             }
         }
-        let wal_records = Wal::replay_dir(&layout.wal_root())?;
+        let wal_records = match validated_records {
+            Some(records) => records,
+            None => Wal::replay_dir(&layout.wal_root())?
+                .into_iter()
+                .map(crate::wal::record::CoreWalRecord::User)
+                .collect(),
+        };
         let mut memtable = MemTable::default();
         let snapshots = Arc::new(SnapshotManager::default());
         for record in &wal_records {
             // Retired operations are invisible, but their durable sequence IDs
             // must never be reused, including records below a flush cutoff.
-            snapshots.observe(record.sequence);
-            if record.sequence <= manifest.flushed_sequence
-                && !(record.sequence == 0 && manifest.flushed_sequence == 0)
+            snapshots.observe(record.sequence());
+            if record.sequence() <= manifest.flushed_sequence
+                && !(record.sequence() == 0 && manifest.flushed_sequence == 0)
             {
                 continue;
             }
-            for op in record.batch.ops() {
+            for op in record.batch().ops() {
                 let cf = match op {
                     BatchOp::Put { cf, .. }
                     | BatchOp::PutWithExpiry { cf, .. }
@@ -131,7 +182,7 @@ impl PraxisEngine {
                 };
                 if !active_generations
                     .get(&cf.0)
-                    .is_some_and(|generation| generation.includes(record.sequence))
+                    .is_some_and(|generation| generation.includes(record.sequence()))
                 {
                     continue;
                 }
@@ -148,10 +199,10 @@ impl PraxisEngine {
                     if let Some(versions) =
                         segment_index.get_mut(&(cf.clone(), Bytes::copy_from_slice(key)))
                     {
-                        versions.retain(|version| version.sequence != record.sequence);
+                        versions.retain(|version| version.sequence != record.sequence());
                     }
                 }
-                memtable.apply(record.sequence, op);
+                memtable.apply(record.sequence(), op);
             }
         }
         snapshots.observe(manifest.last_sequence);
@@ -160,11 +211,27 @@ impl PraxisEngine {
         // their recovered watermark into future structural checkpoints before
         // those checkpoints retire the WAL containing the original sequence.
         manifest.last_sequence = snapshots.snapshot().sequence;
-        let wal = Wal::open(
-            layout.wal_path(manifest.active_wal_id),
-            manifest.active_wal_id,
-            config.wal_sync_policy,
-        )?;
+        // All v3 segment/WAL evidence has been validated before these first
+        // recovery mutations, including records below the flush cutoff.
+        if records {
+            DiskLayout::create(writer_lease.root())?;
+            if job_state::reconcile_unfinished_jobs(&mut manifest) {
+                manifest_store.save_with_policy(&manifest, config.direct_io)?;
+            }
+        }
+        let wal = if records {
+            Wal::open_core(
+                layout.wal_path(manifest.active_wal_id),
+                manifest.active_wal_id,
+                config.wal_sync_policy,
+            )?
+        } else {
+            Wal::open(
+                layout.wal_path(manifest.active_wal_id),
+                manifest.active_wal_id,
+                config.wal_sync_policy,
+            )?
+        };
         let metrics = EngineMetrics::default();
         metrics
             .recovered_records
@@ -546,6 +613,7 @@ impl PraxisEngine {
                     | BatchOp::Merge { cf, .. }
                     | BatchOp::Delete { cf, .. } => cf,
                 };
+                crate::core_records::ensure_public_cf(&manifest, &cf.0)?;
                 if options.contains_key(&cf.0) {
                     continue;
                 }
@@ -719,6 +787,7 @@ impl PraxisEngine {
         let _maintenance = self.inner.maintenance_serialization.lock();
         let _writer = self.inner.write_serialization.lock();
         self.inner.group_commit.ensure_writable()?;
+        crate::core_records::ensure_public_cf(&self.inner.manifest.lock(), &descriptor.name)?;
         if descriptor.name == ColumnFamily::default().0 {
             return Ok(());
         }
@@ -773,6 +842,7 @@ impl PraxisEngine {
         let _maintenance = self.inner.maintenance_serialization.lock();
         let _writer = self.inner.write_serialization.lock();
         self.inner.group_commit.ensure_writable()?;
+        crate::core_records::ensure_public_cf(&self.inner.manifest.lock(), name)?;
         let _topology = self.inner.topology.write();
         if name == ColumnFamily::default().0 {
             return Err(PraxisError::CannotDropDefaultColumnFamily);
@@ -847,7 +917,13 @@ impl PraxisEngine {
     }
 
     pub fn list_column_families(&self) -> Vec<ColumnFamilyDescriptor> {
-        self.inner.manifest.lock().column_families.clone()
+        let manifest = self.inner.manifest.lock();
+        manifest
+            .column_families
+            .iter()
+            .filter(|family| crate::core_records::ensure_public_cf(&manifest, &family.name).is_ok())
+            .cloned()
+            .collect()
     }
 
     pub fn column_family(&self, name: &str) -> Result<ColumnFamily> {
@@ -921,10 +997,9 @@ impl PraxisEngine {
     }
 
     pub(crate) fn ensure_column_family(&self, cf: &ColumnFamily) -> Result<()> {
-        if self
-            .inner
-            .manifest
-            .lock()
+        let manifest = self.inner.manifest.lock();
+        crate::core_records::ensure_public_cf(&manifest, &cf.0)?;
+        if manifest
             .column_families
             .iter()
             .any(|family| family.name == cf.0)

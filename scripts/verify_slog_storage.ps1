@@ -1,6 +1,7 @@
 $ErrorActionPreference = "Stop"
 
 $paths = @(
+    "src/core_records",
     "src/storage",
     "src/store",
     "src/wal",
