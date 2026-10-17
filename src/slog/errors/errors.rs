@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PraxisError {
+    #[error("storage handle requires recovery; close and reopen it before continuing")]
+    RecoveryRequired,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("serialization error: {0}")]

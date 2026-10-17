@@ -97,6 +97,11 @@ pub struct RecordStore {
     indirection: IndirectionTable,
 }
 
+pub(crate) struct PreparedPrimaryPut {
+    pub rid: RecordId,
+    pub location: PhysicalLocation,
+}
+
 impl RecordStore {
     const SEGMENT_SUBDIR: &'static str = "records";
     const INDIRECTION_FILE: &'static str = "indirection.tind";
@@ -141,13 +146,30 @@ impl RecordStore {
     }
 
     pub(crate) fn put_unsynced(&mut self, bytes: &[u8]) -> Result<RecordId> {
+        let prepared = self.prepare_put(bytes)?;
+        let rid = prepared.rid;
+        self.publish_puts(&[prepared]);
+        Ok(rid)
+    }
+
+    pub(crate) fn prepare_put(&mut self, bytes: &[u8]) -> Result<PreparedPrimaryPut> {
+        u32::try_from(bytes.len()).map_err(|_| {
+            crate::errors::PraxisError::InvalidConfig("primary record exceeds u32 length".into())
+        })?;
+        let rid = self.indirection.reserve_rid()?;
         let (record_offset, length) = self.active_segment.append(bytes)?;
         let loc = PhysicalLocation {
             segment_id: self.active_segment.segment_id(),
             record_offset,
             length,
         };
-        Ok(self.indirection.allocate(loc))
+        Ok(PreparedPrimaryPut { rid, location: loc })
+    }
+
+    pub(crate) fn publish_puts(&mut self, puts: &[PreparedPrimaryPut]) {
+        for put in puts {
+            self.indirection.upsert_live(put.rid, put.location);
+        }
     }
 
     pub(crate) fn sync_active_segment(&self) -> Result<()> {
@@ -160,6 +182,12 @@ impl RecordStore {
 
     pub fn contains(&self, rid: RecordId) -> bool {
         self.indirection.contains_live(rid)
+    }
+
+    /// Delete preflight distinguishes unknown IDs from known tombstones so
+    /// idempotent deletes and cleanup of stale secondary pointers stay valid.
+    pub(crate) fn contains_record(&self, rid: RecordId) -> bool {
+        self.indirection.contains_record(rid)
     }
 
     pub fn replay_primary_put(&mut self, rid: RecordId, location: PhysicalLocation) -> Result<()> {
