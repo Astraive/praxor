@@ -1,10 +1,8 @@
-# Core record authority foundation (#46 F1a)
+# Core record authority checkpoints (#46 F1a/F1b)
 
 This is an unshipped review checkpoint within the complete F1 branch. It has no
-public record writer. Nonbootstrap record envelopes and protected states return
-an explicit unsupported error until F1b installs sealed logical intents and their
-complete transition validator. F1a and F1b must ship together; this checkpoint
-does not establish record CRUD, record durability barriers, historical payload
+public record writer. F1a and F1b must ship together; this checkpoint
+does not establish public record CRUD, historical payload
 snapshots, legacy import, plugin parity, or product adoption.
 
 F1b checkpoint 1 adds private typed User/Barrier requests and Write/Barrier
@@ -14,6 +12,66 @@ no frame and consumes no core sequence. It holds no maintenance/WAL/manifest
 guard while waiting. Durable accepted requests sync even under Never without
 changing persisted policy; rejected requests do not force IO. The helper remains
 private pending the complete record facade. No record intent/planner is exposed.
+
+Checkpoint 2 adds private sealed owned record intents and typed RID receipts to
+that same queue. Its canonical builder/parser covers the six envelope kinds;
+DeleteByIndex lowers to cleanup or an index tombstone under the writer. Accepted
+intents alone advance the request-local overlay, RID/counters and core sequence.
+Receipts and exact frame size are prepared before merging. Every accepted record
+request is Durable. Conservative owned-memory admission may exceed the wire cap
+as an oversized singleton; exact materialized frames obey the existing 64 MiB
+payload limit before rotation or append. Empty public batch handling, facade
+reads/flush and semantic v3 verify are pending checkpoint 3.
+
+Reopen and captured backup validation share the canonical parser. Complete old
+envelopes prove their own RID ranges and counter relationships: floors never
+decrease across retained evidence, and a complete core-sequence chain requires
+exact counter continuity through ordinary user requests. Missing old sequences
+reset equality, not monotonicity; old priors are never equated with today's
+allocator or current RID liveness. Installed state at the flush cutoff is checked
+before exact stateful suffix transitions. Repeated known-dead deletes legitimately
+advance counters without allocating IDs or creating facts.
+
+Installed proof walks actual rows and checked RID adjacency, never a claimed RID
+range or allocation count. It checks payload/state/counter consistency, globally
+unique immutable fact ordinals and matching latest heads. Retained state cannot
+resurrect an ID; payload summaries cannot change or reappear after tombstones;
+allocator floors and dead count are monotone. Counter lower bounds include each
+allocated RID, first delete and actual immutable mapping fact, without claiming
+they explain all repeated deletes. Payload evidence retains lengths and digests,
+not a second payload corpus; validation storage follows actual retained metadata,
+versions and facts. Blob rows are resolved one bounded row at a time. These are
+integrity checks, not a whole-process memory bound or arbitrary tamper detection.
+Available immutable payload witnesses and live-state lengths agree across both
+segments and retained WALs, even when the current RID is dead; absent compacted
+history is not required. Available allocator and primary copies at the same
+core sequence agree across segments and WALs, including tombstones and dead
+states; same-sequence heads preserve last input order. A fresh mapping Put's raw
+sequence must exceed its RID, a necessary allocation-before-mapping floor rather
+than proof of every historical event when its original WAL has been retired.
+Available live primary evidence precedes the earliest available death for that
+RID. A death covered by the installed flush cutoff requires the installed state
+to be dead, before replaying any newer suffix; pruning cannot erase that known
+fact and a later suffix delete cannot mask a contradictory installed live row.
+Fresh F1 has no payload-update operation: available live State/Payload copies
+for one RID share its creation sequence. Mapping Put facts are live-at-event
+witnesses, at or after an available birth and before an available death. Known
+births follow actual RID allocation order, allowing equal sequences for a batch
+and missing pruned births. These fresh-format checks do not define future update
+or imported legacy history semantics.
+Every available Head, including intermediate same-sequence puts, binds to its
+exact immutable Fact value and core sequence. Facts keep one core sequence across
+WAL and segment copies. Available allocator cuts agree at one sequence and have
+monotone RID/dead floors and advancing fresh counters. Known births, RID events
+and Fact raw positions respect earlier/later available cuts; actual Fact raw
+intervals advance across core sequences even where intermediate cuts are gone.
+This temporary proof walks actual metadata and never manufactures missing cuts
+or claims to detect an entirely coherent rewrite of all historical evidence.
+
+Fresh compatibility counters describe logical CRUD/index entries. Legacy primary
+physical relocation consumes its own raw sequence; fresh maintenance fabricates
+no relocation fact. Numeric ceilings are not interchangeable between those
+backend domains. Snapshot/import/adapter work remains separate.
 
 Commit sync attempts/successes/duration include closed write groups and ordered
 barriers; rotation/header/checkpoint syncs remain separate. Earlier rotated WALs

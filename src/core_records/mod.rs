@@ -1,8 +1,15 @@
 //! Explicit core-backed record authority. Legacy storage constructors never activate it.
 pub(crate) mod codec;
 mod database;
+pub(crate) mod intent;
 pub(crate) mod recovery;
 mod schema;
+pub(crate) mod transition;
+
+#[cfg(test)]
+mod recovery_tests;
+#[cfg(test)]
+mod transition_tests;
 
 pub use database::CoreDatabase;
 pub use schema::{MappingDescriptor, RecordAuthority, RecordAuthorityOptions, RecordRoleBinding};

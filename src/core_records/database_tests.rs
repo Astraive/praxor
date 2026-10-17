@@ -349,14 +349,10 @@ fn invalid_protected_wal_and_nonbootstrap_transitions_refuse_before_reconciliati
         unfinished(temp.path());
         let before = tree(temp.path());
         let result = CoreDatabase::open(config);
-        if kind.is_some() {
-            assert!(matches!(
-                result,
-                Err(PraxisError::StorageFormatUnsupported { .. })
-            ));
-        } else {
-            assert!(result.is_err());
-        }
+        assert!(
+            result.is_err(),
+            "malformed nonbootstrap operations remain refused"
+        );
         assert_eq!(tree(temp.path()), before);
     }
 }
@@ -824,4 +820,68 @@ fn review_retired_segment_cf_cannot_hide_a_bootstrap_sequence_row() {
 #[test]
 fn review_ordinary_segment_row_cannot_exceed_the_installed_flush_cutoff() {
     ordinary_segment_row_cannot_share_bootstrap(100, "default");
+}
+
+#[test]
+fn canonical_nonbootstrap_create_recovers_through_existing_owner_and_backup_apis() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = PraxisConfig::new(dir.path());
+    let db = CoreDatabase::create_fresh(config.clone(), options()).unwrap();
+    let id = db.authority().identity(dir.path()).unwrap();
+    drop(db);
+    let mut batch = WriteBatch::new();
+    for (role, key, row) in [
+        (Role::Payload, Key::Payload(1), Row::Payload(b"actual")),
+        (
+            Role::State,
+            Key::State(1),
+            Row::State {
+                live: true,
+                payload_length: 6,
+            },
+        ),
+        (
+            Role::Meta,
+            Key::Allocator,
+            Row::Allocator(Allocator {
+                last_rid: 1,
+                compatibility_sequence: 1,
+                append_ordinal: 1,
+                live_count: 1,
+                dead_count: 0,
+                live_payload_bytes: 6,
+            }),
+        ),
+    ] {
+        batch.put(role.cf(), key.encode().unwrap(), row.encode().unwrap());
+    }
+    append(
+        dir.path(),
+        &CoreWalRecord::Record {
+            sequence: 2,
+            batch,
+            envelope: Envelope {
+                kind: Kind::Create,
+                database_id: id,
+                prior_rid: 0,
+                new_rid: 1,
+                prior_compatibility_sequence: 0,
+                new_compatibility_sequence: 1,
+                prior_append_ordinal: 0,
+                new_append_ordinal: 1,
+                record_count: 1,
+                logical_entry_count: 1,
+            },
+        }
+        .try_encode()
+        .unwrap(),
+    );
+    let db =
+        CoreDatabase::open(config.clone()).expect("valid complete canonical create is supported");
+    assert_eq!(db.kv().snapshot().sequence, 2);
+    db.kv().flush().unwrap();
+    let backup = tempfile::tempdir().unwrap();
+    db.kv().backup_to(backup.path()).unwrap();
+    drop(db);
+    CoreDatabase::open(config).unwrap();
 }

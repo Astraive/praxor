@@ -4,7 +4,7 @@ use super::schema::corrupt;
 use crate::errors::{PraxisError, Result};
 use std::path::Path;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 #[repr(u8)]
 pub(crate) enum Role {
     Meta = 1,
