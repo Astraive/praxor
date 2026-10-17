@@ -2,6 +2,7 @@ use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_ma
 use praxis::bench::{LatencyDistribution, WorkloadGenerator, WorkloadPattern};
 use praxis::storage::lsm::LsmIndex;
 use praxis::store::{IndexInsert, StorageEngine};
+use praxis::{IndexPlugin, RecordId};
 use std::time::Duration;
 use tempfile::tempdir;
 
@@ -327,6 +328,60 @@ fn bench_latency_distribution(c: &mut Criterion) {
     group.finish();
 }
 
+// Measure plugin metadata work independently of WAL syncs and primary value IO.
+fn bench_lsm_mutations(c: &mut Criterion) {
+    let mut group = c.benchmark_group("lsm_mutations");
+    for key_count in [1024_u64, 2048, 4096, 8192] {
+        let keys: Vec<_> = (0..key_count).map(u64::to_be_bytes).collect();
+        group.bench_with_input(BenchmarkId::new("distinct", key_count), &keys, |b, keys| {
+            b.iter_batched(
+                || {
+                    let dir = tempdir().unwrap();
+                    let index = LsmIndex::open("kv", dir.path()).unwrap();
+                    (dir, index)
+                },
+                |(_dir, mut index)| {
+                    for (i, key) in keys.iter().enumerate() {
+                        index.put(black_box(key), RecordId(i as u64 + 1)).unwrap();
+                    }
+                    black_box((index, _dir))
+                },
+                criterion::BatchSize::LargeInput,
+            );
+        });
+        for (name, live) in [("overwrite", true), ("tombstoned_history", false)] {
+            group.bench_with_input(BenchmarkId::new(name, key_count), &keys, |b, keys| {
+                b.iter_batched(
+                    || {
+                        let dir = tempdir().unwrap();
+                        let mut index = LsmIndex::open("kv", dir.path()).unwrap();
+                        for (i, key) in keys.iter().enumerate() {
+                            if live {
+                                index.put(key, RecordId(i as u64 + 1)).unwrap();
+                            } else {
+                                index.delete(key).unwrap();
+                            }
+                        }
+                        (dir, index)
+                    },
+                    |(_dir, mut index)| {
+                        for i in 0..1024 {
+                            if live {
+                                index.put(&keys[0], RecordId(i + 1)).unwrap();
+                            } else {
+                                index.delete(b"absent").unwrap();
+                            }
+                        }
+                        black_box((index, _dir))
+                    },
+                    criterion::BatchSize::LargeInput,
+                );
+            });
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_sequential_writes,
@@ -334,7 +389,8 @@ criterion_group!(
     bench_index_lookups,
     bench_large_values,
     bench_concurrent_writes,
-    bench_latency_distribution
+    bench_latency_distribution,
+    bench_lsm_mutations
 );
 
 criterion_main!(benches);
