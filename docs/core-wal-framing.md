@@ -16,8 +16,10 @@ New records use little-endian v2 framing:
 | 12 | checksum of the preceding 12 header bytes (u32) |
 | 16 | existing sequence/count/operation payload |
 
-Both checksums use the existing `io::crc32c` helper, currently backed by
-`crc32fast`. This change does not alter that checksum implementation. A complete
+Both checksums use IEEE CRC32, exposed as `io::crc32_ieee` and the historical
+`io::crc32c` alias, backed by `crc32fast`. See the
+[persisted checksum contract](checksum-contract.md). This naming correction
+does not alter existing checksum bytes. A complete
 v2 header must pass its checksum before a declared payload extending beyond EOF
 can be classified as an interrupted append. A bad complete header, bad payload
 checksum, unsupported magic, invalid UTF-8 family name, unknown operation tag,

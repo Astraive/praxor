@@ -11,7 +11,7 @@ pub use capability::{
     write_file_with_policy,
 };
 pub(crate) use capability::{create_dir_all_durable, sync_parent_dir};
-pub use checksum::{crc32c, file_digest};
+pub use checksum::{crc32_ieee, crc32c, file_digest};
 pub use compression::{decode_block, encode_block};
 pub use hardware::{HardwareBackend, HardwareCapability, HardwareIoProfile, HardwareOperation};
 pub use rate_limiter::IoRateLimiter;
