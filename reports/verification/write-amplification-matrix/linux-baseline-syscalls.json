@@ -1,0 +1,133 @@
+{
+  "schema_version": 1,
+  "trace_sha256": "4aa7a6480cddc8196025c14202e615055e868ed04335c157b92f359af9788950",
+  "scope": "Linux syscalls inside BEGIN/END markers; untimed; not device flushes",
+  "cases": [
+    {
+      "id": "baseline-r0-cf1-ops1",
+      "label": "baseline",
+      "source_revision": "636d2ddee1ba82966212a4d4bfbb06497ec3a871",
+      "active_cfs": 1,
+      "batch_ops": 1,
+      "batches": 4,
+      "observed_syscalls": {
+        "fdatasync.wal_file.success": 4,
+        "fsync.database_parent_directory.success": 8,
+        "fsync.manifest_temporary_file.success": 4,
+        "manifest_rename.success": 4
+      }
+    },
+    {
+      "id": "baseline-r0-cf1-ops16",
+      "label": "baseline",
+      "source_revision": "636d2ddee1ba82966212a4d4bfbb06497ec3a871",
+      "active_cfs": 1,
+      "batch_ops": 16,
+      "batches": 4,
+      "observed_syscalls": {
+        "fdatasync.wal_file.success": 4,
+        "fsync.database_parent_directory.success": 8,
+        "fsync.manifest_temporary_file.success": 4,
+        "manifest_rename.success": 4
+      }
+    },
+    {
+      "id": "baseline-r0-cf1-ops256",
+      "label": "baseline",
+      "source_revision": "636d2ddee1ba82966212a4d4bfbb06497ec3a871",
+      "active_cfs": 1,
+      "batch_ops": 256,
+      "batches": 4,
+      "observed_syscalls": {
+        "fdatasync.wal_file.success": 4,
+        "fsync.database_parent_directory.success": 8,
+        "fsync.manifest_temporary_file.success": 4,
+        "manifest_rename.success": 4
+      }
+    },
+    {
+      "id": "baseline-r0-cf16-ops1",
+      "label": "baseline",
+      "source_revision": "636d2ddee1ba82966212a4d4bfbb06497ec3a871",
+      "active_cfs": 16,
+      "batch_ops": 1,
+      "batches": 4,
+      "observed_syscalls": {
+        "fdatasync.wal_file.success": 4,
+        "fsync.database_parent_directory.success": 8,
+        "fsync.manifest_temporary_file.success": 4,
+        "manifest_rename.success": 4
+      }
+    },
+    {
+      "id": "baseline-r0-cf16-ops16",
+      "label": "baseline",
+      "source_revision": "636d2ddee1ba82966212a4d4bfbb06497ec3a871",
+      "active_cfs": 16,
+      "batch_ops": 16,
+      "batches": 4,
+      "observed_syscalls": {
+        "fdatasync.wal_file.success": 4,
+        "fsync.database_parent_directory.success": 8,
+        "fsync.manifest_temporary_file.success": 4,
+        "manifest_rename.success": 4
+      }
+    },
+    {
+      "id": "baseline-r0-cf16-ops256",
+      "label": "baseline",
+      "source_revision": "636d2ddee1ba82966212a4d4bfbb06497ec3a871",
+      "active_cfs": 16,
+      "batch_ops": 256,
+      "batches": 4,
+      "observed_syscalls": {
+        "fdatasync.wal_file.success": 4,
+        "fsync.database_parent_directory.success": 8,
+        "fsync.manifest_temporary_file.success": 4,
+        "manifest_rename.success": 4
+      }
+    },
+    {
+      "id": "baseline-r0-cf256-ops1",
+      "label": "baseline",
+      "source_revision": "636d2ddee1ba82966212a4d4bfbb06497ec3a871",
+      "active_cfs": 256,
+      "batch_ops": 1,
+      "batches": 4,
+      "observed_syscalls": {
+        "fdatasync.wal_file.success": 4,
+        "fsync.database_parent_directory.success": 8,
+        "fsync.manifest_temporary_file.success": 4,
+        "manifest_rename.success": 4
+      }
+    },
+    {
+      "id": "baseline-r0-cf256-ops16",
+      "label": "baseline",
+      "source_revision": "636d2ddee1ba82966212a4d4bfbb06497ec3a871",
+      "active_cfs": 256,
+      "batch_ops": 16,
+      "batches": 4,
+      "observed_syscalls": {
+        "fdatasync.wal_file.success": 4,
+        "fsync.database_parent_directory.success": 8,
+        "fsync.manifest_temporary_file.success": 4,
+        "manifest_rename.success": 4
+      }
+    },
+    {
+      "id": "baseline-r0-cf256-ops256",
+      "label": "baseline",
+      "source_revision": "636d2ddee1ba82966212a4d4bfbb06497ec3a871",
+      "active_cfs": 256,
+      "batch_ops": 256,
+      "batches": 4,
+      "observed_syscalls": {
+        "fdatasync.wal_file.success": 4,
+        "fsync.database_parent_directory.success": 8,
+        "fsync.manifest_temporary_file.success": 4,
+        "manifest_rename.success": 4
+      }
+    }
+  ]
+}

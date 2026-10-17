@@ -33,3 +33,8 @@ Each capture records:
 - `summary.txt`: capture location.
 
 Criterion HTML reports remain under `target/criterion/` for charting and visual inspection.
+
+The maintained [durable write amplification matrix](write-amplification-matrix.md)
+separates actual 1/16/256-operation batches from independent puts and controls
+real active manifest descriptor counts. It includes isolated allocation and
+Linux syscall probes; report their evidence separately from native timing.

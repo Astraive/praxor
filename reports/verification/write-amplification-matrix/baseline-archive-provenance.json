@@ -1,0 +1,11 @@
+{
+  "copied_harness_sha256": {
+    "write_amplification_allocations.rs": "6712797fa1c7f93905bb2b69d12ef21d5e27a5eefd3edb4be55a2c15998d09e8",
+    "write_matrix_support.rs": "7bdceb40be81318f9070c20f5ba9b1f2eea5418ff3896ebd304c1eab84e420c3",
+    "write_amplification_matrix.rs": "c0d9c31bf442b059b87c4aa240bcea5ce7019103c914b7b7b5db7fe80d80f224"
+  },
+  "archive_sha256": "5b152f6296fc788887003fd29a26e50704fed62d840aaf34dfcfeeabc5080a46",
+  "cargo_lock_sha256": "df982808577cfed40d4c88f13aacb873dcd4b39e8e60c772d3a404fe97e18dce",
+  "source_revision": "636d2ddee1ba82966212a4d4bfbb06497ec3a871",
+  "source_modifications": "Only benchmark targets and the three identical harness source files were added."
+}

@@ -1,0 +1,50 @@
+{
+  "mode": "Timing",
+  "source_revision": "f3ae6c47c6a5ffde7cdd2861717f0c0256cd463f",
+  "source_root": "D:\\poiesis-worktrees\\phase-03-write-amplification-matrix",
+  "executable": "F:\\poiesis-targets\\phase-03-write-matrix\\release\\deps\\write_amplification_matrix-f62ef551824f0013.exe",
+  "executable_sha256": "54d94195af7c35b8e5179ed1a384b1b398067cba6c131b022f1dc9427ef70d5a",
+  "harness_sha256": "717ac06423bd418586b7204119df788410b5d6c0712522ba3bd8a88810b0f656",
+  "harness_files_sha256": {
+    "write_amplification_matrix.rs": "c0d9c31bf442b059b87c4aa240bcea5ce7019103c914b7b7b5db7fe80d80f224",
+    "write_amplification_allocations.rs": "6712797fa1c7f93905bb2b69d12ef21d5e27a5eefd3edb4be55a2c15998d09e8",
+    "write_matrix_support.rs": "7bdceb40be81318f9070c20f5ba9b1f2eea5418ff3896ebd304c1eab84e420c3"
+  },
+  "cargo_lock_sha256": "df982808577cfed40d4c88f13aacb873dcd4b39e8e60c772d3a404fe97e18dce",
+  "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+  "operating_system": "Microsoft Windows 10.0.26300",
+  "process_architecture": "X64",
+  "cpu": {
+    "Name": "13th Gen Intel(R) Core(TM) i7-13650HX",
+    "NumberOfCores": 14,
+    "NumberOfLogicalProcessors": 20
+  },
+  "data_volume": {
+    "DriveLetter": "F",
+    "FileSystem": "NTFS",
+    "FileSystemLabel": "JaiNee",
+    "Size": 433645940736,
+    "SizeRemaining": 176843943936
+  },
+  "data_disk": {
+    "Number": 1,
+    "FriendlyName": "Lenovo SSD LN860 1TB",
+    "BusType": "NVMe",
+    "Size": 1024209543168
+  },
+  "arguments": [
+    "--label",
+    "candidate",
+    "--source-revision",
+    "f3ae6c47c6a5ffde7cdd2861717f0c0256cd463f",
+    "--harness-hash",
+    "717ac06423bd418586b7204119df788410b5d6c0712522ba3bd8a88810b0f656",
+    "--data-dir",
+    "F:\\poiesis-data\\write-matrix",
+    "--expect-stable-manifest"
+  ],
+  "started_utc": "2026-10-17T12:37:26.3588301Z",
+  "exit_code": 0,
+  "ended_utc": "2026-10-17T12:38:03.2592018Z"
+}
