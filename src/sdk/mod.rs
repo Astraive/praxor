@@ -10,6 +10,9 @@ use crate::store::{IndexInsert, RecordId, StorageEngine};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+mod core_records;
+pub use core_records::LocalCorepraxisClient;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SdkTransport {
     Local,
