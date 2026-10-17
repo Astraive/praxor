@@ -65,8 +65,8 @@ execution check for that row.
 | Collection SELECT/filter/order/offset/limit | A bounded numeric predicate returns `u34,u21`; its literal scalar-index result matches the scan fallback. AND/OR has a separate literal result. | Executed. No complete SQL, general acceleration parity, projection or durable backend claim. |
 | Projection / scalar SELECT | `SELECT age` and `SELECT *` produce equal logical plans. No-FROM syntax selects `_scalar`. | Projection equality executed; scalar target source-reviewed. Neither proves expression evaluation. |
 | `IS NULL` | Parser emits `is_null`; executor returns no rows even with explicit null/missing attributes. | Executed known gap, not SQL null conformance or a capability refusal. |
-| PQL `AS OF` | Logical selector survives parsing; physical form is only `AsOf`; execution returns current provider rows. | Executed known gap. No retained read view, historical payload or durable branch-history binding. |
-| `GROUP BY` / aggregates | GroupBy is planned and leaves all provider rows unchanged. Planner does not populate Aggregate from SQL SELECT. | GroupBy executed; SQL aggregate lowering source-reviewed. Manual Aggregate serde coverage is not SQL aggregation support. |
+| PQL `AS OF` | Logical selector survives parsing. Legacy planning now refuses it; a manually constructed `AsOf` physical plan refuses before reading the provider. | Pre-fix executed current-row gap and post-fix refusal are tested in #61. No retained read view, historical payload or durable branch-history binding. |
+| `GROUP BY` / aggregates | Legacy planning now refuses `GROUP BY`; a manually constructed GroupBy physical plan refuses before reading the provider. Planner still does not populate Aggregate from SQL SELECT. | Pre-fix ignored behavior and post-fix refusal are tested in #61. Manual Aggregate serde coverage is not SQL aggregation support. |
 | Parameters | Ordinary parse_with_params loses supplied metadata; WITH keeps it only on the outer plan. `$`, `:`, `@` placeholders are tokenizer errors. The separate substitution helper replaces raw text, including quotes and `$1` prefixes inside `$10`. | Executed observations. No typed binding or supported placeholder protocol. |
 | Trailing tokens / real rejection | Trailing `GARBAGE` can be accepted. Unsupported starting syntax/SHOW target and unterminated quote produce actual Query errors. | Executed. Accepted-but-ignored input is distinct from deterministic refusal. |
 | CTE / window models | Boxed CTE/window serde forms are reachable. CTE resolution is not wired into execution; SQL parsing does not call the exported window helper. | Serde/import coverage executed; missing execution/lowering source-reviewed. |
@@ -76,11 +76,12 @@ execution check for that row.
 | Full-text/vector/graph/ranking | Models and executor arms exist outside the bounded SELECT corpus. | Source-reviewed only here; no general feature or accelerator-equivalence claim. |
 | Storage read seam | Existing RecordProvider reads return infallible Vec/Option. Core record reads can fail and share owner health. | Source-reviewed. Q0 supplies no adapter that hides errors or fabricates empty results. |
 
-Accepted-but-ignored cases are explicitly named `known_gap_*` characterization.
-They record current limitations, not supported semantics that must be retained.
-A reviewed behavior/capability change may replace these expectations. Q0 makes
-no production parser, planner, executor or backend correction and manufactures
-no failing implementation to claim a RED.
+Remaining accepted-but-ignored cases are explicitly named `known_gap_*`
+characterization. They record current limitations, not supported semantics
+that must be retained. #61 changes only the AsOf/GroupBy legacy refusal;
+direct old execution is still experimental. Q0 made no production parser,
+planner, executor or backend correction and manufactured no RED; the #61
+behavioral tests were run against Q0 source before the refusal change.
 
 ## Follow-on gates
 

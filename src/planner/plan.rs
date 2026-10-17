@@ -1,4 +1,4 @@
-use crate::errors::Result;
+use crate::errors::{PraxisError, Result};
 use crate::query::{
     BooleanExpression, FullTextClause, JoinClause, LogicalPlan, OrderClause, Predicate,
     TraversalClause, VectorClause,
@@ -81,14 +81,19 @@ pub struct Planner;
 
 impl Planner {
     pub fn plan(&self, logical: &LogicalPlan) -> Result<PhysicalPlan> {
+        if logical.as_of.is_some() {
+            return Err(PraxisError::Query(
+                "unsupported query feature: as_of".into(),
+            ));
+        }
+        if logical.group_by.is_some() {
+            return Err(PraxisError::Query(
+                "unsupported query feature: group_by".into(),
+            ));
+        }
         let mut operators = Vec::new();
 
-        // 1. AsOf first (snapshot isolation)
-        if logical.as_of.is_some() {
-            operators.push(PhysicalOperator::AsOf);
-        }
-
-        // 2. Predicate pushdown: filters before expensive operators
+        // Predicate pushdown: filters before expensive operators
         if let Some(expression) = &logical.filter_expression {
             operators.push(PhysicalOperator::FilterExpression(expression.clone()));
         } else if let Some(filter) = &logical.filter {
@@ -125,12 +130,7 @@ impl Planner {
             operators.push(PhysicalOperator::Order(order_by.clone()));
         }
 
-        // 9. Group By
-        if let Some(group_by) = &logical.group_by {
-            operators.push(PhysicalOperator::GroupBy(group_by.clone()));
-        }
-
-        // 10. Distinct
+        // Distinct
         if logical.distinct {
             operators.push(PhysicalOperator::Distinct);
         }
