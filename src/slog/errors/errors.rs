@@ -4,6 +4,12 @@ use std::path::PathBuf;
 pub enum PraxisError {
     #[error("database is already open for writing: {path}")]
     AlreadyOpen { path: PathBuf },
+    #[error("record-authority database requires CoreDatabase::open: {path}")]
+    RecordAuthorityOpenRequired { path: PathBuf },
+    #[error("record-authority WAL requires the typed core recovery decoder: {path}")]
+    RecordAuthorityWalRequired { path: PathBuf },
+    #[error("protected record column family is unavailable to public KV operations: {0}")]
+    ProtectedRecordColumnFamily(String),
     #[error("storage format mismatch at {path}: requested {expected}, detected {detected:?}")]
     StorageFormatMismatch {
         path: PathBuf,

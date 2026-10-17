@@ -2,6 +2,7 @@ $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
 $scanRoots = @(
+    @("src", "core_records"),
     @("src", "store"),
     @("src", "storage"),
     @("src", "index"),
