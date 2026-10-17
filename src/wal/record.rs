@@ -61,7 +61,21 @@ impl WalRecord {
     }
 
     pub fn encoded_len(&self) -> usize {
-        self.encode().len()
+        let operations = self
+            .batch
+            .ops()
+            .iter()
+            .map(|op| match op {
+                BatchOp::Put { cf, key, value } | BatchOp::Merge { cf, key, value } => {
+                    1 + 3 * 4 + cf.0.len() + key.len() + value.len()
+                }
+                BatchOp::PutWithExpiry { cf, key, value, .. } => {
+                    1 + 3 * 4 + cf.0.len() + key.len() + value.len() + 8
+                }
+                BatchOp::Delete { cf, key } => 1 + 2 * 4 + cf.0.len() + key.len(),
+            })
+            .sum::<usize>();
+        WAL_RECORD_HEADER_LEN + 8 + 4 + operations
     }
 
     pub fn decode(bytes: &[u8], source: impl Into<PathBuf>) -> Result<Self> {
