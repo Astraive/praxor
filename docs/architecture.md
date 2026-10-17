@@ -12,6 +12,10 @@ Praxis = shared durability + shared recovery + shared canonical storage
 
 Poiesis owns database semantics above Praxis. Praxis owns storage primitives below Poiesis.
 
+See [storage source ownership](storage-source-ownership.md) for the compiled
+owners, module-graph evidence and the boundary between dead-source cleanup and
+the separate migration of the two live engine/WAL protocols.
+
 ```text
 +--------------------------------------------------+
 |                 POIESIS DB                       |
