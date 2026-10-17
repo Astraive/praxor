@@ -154,6 +154,40 @@ impl Capture {
             &self.manifest,
             &self.root.join("MANIFEST"),
         )?;
+        for metadata in self.manifest.segments.clone() {
+            let path = self.local(&segment_relative(metadata.level, metadata.id))?;
+            let bytes = fs::read(&path)?;
+            if blake3::hash(&bytes).to_hex().as_str() != metadata.file_digest {
+                return corrupt(&path, "backup segment digest mismatch");
+            }
+            let raw = decode_segment(&bytes, &path, accelerator)?;
+            if raw.id != metadata.id
+                || raw.level != metadata.level
+                || raw
+                    .blocks
+                    .iter()
+                    .map(|block| block.len() as u64)
+                    .sum::<u64>()
+                    != metadata.entries
+            {
+                return corrupt(&path, "backup segment role/header/count mismatch");
+            }
+            protected.begin_segment();
+            for raw in raw.blocks.iter().flatten() {
+                protected.segment(raw, |pointer| {
+                    let id = file_id(Path::new(&pointer.path), "tval")?;
+                    let relative = value_relative(id);
+                    self.accept_label(&pointer.path, &relative)?;
+                    crate::core_records::recovery::read_blob_at(pointer, &self.local(&relative)?)
+                })?;
+                if let StoredValue::BlobPointer(pointer) = &raw.entry.version.value {
+                    let id = file_id(Path::new(&pointer.path), "tval")?;
+                    let relative = value_relative(id);
+                    self.accept_label(&pointer.path, &relative)?;
+                    validate_pointer(&self.local(&relative)?, pointer)?;
+                }
+            }
+        }
         let mut covered = self.manifest.flushed_sequence;
         for (id, len) in &self.proof_wals {
             let path = self.local(&wal_relative(*id))?;
@@ -175,39 +209,6 @@ impl Capture {
             )?;
         }
         require_coverage(&self.root, covered, self.manifest.last_sequence)?;
-        for metadata in self.manifest.segments.clone() {
-            let path = self.local(&segment_relative(metadata.level, metadata.id))?;
-            let bytes = fs::read(&path)?;
-            if blake3::hash(&bytes).to_hex().as_str() != metadata.file_digest {
-                return corrupt(&path, "backup segment digest mismatch");
-            }
-            let raw = decode_segment(&bytes, &path, accelerator)?;
-            if raw.id != metadata.id
-                || raw.level != metadata.level
-                || raw
-                    .blocks
-                    .iter()
-                    .map(|block| block.len() as u64)
-                    .sum::<u64>()
-                    != metadata.entries
-            {
-                return corrupt(&path, "backup segment role/header/count mismatch");
-            }
-            for raw in raw.blocks.iter().flatten() {
-                protected.segment(raw, |pointer| {
-                    let id = file_id(Path::new(&pointer.path), "tval")?;
-                    let relative = value_relative(id);
-                    self.accept_label(&pointer.path, &relative)?;
-                    crate::core_records::recovery::read_blob_at(pointer, &self.local(&relative)?)
-                })?;
-                if let StoredValue::BlobPointer(pointer) = &raw.entry.version.value {
-                    let id = file_id(Path::new(&pointer.path), "tval")?;
-                    let relative = value_relative(id);
-                    self.accept_label(&pointer.path, &relative)?;
-                    validate_pointer(&self.local(&relative)?, pointer)?;
-                }
-            }
-        }
         protected.finish()?;
         Ok(())
     }

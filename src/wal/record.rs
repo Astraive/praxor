@@ -160,12 +160,12 @@ pub(crate) fn encode_record(
     batch: &WriteBatch,
     envelope: Option<&Envelope>,
 ) -> Result<Vec<u8>> {
-    let mut encoded_len = WalRecord::checked_encoded_batch_len(batch)?;
+    let encoded_len = match envelope {
+        Some(value) => checked_core_encoded_len(sequence, batch, value)?,
+        None => WalRecord::checked_encoded_batch_len(batch)?,
+    };
     let mut count = checked_u32(batch.len(), "operation count")?;
-    if let Some(envelope) = envelope {
-        envelope.validate(sequence, Path::new("record-envelope"))?;
-        encoded_len = checked_payload_add(encoded_len - WAL_RECORD_HEADER_LEN, 5 + Envelope::LEN)?
-            + WAL_RECORD_HEADER_LEN;
+    if envelope.is_some() {
         count = count
             .checked_add(1)
             .ok_or_else(|| invalid("WAL operation count overflow"))?;
@@ -216,6 +216,22 @@ pub(crate) fn encode_record(
     let header_crc = crc32c(&out[..12]);
     out[12..16].copy_from_slice(&header_crc.to_le_bytes());
     Ok(out)
+}
+
+pub(crate) fn checked_core_encoded_len(
+    sequence: u64,
+    batch: &WriteBatch,
+    envelope: &Envelope,
+) -> Result<usize> {
+    envelope.validate(sequence, Path::new("record-envelope"))?;
+    checked_u32(batch.len(), "operation count")?
+        .checked_add(1)
+        .ok_or_else(|| invalid("WAL operation count overflow"))?;
+    let len = WalRecord::checked_encoded_batch_len(batch)?;
+    Ok(
+        checked_payload_add(len - WAL_RECORD_HEADER_LEN, 5 + Envelope::LEN)?
+            + WAL_RECORD_HEADER_LEN,
+    )
 }
 
 fn checked_u32(value: usize, what: &str) -> Result<u32> {

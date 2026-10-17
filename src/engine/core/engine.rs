@@ -54,6 +54,10 @@ mod backup_tests;
 #[path = "engine/durability_tests.rs"]
 mod durability_tests;
 
+#[cfg(test)]
+#[path = "engine/record_tests.rs"]
+mod record_tests;
+
 impl PraxisEngine {
     pub fn open(config: PraxisConfig) -> Result<Self> {
         config.validate()?;
@@ -467,6 +471,33 @@ impl PraxisEngine {
         }
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "private planner checkpoint; public facade follows"
+        )
+    )]
+    pub(crate) fn commit_record(
+        &self,
+        intent: crate::core_records::intent::RecordIntent,
+    ) -> Result<crate::core_records::intent::RecordReceipt> {
+        self.inner.group_commit.ensure_writable()?;
+        if self.inner.manifest.lock().record_authority.is_none() {
+            return Err(PraxisError::InvalidConfig(
+                "record intent requires explicit core authority".into(),
+            ));
+        }
+        let request = self
+            .inner
+            .group_commit
+            .admit_record(intent, &self.inner.metrics)?;
+        match self.wait_for_commit(&request)? {
+            CommitOutcome::Record(receipt) => Ok(receipt),
+            _ => Err(PraxisError::RecoveryRequired),
+        }
+    }
+
     fn sync_commit_wal(&self, wal: &mut Wal) -> Result<()> {
         let started = std::time::Instant::now();
         self.inner
@@ -513,20 +544,100 @@ impl PraxisEngine {
             drop(writer);
             return;
         }
+        enum Accepted<'a> {
+            User(&'a super::group_commit::UserCommit),
+            Record(crate::wal::record::CoreWalRecord),
+        }
+        impl Accepted<'_> {
+            fn batch(&self) -> &WriteBatch {
+                match self {
+                    Self::User(user) => &user.batch,
+                    Self::Record(record) => record.batch(),
+                }
+            }
+        }
         let mut results = Vec::with_capacity(group.len());
-        let mut valid = Vec::new();
+        let mut valid = Vec::with_capacity(group.len());
+        let mut overlay = crate::core_records::transition::Rows::new();
+        let base_sequence = self.snapshot().sequence;
+        let mut last_sequence = base_sequence;
+        let mut bytes = 0usize;
+        let authority = self.inner.manifest.lock().record_authority.clone();
+        let source = self.inner.layout.manifest_path();
         for request in &group {
-            let CommitKind::User(user) = &request.kind else {
-                leader.fail("barrier was coalesced into a write group".into());
-                return;
-            };
-            match self
-                .validate_captured_generations(&user.generations)
-                .and_then(|()| self.validate_write_condition(&user.condition, &user.batch))
-            {
-                Ok(()) => {
-                    results.push(Ok(CommitOutcome::Write { sequence: 0 }));
-                    valid.push((user, request.admission_bytes, request.durability));
+            let planned = (|| -> Result<_> {
+                let sequence =
+                    last_sequence
+                        .checked_add(1)
+                        .ok_or_else(|| PraxisError::WriteStalled {
+                            reason: "sequence space exhausted".into(),
+                        })?;
+                let (accepted, outcome, len, updates) = match &request.kind {
+                    CommitKind::User(user) => {
+                        self.validate_captured_generations(&user.generations)?;
+                        self.validate_write_condition(&user.condition, &user.batch)?;
+                        (
+                            Accepted::User(user),
+                            CommitOutcome::Write { sequence },
+                            request.admission_bytes,
+                            None,
+                        )
+                    }
+                    CommitKind::Record(intent) => {
+                        let authority = authority.as_ref().ok_or_else(|| {
+                            PraxisError::InvalidConfig(
+                                "record intent requires explicit authority".into(),
+                            )
+                        })?;
+                        let context = crate::core_records::transition::Context {
+                            id: authority.identity(&source)?,
+                            descriptors: authority.index_descriptor_count,
+                            source: &source,
+                        };
+                        let mut read = |role: crate::core_records::codec::Role, key: &[u8]| {
+                            if let Some(value) = overlay.get(&(role, key.to_vec())) {
+                                return Ok(value.clone());
+                            }
+                            self.resolve_value_at_snapshot(
+                                &ColumnFamily(role.cf().into()),
+                                key,
+                                base_sequence,
+                            )?
+                            .map(|bytes| {
+                                crate::core_records::transition::Summary::decode(
+                                    role, key, &bytes, &source,
+                                )
+                            })
+                            .transpose()
+                        };
+                        let planned = crate::core_records::transition::plan(
+                            intent, sequence, &context, &mut read,
+                        )?;
+                        // Move the prepared receipt before the accepted overlay changes.
+                        (
+                            Accepted::Record(planned.record),
+                            CommitOutcome::Record(planned.receipt),
+                            planned.encoded_len,
+                            Some(planned.updates),
+                        )
+                    }
+                    CommitKind::Barrier => return Err(PraxisError::RecoveryRequired),
+                };
+                let next_bytes = bytes.checked_add(len).ok_or_else(|| {
+                    PraxisError::InvalidConfig("closed commit group size overflow".into())
+                })?;
+                Ok((sequence, accepted, outcome, next_bytes, updates))
+            })();
+            match planned {
+                Ok((sequence, accepted, outcome, next_bytes, updates)) => {
+                    // All fallible planning and typed receipt preparation completed.
+                    if let Some(updates) = updates {
+                        overlay.extend(updates);
+                    }
+                    last_sequence = sequence;
+                    bytes = next_bytes;
+                    results.push(Ok(outcome));
+                    valid.push((sequence, accepted, request.durability));
                 }
                 Err(error) => results.push(Err(error)),
             }
@@ -536,25 +647,10 @@ impl PraxisEngine {
             drop(writer);
             return;
         }
-        let Some(last_sequence) = self.snapshot().sequence.checked_add(valid.len() as u64) else {
-            for result in &mut results {
-                if result.is_ok() {
-                    *result = Err(PraxisError::WriteStalled {
-                        reason: "sequence space exhausted".to_string(),
-                    });
-                }
-            }
-            leader.finish(results);
-            drop(writer);
-            return;
-        };
-        let bytes = valid.iter().map(|(_, bytes, _)| *bytes).sum();
         if let Err(error) = self.rotate_wal_if_needed(bytes) {
             if self.inner.group_commit.ensure_writable().is_err() {
                 leader.fail(error.to_string());
             } else {
-                // A failure opening the prospective WAL leaves the original
-                // WAL/manifest authoritative and is safe to retry.
                 for result in &mut results {
                     if result.is_ok() {
                         *result = Err(PraxisError::Io(std::io::Error::other(error.to_string())));
@@ -565,11 +661,15 @@ impl PraxisEngine {
             }
             return;
         }
-        let first_sequence = last_sequence - valid.len() as u64 + 1;
         let write_result = (|| -> Result<()> {
             let mut wal = self.inner.wal.lock();
-            for (index, (user, _, _)) in valid.iter().enumerate() {
-                wal.append_user_batch_unsynced(first_sequence + index as u64, &user.batch)?;
+            for (sequence, accepted, _) in &valid {
+                match accepted {
+                    Accepted::User(user) => {
+                        wal.append_user_batch_unsynced(*sequence, &user.batch)?
+                    }
+                    Accepted::Record(record) => wal.append_core_unsynced(record)?,
+                }
             }
             if !matches!(
                 self.inner.config.wal_sync_policy,
@@ -598,10 +698,9 @@ impl PraxisEngine {
         }
         {
             let mut memtable = self.inner.memtable.write();
-            for (index, (user, _, _)) in valid.iter().enumerate() {
-                let sequence = first_sequence + index as u64;
-                for op in user.batch.ops() {
-                    memtable.apply(sequence, op);
+            for (sequence, accepted, _) in &valid {
+                for op in accepted.batch().ops() {
+                    memtable.apply(*sequence, op);
                     match op {
                         BatchOp::Delete { .. } => {
                             self.inner.metrics.deletes.fetch_add(1, Ordering::Relaxed);
@@ -631,13 +730,6 @@ impl PraxisEngine {
             .metrics
             .commit_batches
             .fetch_add(valid.len() as u64, Ordering::Relaxed);
-        let mut sequence = first_sequence;
-        for result in &mut results {
-            if result.is_ok() {
-                *result = Ok(CommitOutcome::Write { sequence });
-                sequence = sequence.saturating_add(1);
-            }
-        }
         leader.finish(results);
         drop(writer);
     }

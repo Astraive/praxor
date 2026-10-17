@@ -249,3 +249,129 @@ fn never_rotation_must_sync_old_wal_before_a_later_barrier_can_acknowledge() {
     drop(engine);
     assert_eq!(PraxisEngine::open(config).unwrap().snapshot().sequence, 1);
 }
+
+#[test]
+fn mixed_record_user_failures_complete_all_waiters_and_poison_the_one_owner() {
+    use crate::core_records::intent::{IntentKind, NewRecord, RecordIntent, RecordResult};
+    use crate::core_records::{CoreDatabase, RecordAuthorityOptions};
+    for fail_sync in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = PraxisConfig::new(dir.path());
+        config.wal_sync_policy = WalSyncPolicy::GroupCommit;
+        let db =
+            CoreDatabase::create_fresh(config.clone(), RecordAuthorityOptions { indexes: vec![] })
+                .unwrap();
+        let engine = db.kv();
+        let before = std::fs::read(engine.inner.wal.lock().path()).unwrap();
+        let writer = engine.inner.write_serialization.lock();
+        {
+            let mut wal = engine.inner.wal.lock();
+            wal.file = if fail_sync {
+                #[cfg(windows)]
+                let device = "NUL";
+                #[cfg(not(windows))]
+                let device = "/dev/null";
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(device)
+                    .unwrap()
+            } else {
+                File::open(wal.path()).unwrap()
+            };
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut workers = Vec::new();
+        for index in 0..8 {
+            let engine = engine.clone();
+            let tx = tx.clone();
+            workers.push(std::thread::spawn(move || {
+                let result = if index % 2 == 0 {
+                    engine
+                        .commit_record(
+                            RecordIntent::new(IntentKind::Create(vec![NewRecord {
+                                payload: vec![index as u8],
+                                mappings: vec![],
+                            }]))
+                            .unwrap(),
+                        )
+                        .map(|_| ())
+                } else {
+                    engine.put(format!("user-{index}"), "new").map(|_| ())
+                };
+                tx.send(result).unwrap();
+            }));
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while engine
+            .inner
+            .metrics
+            .write_admissions
+            .load(Ordering::Relaxed)
+            != 8
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        drop(writer);
+        for _ in 0..8 {
+            assert!(matches!(
+                rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+                Err(PraxisError::RecoveryRequired)
+            ));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(engine.snapshot().sequence, 1);
+        assert_eq!(
+            engine
+                .inner
+                .metrics
+                .commit_sync_attempts
+                .load(Ordering::Relaxed),
+            u64::from(fail_sync)
+        );
+        assert_eq!(engine.inner.metrics.commit_syncs.load(Ordering::Relaxed), 0);
+        if fail_sync {
+            assert!(engine.inner.metrics.commit_sync_ns.load(Ordering::Relaxed) > 0);
+        }
+        assert_eq!(
+            std::fs::read(engine.inner.wal.lock().path()).unwrap(),
+            before
+        );
+        assert!(matches!(
+            engine.durable_barrier(),
+            Err(PraxisError::RecoveryRequired)
+        ));
+        assert!(matches!(engine.flush(), Err(PraxisError::RecoveryRequired)));
+        assert!(matches!(
+            engine.compact(),
+            Err(PraxisError::RecoveryRequired)
+        ));
+        assert!(matches!(
+            engine.checkpoint(),
+            Err(PraxisError::RecoveryRequired)
+        ));
+        assert!(matches!(
+            engine.garbage_collect(),
+            Err(PraxisError::RecoveryRequired)
+        ));
+        drop(engine);
+        drop(db);
+        let db = CoreDatabase::open(config).unwrap();
+        assert_eq!(
+            db.kv()
+                .commit_record(
+                    RecordIntent::new(IntentKind::Create(vec![NewRecord {
+                        payload: b"reopened".to_vec(),
+                        mappings: vec![]
+                    }]))
+                    .unwrap()
+                )
+                .unwrap()
+                .result,
+            RecordResult::Created(vec![crate::store::RecordId(1)])
+        );
+    }
+}

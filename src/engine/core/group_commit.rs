@@ -1,6 +1,7 @@
 //! A bounded FIFO of owned writes. The writer mutex protects WAL/publication;
 //! this mutex only protects admission, closed-group membership and completion.
 use crate::config::WalSyncPolicy;
+use crate::core_records::intent::{RecordIntent, RecordReceipt};
 use crate::errors::{PraxisError, Result};
 use crate::metrics::EngineMetrics;
 use crate::transactions::WriteBatch;
@@ -27,6 +28,7 @@ pub(crate) struct UserCommit {
 
 pub(crate) enum CommitKind {
     User(UserCommit),
+    Record(RecordIntent),
     Barrier,
 }
 
@@ -36,9 +38,10 @@ pub(crate) enum Durability {
     Durable,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CommitOutcome {
     Write { sequence: u64 },
+    Record(RecordReceipt),
     Barrier { through_sequence: u64 },
 }
 
@@ -57,13 +60,14 @@ impl CommitRequest {
             CommitKind::User(UserCommit {
                 condition: WriteCondition::Unconditional,
                 ..
-            })
+            }) | CommitKind::Record(_)
         )
     }
-    fn accepts(&self, outcome: CommitOutcome) -> bool {
+    fn accepts(&self, outcome: &CommitOutcome) -> bool {
         matches!(
             (&self.kind, outcome),
             (CommitKind::User(_), CommitOutcome::Write { .. })
+                | (CommitKind::Record(_), CommitOutcome::Record(_))
                 | (CommitKind::Barrier, CommitOutcome::Barrier { .. })
         )
     }
@@ -169,6 +173,20 @@ impl GroupCommitCoordinator {
     pub(crate) fn admit_barrier(&self, metrics: &EngineMetrics) -> Result<Arc<CommitRequest>> {
         // No wire frame, but queue metadata still consumes bounded admission.
         self.admit_kind(CommitKind::Barrier, Durability::Durable, 16, metrics)
+    }
+
+    pub(crate) fn admit_record(
+        &self,
+        intent: RecordIntent,
+        metrics: &EngineMetrics,
+    ) -> Result<Arc<CommitRequest>> {
+        let charge = intent.admission_bytes();
+        self.admit_kind(
+            CommitKind::Record(intent),
+            Durability::Durable,
+            charge,
+            metrics,
+        )
     }
 
     fn admit_kind(
@@ -296,7 +314,7 @@ impl CommitLeader<'_> {
                 .any(|(request, result)| {
                     result
                         .as_ref()
-                        .is_ok_and(|outcome| !request.accepts(*outcome))
+                        .is_ok_and(|outcome| !request.accepts(outcome))
                 })
         {
             drop(state);
