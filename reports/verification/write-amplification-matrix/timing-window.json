@@ -1,0 +1,13 @@
+{
+  "started_utc": "2026-10-17T12:36:23.5495462Z",
+  "ended_utc": "2026-10-17T12:38:03.2603088Z",
+  "control_order": [
+    "baseline three rotated repetitions",
+    "candidate three rotated repetitions"
+  ],
+  "compiler_monitor": "Get-Process cargo/rustc sampled every 500 ms with pre/post checks; process-start subscription unavailable",
+  "sampled_checks": 195,
+  "compiler_observations": [],
+  "compilers_after": 0,
+  "root_quiet_window_authorized": true
+}
