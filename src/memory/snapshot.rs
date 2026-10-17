@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Default)]
 pub struct SnapshotManager {
+    reserved_sequence: AtomicU64,
     latest_sequence: AtomicU64,
     next_pin_id: AtomicU64,
     pinned: Mutex<BTreeMap<u64, SequenceNumber>>,
@@ -20,10 +21,11 @@ pub struct PinnedSnapshot {
 
 impl SnapshotManager {
     pub fn next_sequence(&self) -> SequenceNumber {
-        self.latest_sequence.fetch_add(1, Ordering::SeqCst) + 1
+        self.reserved_sequence.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     pub fn observe(&self, sequence: SequenceNumber) {
+        self.reserved_sequence.fetch_max(sequence, Ordering::SeqCst);
         let mut current = self.latest_sequence.load(Ordering::SeqCst);
         while sequence > current {
             match self.latest_sequence.compare_exchange(
@@ -45,9 +47,10 @@ impl SnapshotManager {
     }
 
     pub fn pin(self: &Arc<Self>) -> PinnedSnapshot {
+        let mut pinned = self.pinned.lock();
         let snapshot = self.snapshot();
         let id = self.next_pin_id.fetch_add(1, Ordering::SeqCst) + 1;
-        self.pinned.lock().insert(id, snapshot.sequence);
+        pinned.insert(id, snapshot.sequence);
         PinnedSnapshot {
             id,
             snapshot,

@@ -8,9 +8,11 @@ use std::sync::atomic::Ordering;
 
 impl PraxisEngine {
     pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Value>> {
-        self.get_cf(&ColumnFamily::default(), key.as_ref(), self.snapshot())
+        let snapshot = self.pin_snapshot();
+        self.get_cf(&ColumnFamily::default(), key.as_ref(), snapshot.snapshot())
     }
 
+    /// Keep a pinned snapshot alive when reading historical sequences.
     pub fn get_cf(
         &self,
         cf: &ColumnFamily,
@@ -76,5 +78,40 @@ impl PraxisEngine {
             }
             segment.bloom_filter.may_contain(&encoded)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::PraxisConfig;
+    use std::time::{Duration, Instant};
+    use tempfile::tempdir;
+
+    #[test]
+    fn point_read_keeps_its_snapshot_pinned_until_resolution_finishes() {
+        let dir = tempdir().unwrap();
+        let engine = PraxisEngine::open(PraxisConfig::new(dir.path())).unwrap();
+        engine.put("key", "value").unwrap();
+        let memtable = engine.inner.memtable.write();
+        let reader = engine.clone();
+        let handle = std::thread::spawn(move || reader.get("key"));
+        let started = Instant::now();
+        while engine.inner.snapshots.pinned_count() == 0
+            && started.elapsed() < Duration::from_secs(1)
+        {
+            std::thread::yield_now();
+        }
+        let was_pinned = engine.inner.snapshots.pinned_count() > 0;
+        drop(memtable);
+        assert_eq!(
+            handle.join().unwrap().unwrap(),
+            Some(Bytes::from_static(b"value"))
+        );
+        assert!(
+            was_pinned,
+            "point reads must register their sequence before reading storage"
+        );
+        assert_eq!(engine.inner.snapshots.pinned_count(), 0);
     }
 }

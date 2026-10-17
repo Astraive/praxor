@@ -73,18 +73,51 @@ impl PraxisEngine {
                 accelerator.as_ref(),
                 config.direct_io,
             )?;
+            let mut groups = BTreeMap::<(ColumnFamily, Key), Vec<VersionedValue>>::new();
             for entry in entries {
-                segment_index
+                groups
                     .entry((entry.cf, entry.key))
                     .or_default()
                     .push(entry.version);
+            }
+            for (key, versions) in groups {
+                // A legacy WAL overlap may have been flushed into a later
+                // segment. Prefer that segment's complete batch group, while
+                // preserving repeated same-sequence operands inside the group.
+                let sequences = versions
+                    .iter()
+                    .map(|version| version.sequence)
+                    .collect::<std::collections::BTreeSet<_>>();
+                let chain = segment_index.entry(key).or_default();
+                chain.retain(|version| !sequences.contains(&version.sequence));
+                chain.extend(versions);
+                chain.sort_by_key(|version| version.sequence);
             }
         }
         let wal_records = Wal::replay_dir(&layout.wal_root())?;
         let mut memtable = MemTable::default();
         let snapshots = Arc::new(SnapshotManager::default());
-        for record in &wal_records {
+        for record in wal_records
+            .iter()
+            .filter(|record| record.sequence > manifest.flushed_sequence)
+        {
             for op in record.batch.ops() {
+                if manifest.flushed_sequence == 0 {
+                    // Legacy flushes retained WALs without a durable cutoff.
+                    // Prefer the complete WAL batch over its persisted copies;
+                    // keep every operation within that batch, even at one sequence.
+                    let (cf, key) = match op {
+                        BatchOp::Put { cf, key, .. }
+                        | BatchOp::PutWithExpiry { cf, key, .. }
+                        | BatchOp::Merge { cf, key, .. }
+                        | BatchOp::Delete { cf, key } => (cf, key),
+                    };
+                    if let Some(versions) =
+                        segment_index.get_mut(&(cf.clone(), Bytes::copy_from_slice(key)))
+                    {
+                        versions.retain(|version| version.sequence != record.sequence);
+                    }
+                }
                 memtable.apply(record.sequence, op);
             }
             snapshots.observe(record.sequence);
@@ -112,6 +145,9 @@ impl PraxisEngine {
                 layout,
                 manifest_store,
                 cas_serialization: Mutex::new(()),
+                write_serialization: Mutex::new(()),
+                maintenance_serialization: parking_lot::ReentrantMutex::new(()),
+                topology: RwLock::new(()),
                 manifest: Mutex::new(manifest),
                 wal: Mutex::new(wal),
                 memtable: RwLock::new(memtable),
@@ -184,18 +220,19 @@ impl PraxisEngine {
     ) -> Result<SequenceNumber> {
         let _write_guard = self.inner.cas_serialization.lock();
         let key = key.into();
-        let current = self.resolve_value_at_snapshot(
-            &ColumnFamily::default(),
-            &key,
-            self.snapshot().sequence,
-        )?;
-        let current_bytes = current.as_deref();
-        if current_bytes != expected {
-            return Err(PraxisError::CompareAndSwapFailed);
-        }
         let mut batch = WriteBatch::new();
-        batch.put_default(key, value);
-        self.write_batch_inner(batch)
+        batch.put_default(key.clone(), value);
+        self.write_batch_validated(batch, || {
+            let current = self.resolve_value_at_snapshot(
+                &ColumnFamily::default(),
+                &key,
+                self.snapshot().sequence,
+            )?;
+            if current.as_deref() != expected {
+                return Err(PraxisError::CompareAndSwapFailed);
+            }
+            Ok(())
+        })
     }
 
     pub fn begin_transaction(&self) -> OptimisticTransaction {
@@ -207,8 +244,9 @@ impl PraxisEngine {
         snapshot: ReadSnapshot,
         batch: WriteBatch,
     ) -> Result<SequenceNumber> {
-        self.validate_transaction_conflicts(snapshot, &batch)?;
-        self.write_batch(batch)
+        self.write_batch_validated(batch.clone(), || {
+            self.validate_transaction_conflicts(snapshot, &batch)
+        })
     }
 
     pub fn write_batch(&self, batch: WriteBatch) -> Result<SequenceNumber> {
@@ -216,13 +254,24 @@ impl PraxisEngine {
     }
 
     fn write_batch_inner(&self, batch: WriteBatch) -> Result<SequenceNumber> {
+        self.write_batch_validated(batch, || Ok(()))
+    }
+
+    fn write_batch_validated(
+        &self,
+        batch: WriteBatch,
+        validate: impl FnOnce() -> Result<()>,
+    ) -> Result<SequenceNumber> {
         let started = std::time::Instant::now();
         if batch.is_empty() {
+            validate()?;
             return Ok(self.snapshot().sequence);
         }
         self.validate_batch_column_families(&batch)?;
         let batch = self.normalize_batch_with_cf_policies(batch)?;
         self.relieve_l0_pressure_before_write()?;
+        let write_guard = self.inner.write_serialization.lock();
+        validate()?;
         let sequence = self.inner.snapshots.next_sequence();
         let record = WalRecord {
             sequence,
@@ -245,6 +294,7 @@ impl PraxisEngine {
                 }
             }
         }
+        self.inner.snapshots.observe(sequence);
         self.inner
             .metrics
             .wal_records
@@ -258,6 +308,7 @@ impl PraxisEngine {
             .metrics
             .memtable_bytes
             .store(memtable_bytes as u64, Ordering::Relaxed);
+        drop(write_guard);
         if memtable_bytes >= self.inner.config.memtable_flush_threshold_bytes {
             self.flush()?;
             self.inner
@@ -292,13 +343,15 @@ impl PraxisEngine {
             drop(state);
 
             std::thread::sleep(Duration::from_millis(1));
-            self.inner.wal.lock().sync()?;
+            let sync_result = self.inner.wal.lock().sync();
 
             let mut state = self.inner.group_commit.state.lock();
-            state.synced_batch = state.enqueued_batch;
+            if sync_result.is_ok() {
+                state.synced_batch = state.enqueued_batch;
+            }
             state.leader_active = false;
             self.inner.group_commit.ready.notify_all();
-            return Ok(());
+            return sync_result;
         }
 
         while state.synced_batch < target_batch {
@@ -371,48 +424,45 @@ impl PraxisEngine {
 
     fn install_new_active_wal(&self) -> Result<()> {
         self.inner.wal.lock().sync()?;
-        let new_wal_id = {
-            let mut manifest = self.inner.manifest.lock();
-            let id = manifest.next_wal_id;
-            manifest.active_wal_id = id;
-            manifest.next_wal_id += 1;
-            self.inner
-                .manifest_store
-                .save_with_policy(&manifest, self.inner.config.direct_io)?;
-            id
-        };
+        let mut manifest = self.inner.manifest.lock();
+        let new_wal_id = manifest.next_wal_id;
         let new_wal = Wal::open(
             self.inner.layout.wal_path(new_wal_id),
             new_wal_id,
             self.inner.config.wal_sync_policy,
         )?;
+        let mut installed = manifest.clone();
+        installed.active_wal_id = new_wal_id;
+        installed.next_wal_id += 1;
+        self.inner
+            .manifest_store
+            .save_with_policy(&installed, self.inner.config.direct_io)?;
         *self.inner.wal.lock() = new_wal;
+        *manifest = installed;
         Ok(())
     }
 
-    /// Delete WAL files whose data has been flushed to segments.
-    /// Keeps the active WAL and one previous WAL as safety margin.
+    /// Reclaim only WAL files covered by a durably installed flush.
     fn gc_old_wals(&self) {
-        let active_id = self.inner.manifest.lock().active_wal_id;
-        if active_id < 2 {
-            return;
-        }
-        let cutoff = active_id - 1;
-        let wal_root = self.inner.layout.wal_root();
-        let Ok(entries) = std::fs::read_dir(&wal_root) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if !name_str.ends_with(".wal") {
-                continue;
-            }
-            let id_str = &name_str[..name_str.len() - 4];
-            if let Ok(id) = id_str.parse::<u64>()
-                && id < cutoff
-            {
-                std::fs::remove_file(entry.path()).ok();
+        let manifest = self.inner.manifest.lock();
+        let cutoff = manifest.flushed_wal_id;
+        let active_id = manifest.active_wal_id;
+        drop(manifest);
+        if let Ok(entries) = fs::read_dir(self.inner.layout.wal_root()) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|ext| ext.to_str()) != Some("wal") {
+                    continue;
+                }
+                if let Some(id) = path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.parse::<u64>().ok())
+                    && id <= cutoff
+                    && id != active_id
+                {
+                    fs::remove_file(path).ok();
+                }
             }
         }
     }
@@ -622,116 +672,107 @@ impl PraxisEngine {
     }
 
     pub fn flush(&self) -> Result<Option<u64>> {
+        let _maintenance = self.inner.maintenance_serialization.lock();
         let started = std::time::Instant::now();
-
-        // Double-buffer: swap active memtable out under write lock, then flush
-        // without holding the active memtable lock.  Reads continue against the
-        // (now-empty) active memtable and the immutable list.
-        {
+        // Lock order: maintenance -> writer -> topology -> tier locks. New
+        // writes use a fresh WAL while the frozen tables remain readable.
+        let (flushed_wal_id, flushed_sequence) = {
+            let _writer = self.inner.write_serialization.lock();
+            let _topology = self.inner.topology.write();
             let mut mt = self.inner.memtable.write();
-            if mt.is_empty() && self.inner.immutable_memtables.lock().is_empty() {
+            let mut immutables = self.inner.immutable_memtables.lock();
+            if mt.is_empty() && immutables.is_empty() {
                 return Ok(None);
             }
+            let wal_id = self.inner.wal.lock().segment_id();
+            // Do not freeze the table unless a new WAL can be installed.
+            self.install_new_active_wal()?;
             if !mt.is_empty() {
-                let old = std::mem::take(&mut *mt);
-                self.inner.immutable_memtables.lock().push(old);
+                immutables.push(std::mem::take(&mut *mt));
             }
+            (wal_id, self.snapshot().sequence)
+        };
+        let segment_entries = self
+            .inner
+            .immutable_memtables
+            .lock()
+            .iter()
+            .flat_map(MemTable::versions)
+            .map(|(cf, key, version)| crate::segments::block::SegmentEntry { cf, key, version })
+            .collect::<Vec<_>>();
+        let segment_id = {
+            let mut manifest = self.inner.manifest.lock();
+            let id = manifest.next_segment_id;
+            manifest.next_segment_id += 1;
+            id
+        };
+        let path = self.inner.layout.segment_path(0, segment_id);
+        let mut value_log = ValueLog::open(self.inner.layout.value_log_path(segment_id))?;
+        let cf_options = self.cf_options_map();
+        let partitioned_bloom = infer_partitioned_bloom(&segment_entries, &cf_options);
+        let mut limiter = IoRateLimiter::new(self.inner.config.flush_rate_limit_bytes_per_sec);
+        limiter.consume(segment_entries.len() * 256);
+        let compression = effective_segment_compression(
+            &segment_entries,
+            &cf_options,
+            self.inner.config.compression,
+        );
+        let metadata = SegmentWriter::write(
+            SegmentWriteOptions {
+                path: &path,
+                id: segment_id,
+                level: 0,
+                compression,
+                accelerator: self.inner.accelerator.as_ref(),
+                value_log: &mut value_log,
+                large_value_threshold: self.inner.config.large_value_threshold,
+                block_size: self.inner.config.block_size,
+                partitioned_bloom,
+                direct_io: self.inner.config.direct_io,
+            },
+            segment_entries.clone(),
+        )?;
+        let flushed_entries = metadata.entries;
+        {
+            // Readers hold the topology guard through value resolution. Install
+            // disk state and retire its immutable sources as one transition.
+            let _topology = self.inner.topology.write();
+            let mut manifest = self.inner.manifest.lock();
+            let mut installed = manifest.clone();
+            installed.segments.push(metadata);
+            installed.flushed_sequence = flushed_sequence;
+            installed.flushed_wal_id = flushed_wal_id;
+            self.inner
+                .manifest_store
+                .save_with_policy(&installed, self.inner.config.direct_io)?;
+            let mut index = self.inner.segment_index.write();
+            for entry in segment_entries {
+                index
+                    .entry((entry.cf, entry.key))
+                    .or_default()
+                    .push(entry.version);
+            }
+            self.inner.immutable_memtables.lock().clear();
+            *manifest = installed;
         }
-
-        // Flush every immutable memtable to its own segment.
-        let immutables: Vec<MemTable> = std::mem::take(&mut *self.inner.immutable_memtables.lock());
-        let mut last_segment_id = None;
-        for imm in &immutables {
-            let entries = imm.drain_latest();
-            if entries.is_empty() {
-                continue;
-            }
-            let segment_id = {
-                let mut manifest = self.inner.manifest.lock();
-                let id = manifest.next_segment_id;
-                manifest.next_segment_id += 1;
-                id
-            };
-            let path = self.inner.layout.segment_path(0, segment_id);
-            let mut value_log = ValueLog::open(self.inner.layout.value_log_path(segment_id))?;
-            let segment_entries = entries
-                .into_iter()
-                .map(|(cf, key, version)| crate::segments::block::SegmentEntry { cf, key, version })
-                .collect::<Vec<_>>();
-            let cf_options = self.cf_options_map();
-            let partitioned_bloom = infer_partitioned_bloom(&segment_entries, &cf_options);
-            let mut flush_limiter =
-                IoRateLimiter::new(self.inner.config.flush_rate_limit_bytes_per_sec);
-            flush_limiter.consume(segment_entries.len() * 256);
-            let compression = effective_segment_compression(
-                &segment_entries,
-                &cf_options,
-                self.inner.config.compression,
-            );
-            let metadata = SegmentWriter::write(
-                SegmentWriteOptions {
-                    path: &path,
-                    id: segment_id,
-                    level: 0,
-                    compression,
-                    accelerator: self.inner.accelerator.as_ref(),
-                    value_log: &mut value_log,
-                    large_value_threshold: self.inner.config.large_value_threshold,
-                    block_size: self.inner.config.block_size,
-                    partitioned_bloom,
-                    direct_io: self.inner.config.direct_io,
-                },
-                segment_entries,
-            )?;
-            let flushed_entries = metadata.entries;
-            let loaded = SegmentReader::read(
-                &path,
-                self.inner.accelerator.as_ref(),
-                self.inner.config.direct_io,
-            )?;
-            {
-                let mut segment_index = self.inner.segment_index.write();
-                for entry in loaded {
-                    segment_index
-                        .entry((entry.cf, entry.key))
-                        .or_default()
-                        .push(entry.version);
-                }
-            }
-            {
-                let mut manifest = self.inner.manifest.lock();
-                manifest.segments.push(metadata);
-                self.inner
-                    .manifest_store
-                    .save_with_policy(&manifest, self.inner.config.direct_io)?;
-            }
-            last_segment_id = Some((segment_id, flushed_entries));
-        }
-
-        self.inner
-            .metrics
-            .memtable_bytes
-            .store(0, Ordering::Relaxed);
-        self.install_new_active_wal()?;
+        self.inner.metrics.memtable_bytes.store(
+            self.inner.memtable.read().approximate_bytes() as u64,
+            Ordering::Relaxed,
+        );
         self.gc_old_wals();
         self.inner
             .metrics
             .segment_flushes
             .fetch_add(1, Ordering::Relaxed);
-
-        if let Some((segment_id, flushed_entries)) = last_segment_id {
-            slog::info(
-                "flush",
-                slog::context()
-                    .with_u64("segment_id", segment_id)
-                    .with_u64("entries", flushed_entries)
-                    .with_u64("duration_ms", started.elapsed().as_millis() as u64)
-                    .with_str("outcome", "success"),
-            );
-            Ok(Some(segment_id))
-        } else {
-            Ok(None)
-        }
+        slog::info(
+            "flush",
+            slog::context()
+                .with_u64("segment_id", segment_id)
+                .with_u64("entries", flushed_entries)
+                .with_u64("duration_ms", started.elapsed().as_millis() as u64)
+                .with_str("outcome", "success"),
+        );
+        Ok(Some(segment_id))
     }
 
     pub fn compact(&self) -> Result<u64> {
@@ -742,14 +783,24 @@ impl PraxisEngine {
         &self,
         strategy: crate::config::CompactionStrategy,
     ) -> Result<u64> {
+        let _maintenance = self.inner.maintenance_serialization.lock();
         let started = std::time::Instant::now();
         self.flush()?;
         let plan = self.pick_compaction_plan(strategy);
-        let source_segment_ids = plan.source_segment_ids;
         let target_level = plan.target_level;
-        if source_segment_ids.is_empty() {
+        if plan.source_segment_ids.is_empty() {
             return Ok(0);
         }
+        // This implementation rewrites the entire resident segment index, so
+        // every represented segment must be retired to avoid replaying merges twice.
+        let source_segment_ids = self
+            .inner
+            .manifest
+            .lock()
+            .segments
+            .iter()
+            .map(|segment| segment.id)
+            .collect::<Vec<_>>();
         let (job_id, segment_id) =
             self.begin_compaction_job(strategy, source_segment_ids.clone())?;
         self.mark_compaction_job_running(job_id)?;
@@ -772,19 +823,22 @@ impl PraxisEngine {
             ));
         }
         if compacted.is_empty() {
+            let _topology = self.inner.topology.write();
             let mut manifest = self.inner.manifest.lock();
-            manifest
+            let mut installed = manifest.clone();
+            installed
                 .segments
                 .retain(|segment| !source_segment_ids.contains(&segment.id));
-            job_state::finish_job(&mut manifest, job_id, None, CompactionJobStatus::Installed);
+            job_state::finish_job(&mut installed, job_id, None, CompactionJobStatus::Installed);
             self.inner
                 .manifest_store
-                .save_with_policy(&manifest, self.inner.config.direct_io)?;
+                .save_with_policy(&installed, self.inner.config.direct_io)?;
             self.inner.segment_index.write().clear();
+            *manifest = installed;
             return Ok(0);
         }
         let path = self.inner.layout.segment_path(target_level, segment_id);
-        std::fs::create_dir_all(path.parent().expect("segment path has parent"))?;
+        crate::io::create_dir_all_durable(path.parent().expect("segment path has parent"))?;
         let mut value_log = ValueLog::open(self.inner.layout.value_log_path(segment_id))?;
         let mut compaction_limiter =
             IoRateLimiter::new(self.inner.config.compaction_rate_limit_bytes_per_sec);
@@ -820,25 +874,25 @@ impl PraxisEngine {
                 .or_insert_with(Vec::new)
                 .push(entry.version);
         }
-        {
-            let mut segment_index = self.inner.segment_index.write();
-            *segment_index = rebuilt;
-        }
+        let _topology = self.inner.topology.write();
         {
             let mut manifest = self.inner.manifest.lock();
-            manifest
+            let mut installed = manifest.clone();
+            installed
                 .segments
                 .retain(|segment| !source_segment_ids.contains(&segment.id));
-            manifest.segments.push(metadata);
+            installed.segments.push(metadata);
             job_state::finish_job(
-                &mut manifest,
+                &mut installed,
                 job_id,
                 Some(segment_id),
                 CompactionJobStatus::Installed,
             );
             self.inner
                 .manifest_store
-                .save_with_policy(&manifest, self.inner.config.direct_io)?;
+                .save_with_policy(&installed, self.inner.config.direct_io)?;
+            *self.inner.segment_index.write() = rebuilt;
+            *manifest = installed;
         }
         slog::info(
             "compact",
@@ -897,87 +951,32 @@ impl PraxisEngine {
         pinned_snapshots: &[SequenceNumber],
         strategy: crate::config::CompactionStrategy,
     ) -> Vec<crate::segments::block::SegmentEntry> {
-        let mut retained = Vec::new();
-        let now = now_millis();
-        let not_expired = |version: &&VersionedValue| match &version.value {
-            StoredValue::PutWithExpiry { expires_at_ms, .. } => *expires_at_ms > now,
-            _ => true,
-        };
-
-        if versions.is_empty() {
-            return retained;
-        }
-
+        // Keep complete operand chains for current and pinned views. An expired
+        // value is still a deletion barrier, so never filter it before resolution.
+        let mut keep = std::collections::BTreeSet::new();
         if matches!(strategy, crate::config::CompactionStrategy::Tiered) {
-            for version in versions.iter().filter(not_expired) {
-                if let Some(pinned) = pinned_snapshots.iter().copied().min()
-                    && version.sequence > latest_sequence
-                    && version.sequence > pinned
-                {
+            keep.extend(0..versions.len());
+        } else {
+            for snapshot in std::iter::once(&latest_sequence).chain(pinned_snapshots.iter()) {
+                let Some(mut index) = versions.iter().rposition(|v| v.sequence <= *snapshot) else {
                     continue;
+                };
+                loop {
+                    keep.insert(index);
+                    if !matches!(versions[index].value, StoredValue::Merge(_)) || index == 0 {
+                        break;
+                    }
+                    index -= 1;
                 }
-                retained.push(crate::segments::block::SegmentEntry {
-                    cf: cf.clone(),
-                    key: key.clone(),
-                    version: version.clone(),
-                });
             }
-            return retained;
         }
-
-        if matches!(strategy, crate::config::CompactionStrategy::Universal) {
-            for version in versions.iter().rev().filter(not_expired).take(4) {
-                retained.push(crate::segments::block::SegmentEntry {
-                    cf: cf.clone(),
-                    key: key.clone(),
-                    version: version.clone(),
-                });
-            }
-            retained.sort_by_key(|entry| entry.version.sequence);
-            return retained;
-        }
-
-        let Some(newest) = versions
-            .iter()
-            .rev()
-            .filter(not_expired)
-            .find(|version| version.sequence <= latest_sequence)
-        else {
-            return retained;
-        };
-        if !matches!(newest.value, StoredValue::Delete) || !pinned_snapshots.is_empty() {
-            retained.push(crate::segments::block::SegmentEntry {
+        keep.into_iter()
+            .map(|index| crate::segments::block::SegmentEntry {
                 cf: cf.clone(),
                 key: key.clone(),
-                version: newest.clone(),
-            });
-        }
-
-        let mut preserved_sequences = retained
-            .iter()
-            .map(|entry| entry.version.sequence)
-            .collect::<std::collections::BTreeSet<_>>();
-        for snapshot in pinned_snapshots {
-            let Some(pinned_visible) = versions
-                .iter()
-                .rev()
-                .find(|version| version.sequence <= *snapshot)
-            else {
-                continue;
-            };
-            if matches!(pinned_visible.value, StoredValue::Delete) {
-                continue;
-            }
-            if preserved_sequences.insert(pinned_visible.sequence) {
-                retained.push(crate::segments::block::SegmentEntry {
-                    cf: cf.clone(),
-                    key: key.clone(),
-                    version: pinned_visible.clone(),
-                });
-            }
-        }
-        retained.sort_by_key(|entry| entry.version.sequence);
-        retained
+                version: versions[index].clone(),
+            })
+            .collect()
     }
 
     pub(crate) fn resolve_value_at_snapshot(
@@ -986,6 +985,7 @@ impl PraxisEngine {
         key: &[u8],
         snapshot: SequenceNumber,
     ) -> Result<Option<Vec<u8>>> {
+        let _topology = self.inner.topology.read();
         let mut chain = self
             .inner
             .segment_index
@@ -1086,6 +1086,9 @@ impl PraxisEngine {
     }
 
     pub fn garbage_collect(&self) -> Result<GcReport> {
+        let _maintenance = self.inner.maintenance_serialization.lock();
+        let _writer = self.inner.write_serialization.lock();
+        let _topology = self.inner.topology.write();
         let started = std::time::Instant::now();
         let manifest = self.inner.manifest.lock().clone();
         let mut live_files = HashSet::new();
@@ -1093,7 +1096,25 @@ impl PraxisEngine {
             live_files.insert(PathBuf::from(&segment.path));
             live_files.insert(self.inner.layout.value_log_path(segment.id));
         }
-        live_files.insert(self.inner.layout.wal_path(manifest.active_wal_id));
+        // Record payloads can point into value logs owned by older segments.
+        for versions in self.inner.segment_index.read().values() {
+            for version in versions {
+                if let StoredValue::BlobPointer(pointer) = &version.value {
+                    live_files.insert(PathBuf::from(&pointer.path));
+                }
+            }
+        }
+        for entry in fs::read_dir(self.inner.layout.wal_root())? {
+            let path = entry?.path();
+            if let Some(id) = path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.parse::<u64>().ok())
+                && (id > manifest.flushed_wal_id || id == manifest.active_wal_id)
+            {
+                live_files.insert(path);
+            }
+        }
         if let Some(checkpoint) = &manifest.latest_checkpoint {
             live_files.insert(PathBuf::from(&checkpoint.path));
         }
