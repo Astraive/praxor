@@ -145,6 +145,31 @@ impl Wal {
         self.segment_id
     }
 
+    pub(crate) fn validate_backup_prefix(
+        bytes: &[u8],
+        path: &Path,
+        id: u64,
+        sequence: u64,
+    ) -> Result<Vec<u64>> {
+        if bytes.starts_with(&WAL_FILE_MAGIC.to_le_bytes())
+            && (bytes.len() < WAL_FILE_HEADER_LEN
+                || u64::from_le_bytes(bytes[8..16].try_into().expect("complete header")) != id)
+        {
+            return Err(PraxisError::Corrupt {
+                path: path.to_path_buf(),
+                reason: "backup WAL role/header ID mismatch".to_string(),
+            });
+        }
+        let (records, end) = replay_records(bytes, path)?;
+        if end != bytes.len() || records.iter().any(|record| record.sequence > sequence) {
+            return Err(PraxisError::Corrupt {
+                path: path.to_path_buf(),
+                reason: "backup WAL prefix is incomplete or exceeds capture".to_string(),
+            });
+        }
+        Ok(records.into_iter().map(|record| record.sequence).collect())
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
