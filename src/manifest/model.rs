@@ -14,6 +14,12 @@ pub struct Manifest {
     #[serde(default = "default_next_wal_id")]
     pub next_wal_id: u64,
     pub last_sequence: u64,
+    /// WAL records through this sequence are covered by installed segments.
+    #[serde(default)]
+    pub flushed_sequence: u64,
+    /// Only WAL files through this id may be reclaimed after installation.
+    #[serde(default)]
+    pub flushed_wal_id: u64,
     pub next_segment_id: u64,
     pub latest_checkpoint: Option<CheckpointMetadata>,
     #[serde(default)]
@@ -32,6 +38,8 @@ impl Manifest {
             active_wal_id: 1,
             next_wal_id: 2,
             last_sequence: 0,
+            flushed_sequence: 0,
+            flushed_wal_id: 0,
             next_segment_id: 1,
             latest_checkpoint: None,
             compaction_jobs: Vec::new(),

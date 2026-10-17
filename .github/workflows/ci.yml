@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -21,13 +21,13 @@ jobs:
         run: cargo fmt --check
 
       - name: Check tests and benches
-        run: cargo check --benches --tests
+        run: cargo check --locked --benches --tests
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --all
+        run: cargo test --locked --all
 
       - name: Storage slog gate
         shell: pwsh
@@ -50,30 +50,30 @@ jobs:
           - gpu-cuda,gpu-vulkan,gpu-metal,gpu-wgpu
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
 
       - name: Check GPU fallback feature set
-        run: cargo check --benches --tests --features "${{ matrix.features }}"
+        run: cargo check --locked --benches --tests --features "${{ matrix.features }}"
 
   benchmark-smoke:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
 
       - name: Accel smoke benchmark
-        run: cargo bench --bench accel_gpu_crc -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+        run: cargo bench --locked --bench accel_gpu_crc -- --sample-size 10 --warm-up-time 1 --measurement-time 1
 
       - name: Graph smoke benchmark
-        run: cargo bench --bench graph_adjacency_traversal -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+        run: cargo bench --locked --bench graph_adjacency_traversal -- --sample-size 10 --warm-up-time 1 --measurement-time 1
 
       - name: Vector smoke benchmark
-        run: cargo bench --bench vector_ivf_search -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+        run: cargo bench --locked --bench vector_ivf_search -- --sample-size 10 --warm-up-time 1 --measurement-time 1
 
       - name: Search smoke benchmark
-        run: cargo bench --bench search_inverted_index -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+        run: cargo bench --locked --bench search_inverted_index -- --sample-size 10 --warm-up-time 1 --measurement-time 1
 
   ignored-stress:
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
@@ -81,11 +81,11 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
 
       - name: Ignored concurrency benchmark
-        run: cargo test --test concurrency_benchmark_integration test_phase3b_concurrent_benchmark -- --ignored --exact --test-threads=1
+        run: cargo test --locked --test concurrency_benchmark_integration test_phase3b_concurrent_benchmark -- --ignored --exact --test-threads=1
 
       - name: Ignored stress workloads
-        run: cargo test --test concurrency_stress -- --ignored --test-threads=1
+        run: cargo test --locked --test concurrency_stress -- --ignored --test-threads=1
