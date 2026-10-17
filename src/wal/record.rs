@@ -4,7 +4,7 @@ use crate::transactions::{BatchOp, WriteBatch};
 use crate::types::ColumnFamily;
 use std::path::PathBuf;
 
-const WAL_MAGIC: u32 = 0x5457_414c;
+pub(crate) const WAL_MAGIC: u32 = 0x5457_414c;
 pub const WAL_RECORD_HEADER_LEN: usize = 12;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

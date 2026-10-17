@@ -1,5 +1,6 @@
 use super::RecordId;
 use crate::errors::{PraxisError, Result};
+use crate::io::sync_parent_dir;
 use crc32fast::Hasher as Crc32Hasher;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -64,12 +65,17 @@ impl StorageWal {
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
-        std::fs::create_dir_all(&dir)?;
+        crate::io::create_dir_all_durable(&dir)?;
         let stem = wal_stem(&path);
 
         let mut segment_ids = list_segment_ids(&dir, &stem)?;
         segment_ids.sort_unstable();
         let active_segment_id = segment_ids.last().copied().unwrap_or(1);
+        // Validate immutable segments before repairing the active one. New
+        // appends must not succeed when replay would fail on an older segment.
+        for &segment_id in segment_ids.iter().take(segment_ids.len().saturating_sub(1)) {
+            replay_file(&segment_path(&dir, &stem, segment_id))?;
+        }
         let active_segment_path = segment_path(&dir, &stem, active_segment_id);
         let (file, active_size) = open_segment_file(&active_segment_path)?;
 
@@ -191,16 +197,28 @@ fn list_segment_ids(dir: &Path, stem: &str) -> Result<Vec<u64>> {
 }
 
 fn open_segment_file(path: &Path) -> Result<(File, u64)> {
-    let is_new = !path.exists();
     let mut file = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
         .open(path)?;
-    if is_new {
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let (_, valid_len) = replay_records(&bytes, path)?;
+    if bytes.len() < STORAGE_WAL_HEADER_LEN {
+        // A crash can interrupt creation of the segment header itself. The
+        // scanner accepts only a matching prefix, so completing it is safe.
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
         file.write_all(&STORAGE_WAL_MAGIC.to_le_bytes())?;
         file.write_all(&[STORAGE_WAL_VERSION])?;
+        file.sync_data()?;
+        sync_parent_dir(path)?;
+    } else if valid_len < bytes.len() {
+        // New records must start at the recovered boundary, not behind a
+        // torn append that would hide them from subsequent replay.
+        file.set_len(valid_len as u64)?;
         file.sync_data()?;
     }
     let size = file.metadata()?.len();
@@ -214,8 +232,24 @@ fn replay_file(path: &Path) -> Result<Vec<StorageWalEntry>> {
     let mut file = File::open(path)?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
+    replay_records(&bytes, path).map(|(records, _)| records)
+}
+
+/// A short terminal record header or a payload extending past EOF is a torn
+/// append. Complete records must pass checksum and payload validation; errors
+/// are corruption, even when the affected record is the final one in a file.
+fn replay_records(bytes: &[u8], path: &Path) -> Result<(Vec<StorageWalEntry>, usize)> {
     if bytes.len() < STORAGE_WAL_HEADER_LEN {
-        return Ok(Vec::new());
+        let mut header = STORAGE_WAL_MAGIC.to_le_bytes().to_vec();
+        header.push(STORAGE_WAL_VERSION);
+        return if header.starts_with(bytes) {
+            Ok((Vec::new(), 0))
+        } else {
+            Err(PraxisError::Corrupt {
+                path: path.to_path_buf(),
+                reason: "bad partial storage WAL header".to_string(),
+            })
+        };
     }
     let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     if magic != STORAGE_WAL_MAGIC {
@@ -233,7 +267,7 @@ fn replay_file(path: &Path) -> Result<Vec<StorageWalEntry>> {
 
     let mut out = Vec::new();
     let mut cursor = STORAGE_WAL_HEADER_LEN;
-    while cursor + STORAGE_WAL_RECORD_HEADER_LEN <= bytes.len() {
+    while bytes.len() - cursor >= STORAGE_WAL_RECORD_HEADER_LEN {
         let len = u32::from_le_bytes([
             bytes[cursor],
             bytes[cursor + 1],
@@ -247,19 +281,22 @@ fn replay_file(path: &Path) -> Result<Vec<StorageWalEntry>> {
             bytes[cursor + 7],
         ]);
         let start = cursor + STORAGE_WAL_RECORD_HEADER_LEN;
-        let end = start + len;
-        if end > bytes.len() {
+        if len > bytes.len() - start {
             break;
         }
+        let end = start + len;
         let payload = &bytes[start..end];
         if crc32(payload) != expected {
-            break;
+            return Err(PraxisError::Corrupt {
+                path: path.to_path_buf(),
+                reason: format!("storage WAL checksum mismatch at offset {cursor}"),
+            });
         }
         let entry = decode_payload(payload)?;
         out.push(entry);
         cursor = end;
     }
-    Ok(out)
+    Ok((out, cursor))
 }
 
 fn crc32(bytes: &[u8]) -> u32 {
