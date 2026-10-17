@@ -89,10 +89,12 @@ record artifacts, and reserved markers are refused without following aliases.
 lease before any WAL read or page initialization. Entity, page service, local SDK,
 and explicit recovery constructors delegate to that owner. A complete empty
 scaffold may additionally contain the exact regular 16-byte v1 page-WAL header;
-malformed headers and logs-only partial namespaces remain refused. Catalog
-constructors remain a separate ownership/admission task in
-[#48](https://github.com/Astraive/praxor/issues/48), so
-[#40](https://github.com/Astraive/praxor/issues/40) stays open.
+malformed headers and logs-only partial namespaces remain refused.
+`CatalogStore::open` delegates to the same owner/admission path;
+`CatalogStore::new(database)` shares an existing owner. Catalog-only v1 roots
+remain supported without a page manifest or RID directory. Catalog integration
+is tracked by [#48](https://github.com/Astraive/praxor/issues/48) within the
+constructor coverage required by [#40](https://github.com/Astraive/praxor/issues/40).
 
 ## Refusal and compatibility limits
 
