@@ -94,7 +94,9 @@ fn catalog_store_persists_collection_entity_and_attribute_catalogs() {
     };
 
     store.save(&snapshot).unwrap();
-    let loaded = CatalogStore::open(dir.path()).unwrap().load().unwrap();
+    drop(store);
+    let store = CatalogStore::open(dir.path()).unwrap();
+    let loaded = store.load().unwrap();
 
     assert_eq!(loaded, snapshot);
     assert!(
