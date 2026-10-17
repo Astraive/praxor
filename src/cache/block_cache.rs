@@ -355,12 +355,20 @@ mod tests {
                     }
                     peak_queue_capacity = peak_queue_capacity.max(cache.order.capacity());
                 }
-                println!(
-                    "workload={workload} operations={operations} elapsed_us={} live_entries={} queue_len={} peak_queue_capacity={peak_queue_capacity} peak_queue_bytes={}",
-                    started.elapsed().as_micros(),
-                    cache.len(),
-                    cache.order.len(),
-                    peak_queue_capacity * std::mem::size_of::<(usize, u64)>()
+                let elapsed_us = started.elapsed().as_micros() as u64;
+                crate::slog::info(
+                    "cache_metadata_profile",
+                    crate::slog::context()
+                        .with_str("workload", workload)
+                        .with_u64("operations", operations as u64)
+                        .with_u64("elapsed_us", elapsed_us)
+                        .with_u64("live_entries", cache.len() as u64)
+                        .with_u64("queue_len", cache.order.len() as u64)
+                        .with_u64("retained_queue_capacity", peak_queue_capacity as u64)
+                        .with_u64(
+                            "retained_queue_bytes",
+                            (peak_queue_capacity * std::mem::size_of::<(usize, u64)>()) as u64,
+                        ),
                 );
             }
         }
