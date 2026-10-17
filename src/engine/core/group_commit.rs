@@ -6,7 +6,7 @@ use crate::metrics::EngineMetrics;
 use crate::transactions::WriteBatch;
 use crate::types::{Key, ReadSnapshot};
 use parking_lot::{Condvar, Mutex};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -21,6 +21,7 @@ pub(crate) enum WriteCondition {
 
 pub(crate) struct CommitRequest {
     pub(crate) batch: WriteBatch,
+    pub(crate) generations: BTreeMap<String, u64>,
     pub(crate) condition: WriteCondition,
     pub(crate) encoded_len: usize,
     admitted_at: Instant,
@@ -88,6 +89,7 @@ impl GroupCommitCoordinator {
     pub(crate) fn admit(
         &self,
         batch: WriteBatch,
+        generations: BTreeMap<String, u64>,
         condition: WriteCondition,
         encoded_len: usize,
         metrics: &EngineMetrics,
@@ -108,6 +110,7 @@ impl GroupCommitCoordinator {
             if ticket == state.serving_ticket && fits {
                 let request = Arc::new(CommitRequest {
                     batch,
+                    generations,
                     condition,
                     encoded_len,
                     admitted_at,
@@ -240,7 +243,13 @@ mod tests {
         condition: WriteCondition,
     ) -> Arc<CommitRequest> {
         coordinator
-            .admit(WriteBatch::new(), condition, bytes, metrics)
+            .admit(
+                WriteBatch::new(),
+                BTreeMap::new(),
+                condition,
+                bytes,
+                metrics,
+            )
             .unwrap()
     }
 
@@ -369,6 +378,7 @@ mod tests {
                 coordinator
                     .admit(
                         WriteBatch::new(),
+                        BTreeMap::new(),
                         WriteCondition::Unconditional,
                         1,
                         &metrics,
