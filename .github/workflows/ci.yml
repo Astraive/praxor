@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -50,7 +50,7 @@ jobs:
           - gpu-cuda,gpu-vulkan,gpu-metal,gpu-wgpu
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
 
       - name: Check GPU fallback feature set
@@ -60,7 +60,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
 
       - name: Accel smoke benchmark
@@ -81,7 +81,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
 
       - name: Ignored concurrency benchmark

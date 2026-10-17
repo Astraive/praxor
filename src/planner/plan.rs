@@ -173,7 +173,7 @@ impl Planner {
         let mut lines = vec![
             format!("EXPLAIN PLAN FOR {target}"),
             format!("  Total Cost: {total_cost:.2}"),
-            format!("  Operators:"),
+            "  Operators:".to_string(),
         ];
         if costed.operators.is_empty()
             && logical.collection != "_scalar"
