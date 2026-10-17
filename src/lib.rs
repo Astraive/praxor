@@ -16,6 +16,7 @@ pub mod cache;
 pub mod catalog;
 pub mod cli;
 pub mod config;
+pub mod core_records;
 pub mod datatype;
 pub mod disk;
 pub mod document;
@@ -55,6 +56,7 @@ pub use catalog::schema::{
     AttributeSchema, AttributeType, Catalog, CollectionSchema, DistanceMetric, StorageClass,
 };
 pub use config::{CompactionStrategy, Compression, PraxisConfig, WalSyncPolicy};
+pub use core_records::{CoreDatabase, CoreRecordStore, MappingDescriptor, RecordAuthorityOptions};
 pub use document::{Edge, Record, RecordDirectory};
 pub use engine::PraxisEngine;
 pub use engine::r#async::AsyncPraxisEngine;

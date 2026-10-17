@@ -1,4 +1,7 @@
-use super::group_commit::{CommitLeader, CommitTurn, GroupCommitCoordinator, WriteCondition};
+use super::group_commit::{
+    CommitKind, CommitLeader, CommitOutcome, CommitRequest, CommitTurn, Durability,
+    GroupCommitCoordinator, WriteCondition,
+};
 use super::state::{CacheKey, EngineInner};
 use crate::accel::gpu::GpuBackendKind;
 use crate::accel::{Accelerator, CpuAccelerator, GpuAccelerator};
@@ -47,6 +50,14 @@ mod cf_generation_tests;
 #[path = "engine/backup_tests.rs"]
 mod backup_tests;
 
+#[cfg(test)]
+#[path = "engine/durability_tests.rs"]
+mod durability_tests;
+
+#[cfg(test)]
+#[path = "engine/record_tests.rs"]
+mod record_tests;
+
 impl PraxisEngine {
     pub fn open(config: PraxisConfig) -> Result<Self> {
         config.validate()?;
@@ -56,6 +67,33 @@ impl PraxisEngine {
             crate::storage::root_format::InspectionOptions::for_admission(),
         )?
         .require_compatible(crate::storage::root_format::RootOwner::Core)?;
+        if writer_lease.root().join("MANIFEST").exists() {
+            let manifest = crate::manifest::Manifest::decode(
+                &fs::read(writer_lease.root().join("MANIFEST"))?,
+                &writer_lease.root().join("MANIFEST"),
+            )?;
+            if manifest.record_authority.is_some() {
+                return Err(PraxisError::RecordAuthorityOpenRequired {
+                    path: writer_lease.root().to_path_buf(),
+                });
+            }
+        }
+        Self::open_owned(config, writer_lease, None)
+    }
+
+    pub(crate) fn open_records(
+        config: PraxisConfig,
+        lease: WriterLease,
+        manifest: crate::manifest::Manifest,
+    ) -> Result<Self> {
+        Self::open_owned(config, lease, Some(manifest))
+    }
+
+    fn open_owned(
+        config: PraxisConfig,
+        writer_lease: WriterLease,
+        record_manifest: Option<crate::manifest::Manifest>,
+    ) -> Result<Self> {
         slog::Logger::init(config.logging.clone());
         let accelerator: Arc<dyn Accelerator> = match config.accelerator {
             AcceleratorBackend::Cpu => Arc::new(CpuAccelerator),
@@ -63,15 +101,33 @@ impl PraxisEngine {
             AcceleratorBackend::Vulkan => Arc::new(GpuAccelerator::new(GpuBackendKind::Vulkan)),
             AcceleratorBackend::Metal => Arc::new(GpuAccelerator::new(GpuBackendKind::Metal)),
         };
-        let layout = DiskLayout::create(writer_lease.root())?;
+        let records = record_manifest.is_some();
+        let layout = if records {
+            DiskLayout::at(writer_lease.root())
+        } else {
+            DiskLayout::create(writer_lease.root())?
+        };
         let manifest_store = ManifestStore::new(layout.manifest_path());
-        let mut manifest = manifest_store.load_or_create(&config)?;
+        let mut manifest = match record_manifest {
+            Some(manifest) => manifest,
+            None => manifest_store.load_or_create(&config)?,
+        };
+        manifest.validate_and_upgrade(manifest_store.path())?;
         if manifest.effective_config != config.persisted() {
             return Err(PraxisError::ConfigMismatch(
                 "open config differs from persisted effective engine config".to_string(),
             ));
         }
-        if job_state::reconcile_unfinished_jobs(&mut manifest) {
+        let validated_records = if records {
+            Some(crate::core_records::recovery::validate_owner(
+                writer_lease.root(),
+                &manifest,
+                accelerator.as_ref(),
+            )?)
+        } else {
+            None
+        };
+        if !records && job_state::reconcile_unfinished_jobs(&mut manifest) {
             manifest_store.save_with_policy(&manifest, config.direct_io)?;
         }
         let mut segment_index: BTreeMap<(ColumnFamily, Key), Vec<crate::types::VersionedValue>> =
@@ -110,19 +166,25 @@ impl PraxisEngine {
                 chain.sort_by_key(|version| version.sequence);
             }
         }
-        let wal_records = Wal::replay_dir(&layout.wal_root())?;
+        let wal_records = match validated_records {
+            Some(records) => records,
+            None => Wal::replay_dir(&layout.wal_root())?
+                .into_iter()
+                .map(crate::wal::record::CoreWalRecord::User)
+                .collect(),
+        };
         let mut memtable = MemTable::default();
         let snapshots = Arc::new(SnapshotManager::default());
         for record in &wal_records {
             // Retired operations are invisible, but their durable sequence IDs
             // must never be reused, including records below a flush cutoff.
-            snapshots.observe(record.sequence);
-            if record.sequence <= manifest.flushed_sequence
-                && !(record.sequence == 0 && manifest.flushed_sequence == 0)
+            snapshots.observe(record.sequence());
+            if record.sequence() <= manifest.flushed_sequence
+                && !(record.sequence() == 0 && manifest.flushed_sequence == 0)
             {
                 continue;
             }
-            for op in record.batch.ops() {
+            for op in record.batch().ops() {
                 let cf = match op {
                     BatchOp::Put { cf, .. }
                     | BatchOp::PutWithExpiry { cf, .. }
@@ -131,7 +193,7 @@ impl PraxisEngine {
                 };
                 if !active_generations
                     .get(&cf.0)
-                    .is_some_and(|generation| generation.includes(record.sequence))
+                    .is_some_and(|generation| generation.includes(record.sequence()))
                 {
                     continue;
                 }
@@ -148,10 +210,10 @@ impl PraxisEngine {
                     if let Some(versions) =
                         segment_index.get_mut(&(cf.clone(), Bytes::copy_from_slice(key)))
                     {
-                        versions.retain(|version| version.sequence != record.sequence);
+                        versions.retain(|version| version.sequence != record.sequence());
                     }
                 }
-                memtable.apply(record.sequence, op);
+                memtable.apply(record.sequence(), op);
             }
         }
         snapshots.observe(manifest.last_sequence);
@@ -160,11 +222,27 @@ impl PraxisEngine {
         // their recovered watermark into future structural checkpoints before
         // those checkpoints retire the WAL containing the original sequence.
         manifest.last_sequence = snapshots.snapshot().sequence;
-        let wal = Wal::open(
-            layout.wal_path(manifest.active_wal_id),
-            manifest.active_wal_id,
-            config.wal_sync_policy,
-        )?;
+        // All v3 segment/WAL evidence has been validated before these first
+        // recovery mutations, including records below the flush cutoff.
+        if records {
+            DiskLayout::create(writer_lease.root())?;
+            if job_state::reconcile_unfinished_jobs(&mut manifest) {
+                manifest_store.save_with_policy(&manifest, config.direct_io)?;
+            }
+        }
+        let wal = if records {
+            Wal::open_core(
+                layout.wal_path(manifest.active_wal_id),
+                manifest.active_wal_id,
+                config.wal_sync_policy,
+            )?
+        } else {
+            Wal::open(
+                layout.wal_path(manifest.active_wal_id),
+                manifest.active_wal_id,
+                config.wal_sync_policy,
+            )?
+        };
         let metrics = EngineMetrics::default();
         metrics
             .recovered_records
@@ -333,10 +411,13 @@ impl PraxisEngine {
             encoded_len,
             &self.inner.metrics,
         )?;
-        let sequence = loop {
-            match self.inner.group_commit.wait(&request) {
-                CommitTurn::Complete(result) => break result?,
-                CommitTurn::Lead(leader) => self.commit_closed_group(leader),
+        let sequence = match self.wait_for_commit(&request)? {
+            CommitOutcome::Write { sequence } => sequence,
+            _ => {
+                self.inner
+                    .group_commit
+                    .poison("KV request received a non-write outcome".into());
+                return Err(PraxisError::RecoveryRequired);
             }
         };
         // Leadership was handed off before automatic maintenance. Preserve the
@@ -361,6 +442,68 @@ impl PraxisEngine {
         Ok(sequence)
     }
 
+    fn wait_for_commit(&self, request: &CommitRequest) -> Result<CommitOutcome> {
+        loop {
+            match self.inner.group_commit.wait(request) {
+                CommitTurn::Complete(result) => return result,
+                CommitTurn::Lead(leader) => self.commit_closed_group(leader),
+            }
+        }
+    }
+
+    pub(crate) fn durable_barrier(&self) -> Result<u64> {
+        self.inner.group_commit.ensure_writable()?;
+        let request = self.inner.group_commit.admit_barrier(&self.inner.metrics)?;
+        match self.wait_for_commit(&request)? {
+            CommitOutcome::Barrier { through_sequence } => Ok(through_sequence),
+            _ => {
+                self.inner
+                    .group_commit
+                    .poison("barrier received a non-barrier outcome".into());
+                Err(PraxisError::RecoveryRequired)
+            }
+        }
+    }
+
+    pub(crate) fn commit_record(
+        &self,
+        intent: crate::core_records::intent::RecordIntent,
+    ) -> Result<crate::core_records::intent::RecordReceipt> {
+        self.inner.group_commit.ensure_writable()?;
+        if self.inner.manifest.lock().record_authority.is_none() {
+            return Err(PraxisError::InvalidConfig(
+                "record intent requires explicit core authority".into(),
+            ));
+        }
+        let request = self
+            .inner
+            .group_commit
+            .admit_record(intent, &self.inner.metrics)?;
+        match self.wait_for_commit(&request)? {
+            CommitOutcome::Record(receipt) => Ok(receipt),
+            _ => Err(PraxisError::RecoveryRequired),
+        }
+    }
+
+    fn sync_commit_wal(&self, wal: &mut Wal) -> Result<()> {
+        let started = std::time::Instant::now();
+        self.inner
+            .metrics
+            .commit_sync_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        let result = wal.sync();
+        self.inner.metrics.commit_sync_ns.fetch_add(
+            started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+        result?;
+        self.inner
+            .metrics
+            .commit_syncs
+            .fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
     fn commit_closed_group(&self, leader: CommitLeader<'_>) {
         let writer = self.inner.write_serialization.lock();
         // Rebind after the writer guard so unwind poisoning runs before the
@@ -371,16 +514,117 @@ impl PraxisEngine {
             return;
         }
         let group = leader.drain(self.inner.config.wal_sync_policy, &self.inner.metrics);
+        if group
+            .first()
+            .is_some_and(|request| matches!(request.kind, CommitKind::Barrier))
+        {
+            if group.len() != 1 {
+                leader.fail("barrier was not fenced from writes".into());
+                return;
+            }
+            let through_sequence = self.snapshot().sequence;
+            let result = self.sync_commit_wal(&mut self.inner.wal.lock());
+            match result {
+                Ok(()) => leader.finish(vec![Ok(CommitOutcome::Barrier { through_sequence })]),
+                Err(error) => leader.fail(error.to_string()),
+            }
+            drop(writer);
+            return;
+        }
+        enum Accepted<'a> {
+            User(&'a super::group_commit::UserCommit),
+            Record(crate::wal::record::CoreWalRecord),
+        }
+        impl Accepted<'_> {
+            fn batch(&self) -> &WriteBatch {
+                match self {
+                    Self::User(user) => &user.batch,
+                    Self::Record(record) => record.batch(),
+                }
+            }
+        }
         let mut results = Vec::with_capacity(group.len());
-        let mut valid = Vec::new();
+        let mut valid = Vec::with_capacity(group.len());
+        let mut overlay = crate::core_records::transition::Rows::new();
+        let base_sequence = self.snapshot().sequence;
+        let mut last_sequence = base_sequence;
+        let mut bytes = 0usize;
+        let authority = self.inner.manifest.lock().record_authority.clone();
+        let source = self.inner.layout.manifest_path();
         for request in &group {
-            match self
-                .validate_captured_generations(&request.generations)
-                .and_then(|()| self.validate_write_condition(&request.condition, &request.batch))
-            {
-                Ok(()) => {
-                    results.push(Ok(0));
-                    valid.push(request);
+            let planned = (|| -> Result<_> {
+                let sequence =
+                    last_sequence
+                        .checked_add(1)
+                        .ok_or_else(|| PraxisError::WriteStalled {
+                            reason: "sequence space exhausted".into(),
+                        })?;
+                let (accepted, outcome, len, updates) = match &request.kind {
+                    CommitKind::User(user) => {
+                        self.validate_captured_generations(&user.generations)?;
+                        self.validate_write_condition(&user.condition, &user.batch)?;
+                        (
+                            Accepted::User(user),
+                            CommitOutcome::Write { sequence },
+                            request.admission_bytes,
+                            None,
+                        )
+                    }
+                    CommitKind::Record(intent) => {
+                        let authority = authority.as_ref().ok_or_else(|| {
+                            PraxisError::InvalidConfig(
+                                "record intent requires explicit authority".into(),
+                            )
+                        })?;
+                        let context = crate::core_records::transition::Context {
+                            id: authority.identity(&source)?,
+                            descriptors: authority.index_descriptor_count,
+                            source: &source,
+                        };
+                        let mut read = |role: crate::core_records::codec::Role, key: &[u8]| {
+                            if let Some(value) = overlay.get(&(role, key.to_vec())) {
+                                return Ok(value.clone());
+                            }
+                            self.resolve_value_at_snapshot(
+                                &ColumnFamily(role.cf().into()),
+                                key,
+                                base_sequence,
+                            )?
+                            .map(|bytes| {
+                                crate::core_records::transition::Summary::decode(
+                                    role, key, &bytes, &source,
+                                )
+                            })
+                            .transpose()
+                        };
+                        let planned = crate::core_records::transition::plan(
+                            intent, sequence, &context, &mut read,
+                        )?;
+                        // Move the prepared receipt before the accepted overlay changes.
+                        (
+                            Accepted::Record(planned.record),
+                            CommitOutcome::Record(planned.receipt),
+                            planned.encoded_len,
+                            Some(planned.updates),
+                        )
+                    }
+                    CommitKind::Barrier => return Err(PraxisError::RecoveryRequired),
+                };
+                let next_bytes = bytes.checked_add(len).ok_or_else(|| {
+                    PraxisError::InvalidConfig("closed commit group size overflow".into())
+                })?;
+                Ok((sequence, accepted, outcome, next_bytes, updates))
+            })();
+            match planned {
+                Ok((sequence, accepted, outcome, next_bytes, updates)) => {
+                    // All fallible planning and typed receipt preparation completed.
+                    if let Some(updates) = updates {
+                        overlay.extend(updates);
+                    }
+                    last_sequence = sequence;
+                    bytes = next_bytes;
+                    results.push(Ok(outcome));
+                    valid.push((sequence, accepted, request.durability));
                 }
                 Err(error) => results.push(Err(error)),
             }
@@ -390,25 +634,10 @@ impl PraxisEngine {
             drop(writer);
             return;
         }
-        let Some(last_sequence) = self.snapshot().sequence.checked_add(valid.len() as u64) else {
-            for result in &mut results {
-                if result.is_ok() {
-                    *result = Err(PraxisError::WriteStalled {
-                        reason: "sequence space exhausted".to_string(),
-                    });
-                }
-            }
-            leader.finish(results);
-            drop(writer);
-            return;
-        };
-        let bytes = valid.iter().map(|request| request.encoded_len).sum();
         if let Err(error) = self.rotate_wal_if_needed(bytes) {
             if self.inner.group_commit.ensure_writable().is_err() {
                 leader.fail(error.to_string());
             } else {
-                // A failure opening the prospective WAL leaves the original
-                // WAL/manifest authoritative and is safe to retry.
                 for result in &mut results {
                     if result.is_ok() {
                         *result = Err(PraxisError::Io(std::io::Error::other(error.to_string())));
@@ -419,34 +648,24 @@ impl PraxisEngine {
             }
             return;
         }
-        let first_sequence = last_sequence - valid.len() as u64 + 1;
         let write_result = (|| -> Result<()> {
             let mut wal = self.inner.wal.lock();
-            for (index, request) in valid.iter().enumerate() {
-                wal.append_unsynced(&WalRecord {
-                    sequence: first_sequence + index as u64,
-                    batch: request.batch.clone(),
-                })?;
+            for (sequence, accepted, _) in &valid {
+                match accepted {
+                    Accepted::User(user) => {
+                        wal.append_user_batch_unsynced(*sequence, &user.batch)?
+                    }
+                    Accepted::Record(record) => wal.append_core_unsynced(record)?,
+                }
             }
             if !matches!(
                 self.inner.config.wal_sync_policy,
                 crate::config::WalSyncPolicy::Never
-            ) {
-                let started = std::time::Instant::now();
-                self.inner
-                    .metrics
-                    .commit_sync_attempts
-                    .fetch_add(1, Ordering::Relaxed);
-                let sync_result = wal.sync();
-                self.inner.metrics.commit_sync_ns.fetch_add(
-                    started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-                    Ordering::Relaxed,
-                );
-                sync_result?;
-                self.inner
-                    .metrics
-                    .commit_syncs
-                    .fetch_add(1, Ordering::Release);
+            ) || valid
+                .iter()
+                .any(|(_, _, durability)| *durability == Durability::Durable)
+            {
+                self.sync_commit_wal(&mut wal)?;
             }
             Ok(())
         })();
@@ -466,10 +685,9 @@ impl PraxisEngine {
         }
         {
             let mut memtable = self.inner.memtable.write();
-            for (index, request) in valid.iter().enumerate() {
-                let sequence = first_sequence + index as u64;
-                for op in request.batch.ops() {
-                    memtable.apply(sequence, op);
+            for (sequence, accepted, _) in &valid {
+                for op in accepted.batch().ops() {
+                    memtable.apply(*sequence, op);
                     match op {
                         BatchOp::Delete { .. } => {
                             self.inner.metrics.deletes.fetch_add(1, Ordering::Relaxed);
@@ -499,13 +717,6 @@ impl PraxisEngine {
             .metrics
             .commit_batches
             .fetch_add(valid.len() as u64, Ordering::Relaxed);
-        let mut sequence = first_sequence;
-        for result in &mut results {
-            if result.is_ok() {
-                *result = Ok(sequence);
-                sequence = sequence.saturating_add(1);
-            }
-        }
         leader.finish(results);
         drop(writer);
     }
@@ -546,6 +757,7 @@ impl PraxisEngine {
                     | BatchOp::Merge { cf, .. }
                     | BatchOp::Delete { cf, .. } => cf,
                 };
+                crate::core_records::ensure_public_cf(&manifest, &cf.0)?;
                 if options.contains_key(&cf.0) {
                     continue;
                 }
@@ -719,6 +931,7 @@ impl PraxisEngine {
         let _maintenance = self.inner.maintenance_serialization.lock();
         let _writer = self.inner.write_serialization.lock();
         self.inner.group_commit.ensure_writable()?;
+        crate::core_records::ensure_public_cf(&self.inner.manifest.lock(), &descriptor.name)?;
         if descriptor.name == ColumnFamily::default().0 {
             return Ok(());
         }
@@ -773,6 +986,7 @@ impl PraxisEngine {
         let _maintenance = self.inner.maintenance_serialization.lock();
         let _writer = self.inner.write_serialization.lock();
         self.inner.group_commit.ensure_writable()?;
+        crate::core_records::ensure_public_cf(&self.inner.manifest.lock(), name)?;
         let _topology = self.inner.topology.write();
         if name == ColumnFamily::default().0 {
             return Err(PraxisError::CannotDropDefaultColumnFamily);
@@ -847,7 +1061,13 @@ impl PraxisEngine {
     }
 
     pub fn list_column_families(&self) -> Vec<ColumnFamilyDescriptor> {
-        self.inner.manifest.lock().column_families.clone()
+        let manifest = self.inner.manifest.lock();
+        manifest
+            .column_families
+            .iter()
+            .filter(|family| crate::core_records::ensure_public_cf(&manifest, &family.name).is_ok())
+            .cloned()
+            .collect()
     }
 
     pub fn column_family(&self, name: &str) -> Result<ColumnFamily> {
@@ -921,10 +1141,9 @@ impl PraxisEngine {
     }
 
     pub(crate) fn ensure_column_family(&self, cf: &ColumnFamily) -> Result<()> {
-        if self
-            .inner
-            .manifest
-            .lock()
+        let manifest = self.inner.manifest.lock();
+        crate::core_records::ensure_public_cf(&manifest, &cf.0)?;
+        if manifest
             .column_families
             .iter()
             .any(|family| family.name == cf.0)
@@ -1438,6 +1657,26 @@ impl PraxisEngine {
     }
 
     pub fn verify(&self) -> Result<crate::recovery::VerificationReport> {
+        // V3 validates one stable in-memory authority and exact WAL prefixes.
+        // Clone writes may continue after capture; maintenance retains files.
+        let _maintenance = self.inner.maintenance_serialization.lock();
+        let capture = {
+            let _writer = self.inner.write_serialization.lock();
+            let manifest = self.inner.manifest.lock().clone();
+            if manifest.record_authority.is_some() {
+                self.inner.group_commit.ensure_writable()?;
+                Some(super::backup::Capture::from_live(
+                    self.inner.layout.root(),
+                    manifest,
+                )?)
+            } else {
+                None
+            }
+        };
+        if let Some(capture) = capture {
+            super::backup::phase(super::backup::Phase::Captured)?;
+            return capture.validate(self.inner.accelerator.as_ref());
+        }
         let manifest = self.inner.manifest.lock().clone();
         let mut report = crate::recovery::VerificationReport {
             manifest_generation: manifest.next_segment_id,

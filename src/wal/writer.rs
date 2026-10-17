@@ -1,7 +1,10 @@
 use crate::config::WalSyncPolicy;
 use crate::errors::{PraxisError, Result};
 use crate::io::{BinaryWriter, sync_parent_dir};
-use crate::wal::record::{RecordPrefix, WAL_MAGIC, WAL_V2_MAGIC, WalRecord, parse_record_prefix};
+use crate::wal::record::{
+    CoreRecordPrefix, CoreWalRecord, RecordPrefix, WAL_MAGIC, WAL_V2_MAGIC, WalRecord,
+    parse_core_record_prefix, parse_record_prefix,
+};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -28,7 +31,23 @@ impl Wal {
         segment_id: u64,
         sync_policy: WalSyncPolicy,
     ) -> Result<Self> {
-        let path = path.into();
+        Self::open_impl(path.into(), segment_id, sync_policy, false)
+    }
+
+    pub(crate) fn open_core(
+        path: impl Into<PathBuf>,
+        segment_id: u64,
+        sync_policy: WalSyncPolicy,
+    ) -> Result<Self> {
+        Self::open_impl(path.into(), segment_id, sync_policy, true)
+    }
+
+    fn open_impl(
+        path: PathBuf,
+        segment_id: u64,
+        sync_policy: WalSyncPolicy,
+        typed_core: bool,
+    ) -> Result<Self> {
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -45,7 +64,11 @@ impl Wal {
         } else {
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes)?;
-            let (_, valid_len) = replay_records(&bytes, &path)?;
+            let valid_len = if typed_core {
+                replay_core_records(&bytes, &path)?.1
+            } else {
+                replay_records(&bytes, &path)?.1
+            };
             if is_partial_file_header(&bytes) {
                 let header = file_header(segment_id);
                 if !header.starts_with(&bytes) {
@@ -93,10 +116,28 @@ impl Wal {
     /// of append retain the configured EveryBatch behavior above.
     pub(crate) fn append_unsynced(&mut self, record: &WalRecord) -> Result<()> {
         let encoded = record.try_encode()?;
+        self.append_encoded(&encoded)
+    }
+
+    pub(crate) fn append_user_batch_unsynced(
+        &mut self,
+        sequence: u64,
+        batch: &crate::transactions::WriteBatch,
+    ) -> Result<()> {
+        let encoded = crate::wal::record::encode_record(sequence, batch, None)?;
+        self.append_encoded(&encoded)
+    }
+
+    fn append_encoded(&mut self, encoded: &[u8]) -> Result<()> {
         self.file.seek(SeekFrom::End(0))?;
-        self.file.write_all(&encoded)?;
+        self.file.write_all(encoded)?;
         self.bytes_written += encoded.len() as u64;
         Ok(())
+    }
+
+    pub(crate) fn append_core_unsynced(&mut self, record: &CoreWalRecord) -> Result<()> {
+        let encoded = record.try_encode()?;
+        self.append_encoded(&encoded)
     }
 
     pub fn sync(&mut self) -> Result<()> {
@@ -150,7 +191,7 @@ impl Wal {
         path: &Path,
         id: u64,
         sequence: u64,
-    ) -> Result<Vec<u64>> {
+    ) -> Result<Vec<CoreWalRecord>> {
         if bytes.starts_with(&WAL_FILE_MAGIC.to_le_bytes())
             && (bytes.len() < WAL_FILE_HEADER_LEN
                 || u64::from_le_bytes(bytes[8..16].try_into().expect("complete header")) != id)
@@ -160,14 +201,14 @@ impl Wal {
                 reason: "backup WAL role/header ID mismatch".to_string(),
             });
         }
-        let (records, end) = replay_records(bytes, path)?;
-        if end != bytes.len() || records.iter().any(|record| record.sequence > sequence) {
+        let (records, end) = replay_core_records(bytes, path)?;
+        if end != bytes.len() || records.iter().any(|record| record.sequence() > sequence) {
             return Err(PraxisError::Corrupt {
                 path: path.to_path_buf(),
                 reason: "backup WAL prefix is incomplete or exceeds capture".to_string(),
             });
         }
-        Ok(records.into_iter().map(|record| record.sequence).collect())
+        Ok(records)
     }
 
     pub fn path(&self) -> &Path {
@@ -192,6 +233,27 @@ fn replay_records(bytes: &[u8], path: &Path) -> Result<(Vec<WalRecord>, usize)> 
                 offset += encoded_len;
             }
             RecordPrefix::Torn => break,
+        }
+    }
+    Ok((records, offset))
+}
+
+pub(crate) fn replay_core_records(
+    bytes: &[u8],
+    path: &Path,
+) -> Result<(Vec<CoreWalRecord>, usize)> {
+    let mut offset = file_payload_offset(bytes, path)?;
+    let mut records = Vec::new();
+    while offset < bytes.len() {
+        match parse_core_record_prefix(&bytes[offset..], path)? {
+            CoreRecordPrefix::Complete {
+                record,
+                encoded_len,
+            } => {
+                records.push(record);
+                offset += encoded_len;
+            }
+            CoreRecordPrefix::Torn => break,
         }
     }
     Ok((records, offset))

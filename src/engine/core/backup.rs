@@ -36,10 +36,14 @@ pub(super) fn phase(point: Phase) -> Result<()> {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct Capture {
     root: PathBuf,
     pub manifest: Manifest,
     wals: Vec<(u64, u64)>,
+    // v3 validates complete retained evidence even when a flushed file need
+    // not be copied. Maintenance retains these exact captured prefixes.
+    proof_wals: Vec<(u64, u64)>,
     origin: Option<PathBuf>,
 }
 
@@ -70,6 +74,7 @@ impl Capture {
             root: root.to_path_buf(),
             manifest,
             wals: Vec::new(),
+            proof_wals: Vec::new(),
             origin: None,
         };
         let mut identities = BTreeSet::new();
@@ -81,10 +86,7 @@ impl Capture {
         }
         if let Some(checkpoint) = capture.manifest.latest_checkpoint.clone() {
             capture.accept_label(&checkpoint.path, &checkpoint_relative(checkpoint.id))?;
-            let path = capture.local(&checkpoint_relative(checkpoint.id))?;
-            if crate::io::file_digest(&path)?.to_hex().as_str() != checkpoint.file_digest {
-                return corrupt(&path, "captured checkpoint digest mismatch");
-            }
+            capture.local(&checkpoint_relative(checkpoint.id))?;
         }
         let wal_root = root.join("wal");
         if wal_root.exists() {
@@ -94,6 +96,13 @@ impl Capture {
                     continue;
                 }
                 let id = file_id(&path, "wal")?;
+                if capture.manifest.record_authority.is_some() {
+                    if id > capture.manifest.active_wal_id {
+                        return corrupt(&path, "WAL beyond captured authority identity");
+                    }
+                    let local = capture.local(&wal_relative(id))?;
+                    capture.proof_wals.push((id, fs::metadata(local)?.len()));
+                }
                 if id > capture.manifest.flushed_wal_id || id == capture.manifest.active_wal_id {
                     if id > capture.manifest.active_wal_id {
                         return corrupt(&path, "WAL beyond captured active identity");
@@ -104,6 +113,10 @@ impl Capture {
             }
         }
         capture.wals.sort_unstable();
+        if capture.manifest.record_authority.is_none() {
+            capture.proof_wals = capture.wals.clone();
+        }
+        capture.proof_wals.sort_unstable();
         let mut previous = capture.manifest.flushed_wal_id;
         for (id, _) in &capture.wals {
             if previous.checked_add(1) != Some(*id) {
@@ -120,7 +133,11 @@ impl Capture {
     pub(super) fn from_bundle(root: &Path) -> Result<Self> {
         let path = root.join("MANIFEST");
         let bytes = fs::read(&path)?;
-        Self::new(root, Manifest::decode(&bytes, &path)?)
+        let capture = Self::new(root, Manifest::decode(&bytes, &path)?)?;
+        // Offline restore must refuse before acquiring/creating a destination.
+        // No live writer guard is held here, so bulk hashing is appropriate.
+        capture.validate_checkpoint()?;
+        Ok(capture)
     }
 
     pub(super) fn from_live(root: &Path, manifest: Manifest) -> Result<Self> {
@@ -133,30 +150,35 @@ impl Capture {
         Ok(capture)
     }
 
-    pub(super) fn validate(mut self, accelerator: &dyn Accelerator) -> Result<()> {
-        let mut covered = self.manifest.flushed_sequence;
-        for (id, len) in &self.wals {
-            let path = self.local(&wal_relative(*id))?;
-            let bytes = fs::read(&path)?;
-            if bytes.len() as u64 != *len {
-                return corrupt(&path, "backup WAL changed during validation");
-            }
-            let sequences =
-                Wal::validate_backup_prefix(&bytes, &path, *id, self.manifest.last_sequence)?;
-            extend_coverage(
-                &path,
-                self.manifest.flushed_sequence,
-                &mut covered,
-                sequences,
-            )?;
+    pub(super) fn validate(
+        mut self,
+        accelerator: &dyn Accelerator,
+    ) -> Result<crate::recovery::VerificationReport> {
+        let mut report = crate::recovery::VerificationReport {
+            manifest_generation: self.manifest.next_segment_id,
+            ..Default::default()
+        };
+        let mut value_files = BTreeSet::new();
+        let mut value_extents = BTreeSet::new();
+        if self.manifest.latest_checkpoint.is_some() {
+            report.checkpoints_checked = 1;
+            report.bytes_checked = self.validate_checkpoint()?;
         }
-        require_coverage(&self.root, covered, self.manifest.last_sequence)?;
+        let mut protected = crate::core_records::recovery::Evidence::new(
+            &self.manifest,
+            &self.root.join("MANIFEST"),
+        )?;
         for metadata in self.manifest.segments.clone() {
             let path = self.local(&segment_relative(metadata.level, metadata.id))?;
             let bytes = fs::read(&path)?;
             if blake3::hash(&bytes).to_hex().as_str() != metadata.file_digest {
                 return corrupt(&path, "backup segment digest mismatch");
             }
+            report.segments_checked += 1;
+            report.bytes_checked = report
+                .bytes_checked
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| error(&path, "verification byte count overflow"))?;
             let raw = decode_segment(&bytes, &path, accelerator)?;
             if raw.id != metadata.id
                 || raw.level != metadata.level
@@ -169,16 +191,71 @@ impl Capture {
             {
                 return corrupt(&path, "backup segment role/header/count mismatch");
             }
+            protected.begin_segment();
             for raw in raw.blocks.iter().flatten() {
+                protected.segment(raw, |pointer| {
+                    let id = file_id(Path::new(&pointer.path), "tval")?;
+                    let relative = value_relative(id);
+                    self.accept_label(&pointer.path, &relative)?;
+                    crate::core_records::recovery::read_blob_at(pointer, &self.local(&relative)?)
+                })?;
                 if let StoredValue::BlobPointer(pointer) = &raw.entry.version.value {
                     let id = file_id(Path::new(&pointer.path), "tval")?;
                     let relative = value_relative(id);
                     self.accept_label(&pointer.path, &relative)?;
                     validate_pointer(&self.local(&relative)?, pointer)?;
+                    value_files.insert(id);
+                    if value_extents.insert((id, pointer.offset, pointer.len, pointer.checksum)) {
+                        report.bytes_checked = report
+                            .bytes_checked
+                            .checked_add(pointer.len)
+                            .and_then(|n| n.checked_add(12))
+                            .ok_or_else(|| error(&path, "verification byte count overflow"))?;
+                    }
                 }
             }
         }
-        Ok(())
+        let mut covered = self.manifest.flushed_sequence;
+        for (id, len) in &self.proof_wals {
+            let path = self.local(&wal_relative(*id))?;
+            let mut bytes = Vec::new();
+            File::open(&path)?.take(*len).read_to_end(&mut bytes)?;
+            if bytes.len() as u64 != *len {
+                return corrupt(&path, "backup WAL changed during validation");
+            }
+            report.bytes_checked = report
+                .bytes_checked
+                .checked_add(*len)
+                .ok_or_else(|| error(&path, "verification byte count overflow"))?;
+            let records =
+                Wal::validate_backup_prefix(&bytes, &path, *id, self.manifest.last_sequence)?;
+            for record in &records {
+                protected.wal(record)?;
+            }
+            extend_coverage(
+                &path,
+                self.manifest.flushed_sequence,
+                &mut covered,
+                records.iter().map(|record| record.sequence()),
+            )?;
+        }
+        require_coverage(&self.root, covered, self.manifest.last_sequence)?;
+        protected.finish()?;
+        report.value_logs_checked = value_files.len() as u64;
+        Ok(report)
+    }
+
+    /// Bulk checkpoint hashing runs after live capture releases the writer.
+    /// Offline/legacy copies use the same policy before creating layout files.
+    fn validate_checkpoint(&self) -> Result<u64> {
+        let Some(checkpoint) = &self.manifest.latest_checkpoint else {
+            return Ok(0);
+        };
+        let path = self.local(&checkpoint_relative(checkpoint.id))?;
+        if crate::io::file_digest(&path)?.to_hex().as_str() != checkpoint.file_digest {
+            return corrupt(&path, "captured checkpoint digest mismatch");
+        }
+        Ok(fs::metadata(path)?.len())
     }
 
     fn accept_label(&mut self, label: &str, relative: &Path) -> Result<()> {
@@ -233,6 +310,11 @@ impl Capture {
         destination: &Path,
         accelerator: &dyn Accelerator,
     ) -> Result<Staged> {
+        if self.manifest.record_authority.is_some() {
+            self.clone().validate(accelerator)?;
+        } else {
+            self.validate_checkpoint()?;
+        }
         let layout = DiskLayout::create(stage)?;
         let mut files = BTreeSet::new();
         let mut values = BTreeMap::new();
@@ -242,7 +324,7 @@ impl Capture {
             let source = self.local(&relative)?;
             let target = stage.join(&relative);
             copy_prefix(&source, &target, *len)?;
-            let sequences = Wal::validate_backup_prefix(
+            let records = Wal::validate_backup_prefix(
                 &fs::read(&target)?,
                 &target,
                 *id,
@@ -252,7 +334,7 @@ impl Capture {
                 &target,
                 self.manifest.flushed_sequence,
                 &mut covered,
-                sequences,
+                records.iter().map(|record| record.sequence()),
             )?;
             files.insert(relative);
         }
@@ -329,7 +411,7 @@ fn extend_coverage(
     path: &Path,
     flushed: u64,
     covered: &mut u64,
-    sequences: Vec<u64>,
+    sequences: impl IntoIterator<Item = u64>,
 ) -> Result<()> {
     for sequence in sequences {
         // Retained flushed records and legacy sequence-zero records remain in

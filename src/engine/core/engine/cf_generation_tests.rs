@@ -67,7 +67,7 @@ fn queued_old_policy_batch_is_rejected_whole_without_consuming_sequence() {
     ));
     assert!(matches!(
         engine.inner.group_commit.wait(&healthy),
-        CommitTurn::Complete(Ok(1))
+        CommitTurn::Complete(Ok(CommitOutcome::Write { sequence: 1 }))
     ));
     assert_eq!(engine.snapshot().sequence, 1);
     assert!(engine.get("must-not-publish").unwrap().is_none());

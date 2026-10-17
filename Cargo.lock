@@ -900,6 +900,7 @@ dependencies = [
  "clap",
  "crc32fast",
  "criterion",
+ "getrandom 0.3.4",
  "lz4_flex",
  "parking_lot",
  "serde",

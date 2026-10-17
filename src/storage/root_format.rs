@@ -95,6 +95,7 @@ pub enum RootKind {
     Absent,
     Empty,
     CoreLegacy,
+    CoreRecords,
     PointerLegacy,
     /// Proven empty standalone primary prepared for its pointer owner.
     PointerScaffold,
@@ -194,7 +195,7 @@ impl RootInspection {
         }
         let owner = match self.kind {
             RootKind::Absent | RootKind::Empty => return Ok(()),
-            RootKind::CoreLegacy => RootOwner::Core,
+            RootKind::CoreLegacy | RootKind::CoreRecords => RootOwner::Core,
             RootKind::PointerLegacy | RootKind::PointerScaffold => RootOwner::Pointer,
             RootKind::RecordLegacy => RootOwner::Record,
             RootKind::PageLegacy | RootKind::PageScaffold => RootOwner::Page,
@@ -961,7 +962,7 @@ impl Inspector {
             std::str::from_utf8(&bytes).map_err(|_| damaged(&path, "manifest is not UTF-8"))?;
         let header: Header = toml::from_str(text)
             .map_err(|err| damaged(&path, &format!("invalid typed manifest header: {err}")))?;
-        if !matches!(header.format_version, 1 | 2) {
+        if !matches!(header.format_version, 1..=3) {
             return Err(unsupported(
                 &path,
                 "core manifest",
@@ -1023,7 +1024,11 @@ impl Inspector {
                 "tmp",
             ],
         );
-        Ok(RootKind::CoreLegacy)
+        Ok(if header.format_version == 3 {
+            RootKind::CoreRecords
+        } else {
+            RootKind::CoreLegacy
+        })
     }
 
     fn pointer(
