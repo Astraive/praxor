@@ -1,3 +1,4 @@
+use super::inventory::require_inventory_presence;
 use super::recovery::{load_collection, load_collection_with_manifest};
 use super::{PageOperation, PageRecordStore, RidDirectory};
 use crate::config::WalSyncPolicy;
@@ -111,6 +112,7 @@ impl PageDatabase {
         // Validate once even if no collections are discovered, before any WAL
         // repair/layout mutation; share this inventory across startup loads.
         let manifest = PageManifestStore::open(layout.page_manifest_path().path).load()?;
+        require_inventory_presence(&layout, &manifest)?;
         let wal_path = layout.logs_root().join("page.wal");
         let report = read_owner_report(&wal_path)?;
         let records = &report.records;
