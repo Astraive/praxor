@@ -123,6 +123,11 @@ impl PraxisEngine {
             snapshots.observe(record.sequence);
         }
         snapshots.observe(manifest.last_sequence);
+        snapshots.observe(manifest.flushed_sequence);
+        // WAL-only commits can be newer than the persisted manifest. Carry
+        // their recovered watermark into future structural checkpoints before
+        // those checkpoints retire the WAL containing the original sequence.
+        manifest.last_sequence = snapshots.snapshot().sequence;
         let wal = Wal::open(
             layout.wal_path(manifest.active_wal_id),
             manifest.active_wal_id,
@@ -300,9 +305,9 @@ impl PraxisEngine {
             .wal_records
             .fetch_add(1, Ordering::Relaxed);
         self.inner.manifest.lock().last_sequence = sequence;
-        self.inner
-            .manifest_store
-            .save_with_policy(&self.inner.manifest.lock(), self.inner.config.direct_io)?;
+        // The synced WAL is authoritative between structural checkpoints.
+        // Flush/rotation persist the in-memory sequence with their manifest edit;
+        // ordinary batches need no second file rewrite, fsync or rename.
         let memtable_bytes = self.inner.memtable.read().approximate_bytes();
         self.inner
             .metrics
