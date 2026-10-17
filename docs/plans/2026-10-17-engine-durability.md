@@ -29,8 +29,9 @@ On 2026-10-17 the identified remotes are Astraive/praxor (the original Astraive/
 - [x] Reproduce and fix WAL append after a recovered torn suffix.
 - [x] Reproduce and fix WAL retention and flush snapshot-history loss.
 - [x] Verify flush installation/failure/concurrent-write boundaries and sequence publication.
-- [ ] Run the complete engine suite, formatting and targeted fault/restart regressions; obtain independent code review.
-- [ ] Commit independently reviewable changes as type(scope): message without co-author trailers; push a linked PR with exact verification results.
+- [x] Run the complete engine suite, formatting and targeted fault/restart regressions; obtain independent code review.
+- [x] Commit independently reviewable changes as type(scope): message without co-author trailers; push a linked PR with exact verification results ([PR #9](https://github.com/Astraive/praxor/pull/9)).
+- [ ] Verify Linux CI and merge the first batch before starting the next default-based implementation branch.
 
 No phase is complete merely because code compiles. The broader effort remains active until protocol consistency, query semantics, persistent history, UI/SDK contracts, WASM and release verification have their own passing gates. Commit count and changed-line count are outcomes of substantive work, not substitutes for correctness.
 

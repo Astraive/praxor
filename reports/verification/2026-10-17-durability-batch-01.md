@@ -32,7 +32,9 @@ Executed on Windows with Rust 1.95.0 and build artifacts in `D:/target`:
 | `scripts/verify_storage_boundary.ps1` | Passed |
 | `git diff --check` | Passed |
 
-The first suite was run in an isolated coordination workspace. Independent repository-lockfile validation and Linux CI are additional checks to record with the PR.
+The same 364 passed / 0 failed / 7 ignored result was independently repeated with `cargo test --locked` in a standalone verification worktree on D:, using this repository's own Cargo.lock. That check exposed a preexisting lock entry still naming `trident` 0.1.0; it was synchronized to `praxis` 0.0.1 without changing dependency versions. CI now requires locked resolution.
+
+GitHub CI had been automatically disabled for inactivity. It was reenabled for the branch checks. Linux CI remains a separate gate to inspect on [PR #9](https://github.com/Astraive/praxor/pull/9).
 
 Red-to-green regressions cover primary relocation, scan/immutable visibility, torn WAL append followed by a second recovery, partial file-header rotation, flush failure/retry, pinned and merged history, legacy overlap, and read pin lifetime. Maintenance tests additionally cover concurrent writes/flush/GC, large value pointers through GC/restart, failed WAL publication and reserved versus visible sequences.
 
