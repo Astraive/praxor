@@ -532,6 +532,7 @@ fn effective_config_is_persisted_and_verified_on_reopen() {
 
     let reopened = PraxisEngine::open(config.clone()).unwrap();
     assert_eq!(reopened.effective_config(), config.persisted());
+    drop(reopened);
 
     let mut incompatible = config;
     incompatible.block_size = 8192;
