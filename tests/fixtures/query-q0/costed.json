@@ -1,0 +1,4 @@
+{
+  "PlannerStats":{"collection_cardinality":10,"filter_selectivity":0.5,"vector_fanout":4,"graph_average_degree":2.0,"graph_depth":1,"full_text_posting_hits":3,"scalar_index_density":0.25},
+  "CostedPlan":{"physical":{"collection":"users","operators":[{"Limit":2}]},"operators":[{"operator":{"Limit":2},"estimated_rows":2,"estimated_cost":1.0,"reason":"limit caps rows"}],"total_cost":1.0}
+}
