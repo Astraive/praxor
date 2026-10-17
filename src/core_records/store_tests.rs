@@ -303,6 +303,96 @@ fn commit_and_pin_between_latest_and_pin_capture_remain_readable_through_rewrite
 }
 
 #[test]
+fn new_pin_after_retained_view_capture_sees_late_commit_through_install() {
+    use crate::engine::core::engine::reclaim_hooks::{self, Phase};
+
+    let (_dir, db) = tiered_database();
+    let records = db.records();
+    let old = records.put(b"old", &[]).unwrap();
+    records.flush().unwrap();
+    let held = records.pin_snapshot().unwrap();
+    records.delete_record(old).unwrap();
+    records.flush().unwrap();
+
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let worker_records = records.clone();
+    let worker = std::thread::spawn(move || {
+        let _hook = reclaim_hooks::install_rewrite(move |phase| {
+            if phase == Phase::AfterPinnedViews {
+                ready_tx.send(()).unwrap();
+                resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+            Ok(())
+        });
+        worker_records.reclaim_snapshot_history()
+    });
+    ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let late = records.put(b"late", &[]).unwrap();
+    let new_pin = records.pin_snapshot().unwrap();
+    resume_tx.send(()).unwrap();
+    let report = worker.join().unwrap().unwrap();
+    assert!(report.rewrite_performed);
+    assert_eq!(records.fetch_at_snapshot(old, &held).unwrap(), b"old");
+    assert_eq!(records.fetch_at_snapshot(late, &new_pin).unwrap(), b"late");
+    assert!(matches!(
+        records.fetch_at_snapshot(old, &new_pin),
+        Err(PraxisError::KeyNotFound)
+    ));
+    db.kv().verify().unwrap();
+}
+
+#[test]
+fn last_pin_drop_during_rewrite_may_overretain_once_then_next_reclaim_prunes() {
+    use crate::engine::core::engine::reclaim_hooks::{self, Phase};
+
+    let (_dir, db) = tiered_database();
+    let records = db.records();
+    let sacrificial = records.put(b"sacrificial", &[]).unwrap();
+    records.delete_record(sacrificial).unwrap();
+    let target = records.put(b"target", &[]).unwrap();
+    records.flush().unwrap();
+    let held = records.pin_snapshot().unwrap();
+    records.delete_record(target).unwrap();
+    records.flush().unwrap();
+
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let worker_records = records.clone();
+    let worker = std::thread::spawn(move || {
+        let _hook = reclaim_hooks::install_rewrite(move |phase| {
+            if phase == Phase::AfterReplacementValidated {
+                ready_tx.send(()).unwrap();
+                resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+            Ok(())
+        });
+        worker_records.reclaim_snapshot_history()
+    });
+    ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(records.fetch_at_snapshot(target, &held).unwrap(), b"target");
+    drop(held);
+    resume_tx.send(()).unwrap();
+    let first = worker.join().unwrap().unwrap();
+    assert!(first.rewrite_performed);
+    assert!(first.protected_versions_removed >= 1);
+    assert_eq!(
+        disk_versions(&db, Role::Payload, Key::Payload(target.0)).len(),
+        2
+    );
+    db.kv().verify().unwrap();
+
+    let second = records.reclaim_snapshot_history().unwrap();
+    assert!(second.rewrite_performed);
+    assert!(second.protected_versions_removed >= 1);
+    assert_eq!(
+        disk_versions(&db, Role::Payload, Key::Payload(target.0)).len(),
+        1
+    );
+    db.kv().verify().unwrap();
+}
+
+#[test]
 fn same_core_sequence_keeps_the_last_head_and_both_raw_decision_facts() {
     let (_dir, db) = tiered_database();
     let records = db.records();
