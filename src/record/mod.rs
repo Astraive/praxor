@@ -24,6 +24,7 @@ const TYPED_RECORD_MAGIC: u32 = 0x5456_4944;
 const TYPED_RECORD_VERSION: u8 = 1;
 
 mod database;
+mod inventory;
 mod recovery;
 use database::CollectionState;
 pub use database::PageDatabase;
