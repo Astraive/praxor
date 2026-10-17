@@ -268,6 +268,11 @@ impl StorageEngine {
     ) -> Result<Self> {
         let writer_lease = crate::writer_lease::WriterLease::acquire(root.into())?;
         let root = writer_lease.root().to_path_buf();
+        crate::storage::root_format::inspect_storage_root(
+            &root,
+            crate::storage::root_format::InspectionOptions::for_admission(),
+        )?
+        .require_compatible(crate::storage::root_format::RootOwner::Pointer)?;
         let primary_lease = writer_lease.acquire_primary()?;
         create_dir_all_durable(&root.join(Self::INDEX_DIR))?;
         create_dir_all_durable(&root.join(Self::WAL_DIR))?;
