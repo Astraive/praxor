@@ -10,13 +10,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 pub(super) fn load_collection(layout: &PraxisLayout, cid: Cid) -> Result<CollectionState> {
-    let map_path = layout.critical_map_path(cid, "rid_to_slot").path;
     let manifest_path = layout.page_manifest_path().path;
     let manifest = PageManifestStore::open(&manifest_path).load()?;
+    load_collection_with_manifest(layout, cid, &manifest)
+}
+
+pub(super) fn load_collection_with_manifest(
+    layout: &PraxisLayout,
+    cid: Cid,
+    manifest: &PageLayoutManifest,
+) -> Result<CollectionState> {
+    let map_path = layout.critical_map_path(cid, "rid_to_slot").path;
     let has_directory = map_path.exists() && map_path.metadata()?.len() > 0;
     let (directory, mut next_rid) = if has_directory {
         let bytes = std::fs::read(&map_path)?;
-        validate_tracked(&manifest, &map_path, &bytes)?;
+        validate_tracked(manifest, &map_path, &bytes)?;
         let (directory, next_rid, _, _) = RidDirectory::load_binary(&map_path)?;
         (directory, next_rid)
     } else {
@@ -57,7 +65,7 @@ pub(super) fn load_collection(layout: &PraxisLayout, cid: Cid) -> Result<Collect
                     }
                     let pid = Pid(hex_stem(&path)?);
                     let bytes = std::fs::read(&path)?;
-                    validate_tracked(&manifest, &path, &bytes)?;
+                    validate_tracked(manifest, &path, &bytes)?;
                     let page = RecordPage::from_bytes(&bytes, &path)?;
                     has_pages = true;
                     let next_sid = page
