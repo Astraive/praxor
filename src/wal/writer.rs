@@ -116,18 +116,28 @@ impl Wal {
     /// of append retain the configured EveryBatch behavior above.
     pub(crate) fn append_unsynced(&mut self, record: &WalRecord) -> Result<()> {
         let encoded = record.try_encode()?;
+        self.append_encoded(&encoded)
+    }
+
+    pub(crate) fn append_user_batch_unsynced(
+        &mut self,
+        sequence: u64,
+        batch: &crate::transactions::WriteBatch,
+    ) -> Result<()> {
+        let encoded = crate::wal::record::encode_record(sequence, batch, None)?;
+        self.append_encoded(&encoded)
+    }
+
+    fn append_encoded(&mut self, encoded: &[u8]) -> Result<()> {
         self.file.seek(SeekFrom::End(0))?;
-        self.file.write_all(&encoded)?;
+        self.file.write_all(encoded)?;
         self.bytes_written += encoded.len() as u64;
         Ok(())
     }
 
     pub(crate) fn append_core_unsynced(&mut self, record: &CoreWalRecord) -> Result<()> {
         let encoded = record.try_encode()?;
-        self.file.seek(SeekFrom::End(0))?;
-        self.file.write_all(&encoded)?;
-        self.bytes_written += encoded.len() as u64;
-        Ok(())
+        self.append_encoded(&encoded)
     }
 
     pub fn sync(&mut self) -> Result<()> {

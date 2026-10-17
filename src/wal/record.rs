@@ -1,6 +1,6 @@
 use crate::core_records::codec::Envelope;
 use crate::errors::{PraxisError, Result};
-use crate::io::{BinaryReader, BinaryWriter, crc32c};
+use crate::io::{BinaryReader, crc32c};
 use crate::transactions::{BatchOp, WriteBatch};
 use crate::types::ColumnFamily;
 use std::path::{Path, PathBuf};
@@ -62,43 +62,14 @@ impl CoreWalRecord {
         }
     }
     pub(crate) fn try_encode(&self) -> Result<Vec<u8>> {
-        let Self::Record {
-            sequence,
-            envelope,
-            batch,
-        } = self
-        else {
-            return match self {
-                Self::User(record) => record.try_encode(),
-                _ => unreachable!(),
-            };
-        };
-        let ordinary_len = WalRecord::checked_encoded_batch_len(batch)?;
-        checked_payload_add(ordinary_len - WAL_RECORD_HEADER_LEN, 5 + Envelope::LEN)?;
-        let count = checked_u32(batch.len(), "operation count")?
-            .checked_add(1)
-            .ok_or_else(|| invalid("WAL operation count overflow"))?;
-        let envelope = envelope.encode(*sequence)?;
-        let ordinary = WalRecord {
-            sequence: *sequence,
-            batch: batch.clone(),
+        match self {
+            Self::User(record) => record.try_encode(),
+            Self::Record {
+                sequence,
+                envelope,
+                batch,
+            } => encode_record(*sequence, batch, Some(envelope)),
         }
-        .try_encode()?;
-        let mut payload =
-            Vec::with_capacity(ordinary.len() - WAL_RECORD_HEADER_LEN + 5 + Envelope::LEN);
-        payload.extend(sequence.to_le_bytes());
-        payload.extend(count.to_le_bytes());
-        payload.push(5);
-        payload.extend((Envelope::LEN as u32).to_le_bytes());
-        payload.extend(envelope);
-        payload.extend(&ordinary[WAL_RECORD_HEADER_LEN + PAYLOAD_HEADER_LEN..]);
-        let mut out = Vec::with_capacity(payload.len() + WAL_RECORD_HEADER_LEN);
-        out.extend(WAL_V2_MAGIC.to_le_bytes());
-        out.extend((payload.len() as u32).to_le_bytes());
-        out.extend(crc32c(&payload).to_le_bytes());
-        out.extend(crc32c(&out).to_le_bytes());
-        out.extend(payload);
-        Ok(out)
     }
 }
 
@@ -123,53 +94,7 @@ impl WalRecord {
     }
 
     pub fn try_encode(&self) -> Result<Vec<u8>> {
-        let encoded_len = self.try_encoded_len()?;
-        let mut payload = BinaryWriter::new();
-        payload.write_u64(self.sequence);
-        payload.write_u32(checked_u32(self.batch.len(), "operation count")?);
-        // The nonallocating preflight above checks every field length before
-        // BinaryWriter's existing u32 length-prefix writer is used.
-        for op in self.batch.ops() {
-            match op {
-                BatchOp::Put { cf, key, value } => {
-                    payload.write_u8(1);
-                    payload.write_len_bytes(cf.0.as_bytes());
-                    payload.write_len_bytes(key);
-                    payload.write_len_bytes(value);
-                }
-                BatchOp::PutWithExpiry {
-                    cf,
-                    key,
-                    value,
-                    expires_at_ms,
-                } => {
-                    payload.write_u8(3);
-                    payload.write_len_bytes(cf.0.as_bytes());
-                    payload.write_len_bytes(key);
-                    payload.write_len_bytes(value);
-                    payload.write_u64(*expires_at_ms);
-                }
-                BatchOp::Merge { cf, key, value } => {
-                    payload.write_u8(4);
-                    payload.write_len_bytes(cf.0.as_bytes());
-                    payload.write_len_bytes(key);
-                    payload.write_len_bytes(value);
-                }
-                BatchOp::Delete { cf, key } => {
-                    payload.write_u8(2);
-                    payload.write_len_bytes(cf.0.as_bytes());
-                    payload.write_len_bytes(key);
-                }
-            }
-        }
-        let payload = payload.into_inner();
-        let mut out = Vec::with_capacity(encoded_len);
-        out.extend_from_slice(&WAL_V2_MAGIC.to_le_bytes());
-        out.extend_from_slice(&checked_u32(payload.len(), "payload length")?.to_le_bytes());
-        out.extend_from_slice(&crc32c(&payload).to_le_bytes());
-        out.extend_from_slice(&crc32c(&out).to_le_bytes());
-        out.extend_from_slice(&payload);
-        Ok(out)
+        encode_record(self.sequence, &self.batch, None)
     }
 
     /// Measure v2 encoding without allocating.
@@ -226,6 +151,71 @@ impl WalRecord {
             RecordPrefix::Torn => Err(corrupt(&source, "torn WAL record")),
         }
     }
+}
+
+/// One borrowed operation encoder for both wire variants. Complete size and
+/// count preflight precedes allocation; neither batch nor payload is cloned.
+pub(crate) fn encode_record(
+    sequence: u64,
+    batch: &WriteBatch,
+    envelope: Option<&Envelope>,
+) -> Result<Vec<u8>> {
+    let mut encoded_len = WalRecord::checked_encoded_batch_len(batch)?;
+    let mut count = checked_u32(batch.len(), "operation count")?;
+    if let Some(envelope) = envelope {
+        envelope.validate(sequence, Path::new("record-envelope"))?;
+        encoded_len = checked_payload_add(encoded_len - WAL_RECORD_HEADER_LEN, 5 + Envelope::LEN)?
+            + WAL_RECORD_HEADER_LEN;
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| invalid("WAL operation count overflow"))?;
+    }
+    let mut out = Vec::with_capacity(encoded_len);
+    out.extend([0; WAL_RECORD_HEADER_LEN]);
+    out.extend(sequence.to_le_bytes());
+    out.extend(count.to_le_bytes());
+    if let Some(envelope) = envelope {
+        out.push(5);
+        out.extend((Envelope::LEN as u32).to_le_bytes());
+        envelope.encode_into(sequence, &mut out)?;
+    }
+    for op in batch.ops() {
+        let (tag, cf, key, value, expiry) = match op {
+            BatchOp::Put { cf, key, value } => (1, cf, key, Some(value), None),
+            BatchOp::Delete { cf, key } => (2, cf, key, None, None),
+            BatchOp::PutWithExpiry {
+                cf,
+                key,
+                value,
+                expires_at_ms,
+            } => (3, cf, key, Some(value), Some(*expires_at_ms)),
+            BatchOp::Merge { cf, key, value } => (4, cf, key, Some(value), None),
+        };
+        out.push(tag);
+        for field in [
+            Some(cf.0.as_bytes()),
+            Some(key.as_slice()),
+            value.map(Vec::as_slice),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            // Every narrowing was checked against this immutable batch above.
+            out.extend((field.len() as u32).to_le_bytes());
+            out.extend(field);
+        }
+        if let Some(expiry) = expiry {
+            out.extend(expiry.to_le_bytes());
+        }
+    }
+    debug_assert_eq!(out.len(), encoded_len);
+    let payload_crc = crc32c(&out[WAL_RECORD_HEADER_LEN..]);
+    out[..4].copy_from_slice(&WAL_V2_MAGIC.to_le_bytes());
+    out[4..8].copy_from_slice(&((encoded_len - WAL_RECORD_HEADER_LEN) as u32).to_le_bytes());
+    out[8..12].copy_from_slice(&payload_crc.to_le_bytes());
+    let header_crc = crc32c(&out[..12]);
+    out[12..16].copy_from_slice(&header_crc.to_le_bytes());
+    Ok(out)
 }
 
 fn checked_u32(value: usize, what: &str) -> Result<u32> {

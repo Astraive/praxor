@@ -12,6 +12,7 @@ pub struct EngineMetrics {
     pub commit_groups: AtomicU64,
     pub commit_batches: AtomicU64,
     pub commit_syncs: AtomicU64,
+    /// Closed write-group and ordered-barrier sync attempts; excludes rotation.
     pub commit_sync_attempts: AtomicU64,
     pub commit_queue_wait_ns: AtomicU64,
     pub commit_sync_ns: AtomicU64,

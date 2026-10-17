@@ -115,3 +115,137 @@ fn failed_core_io(fail_sync: bool) {
     let engine = PraxisEngine::open(config).unwrap();
     assert!(engine.put("after-recovery", "works").is_ok());
 }
+
+#[test]
+fn failed_ordered_barrier_sync_poison_wakes_later_requests_without_a_wal_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = PraxisConfig::new(dir.path());
+    config.wal_sync_policy = WalSyncPolicy::Never;
+    let engine = PraxisEngine::open(config.clone()).unwrap();
+    engine.put("prior", "value").unwrap();
+    let path = engine.inner.wal.lock().path().to_path_buf();
+    let before = std::fs::read(&path).unwrap();
+    let writer = engine.inner.write_serialization.lock();
+    #[cfg(windows)]
+    let device = "NUL";
+    #[cfg(not(windows))]
+    let device = "/dev/null";
+    engine.inner.wal.lock().file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(device)
+        .unwrap();
+    let barrier_engine = engine.clone();
+    let barrier = std::thread::spawn(move || barrier_engine.durable_barrier());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while engine
+        .inner
+        .metrics
+        .write_admissions
+        .load(Ordering::Relaxed)
+        != 2
+    {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let later: Vec<_> = (0..2)
+        .map(|index| {
+            let engine = engine.clone();
+            std::thread::spawn(move || engine.put(format!("later-{index}"), "no"))
+        })
+        .collect();
+    while engine
+        .inner
+        .metrics
+        .write_admissions
+        .load(Ordering::Relaxed)
+        != 4
+    {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    drop(writer);
+    assert!(matches!(
+        barrier.join().unwrap(),
+        Err(PraxisError::RecoveryRequired)
+    ));
+    for worker in later {
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(PraxisError::RecoveryRequired)
+        ));
+    }
+    assert_eq!(
+        engine
+            .inner
+            .metrics
+            .commit_sync_attempts
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(engine.inner.metrics.commit_syncs.load(Ordering::Relaxed), 0);
+    assert!(engine.inner.metrics.commit_sync_ns.load(Ordering::Relaxed) > 0);
+    assert_eq!(engine.snapshot().sequence, 1);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(matches!(
+        engine.durable_barrier(),
+        Err(PraxisError::RecoveryRequired)
+    ));
+    assert!(matches!(engine.flush(), Err(PraxisError::RecoveryRequired)));
+    assert_eq!(
+        engine
+            .inner
+            .metrics
+            .commit_sync_attempts
+            .load(Ordering::Relaxed),
+        1
+    );
+    drop(engine);
+    assert!(
+        PraxisEngine::open(config)
+            .unwrap()
+            .put("recovered", "yes")
+            .is_ok()
+    );
+}
+
+#[test]
+fn never_rotation_must_sync_old_wal_before_a_later_barrier_can_acknowledge() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = PraxisConfig::new(dir.path());
+    config.wal_sync_policy = WalSyncPolicy::Never;
+    config.wal_segment_size = config.page_size;
+    let engine = PraxisEngine::open(config.clone()).unwrap();
+    engine
+        .put("oversized", vec![1; config.wal_segment_size])
+        .unwrap();
+    #[cfg(windows)]
+    let device = "NUL";
+    #[cfg(not(windows))]
+    let device = "/dev/null";
+    engine.inner.wal.lock().file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(device)
+        .unwrap();
+    assert!(matches!(
+        engine.put("force-rotation", "no"),
+        Err(PraxisError::RecoveryRequired)
+    ));
+    assert_eq!(engine.inner.manifest.lock().active_wal_id, 1);
+    assert!(matches!(
+        engine.durable_barrier(),
+        Err(PraxisError::RecoveryRequired)
+    ));
+    assert_eq!(
+        engine
+            .inner
+            .metrics
+            .commit_sync_attempts
+            .load(Ordering::Relaxed),
+        0,
+        "failed rotation sync is not a closed commit/barrier sync"
+    );
+    drop(engine);
+    assert_eq!(PraxisEngine::open(config).unwrap().snapshot().sequence, 1);
+}

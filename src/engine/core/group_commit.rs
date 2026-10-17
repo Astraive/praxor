@@ -19,13 +19,54 @@ pub(crate) enum WriteCondition {
     Optimistic { snapshot: ReadSnapshot },
 }
 
-pub(crate) struct CommitRequest {
+pub(crate) struct UserCommit {
     pub(crate) batch: WriteBatch,
     pub(crate) generations: BTreeMap<String, u64>,
     pub(crate) condition: WriteCondition,
-    pub(crate) encoded_len: usize,
+}
+
+pub(crate) enum CommitKind {
+    User(UserCommit),
+    Barrier,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Durability {
+    Configured,
+    Durable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CommitOutcome {
+    Write { sequence: u64 },
+    Barrier { through_sequence: u64 },
+}
+
+pub(crate) struct CommitRequest {
+    pub(crate) kind: CommitKind,
+    pub(crate) durability: Durability,
+    pub(crate) admission_bytes: usize,
     admitted_at: Instant,
-    result: Mutex<Option<Result<u64>>>,
+    result: Mutex<Option<Result<CommitOutcome>>>,
+}
+
+impl CommitRequest {
+    fn is_fence(&self) -> bool {
+        !matches!(
+            &self.kind,
+            CommitKind::User(UserCommit {
+                condition: WriteCondition::Unconditional,
+                ..
+            })
+        )
+    }
+    fn accepts(&self, outcome: CommitOutcome) -> bool {
+        matches!(
+            (&self.kind, outcome),
+            (CommitKind::User(_), CommitOutcome::Write { .. })
+                | (CommitKind::Barrier, CommitOutcome::Barrier { .. })
+        )
+    }
 }
 
 #[derive(Default)]
@@ -49,7 +90,7 @@ pub(crate) struct GroupCommitCoordinator {
 }
 
 pub(crate) enum CommitTurn<'a> {
-    Complete(Result<u64>),
+    Complete(Result<CommitOutcome>),
     Lead(CommitLeader<'a>),
 }
 
@@ -94,6 +135,49 @@ impl GroupCommitCoordinator {
         encoded_len: usize,
         metrics: &EngineMetrics,
     ) -> Result<Arc<CommitRequest>> {
+        self.admit_user(
+            batch,
+            generations,
+            condition,
+            Durability::Configured,
+            encoded_len,
+            metrics,
+        )
+    }
+
+    pub(crate) fn admit_user(
+        &self,
+        batch: WriteBatch,
+        generations: BTreeMap<String, u64>,
+        condition: WriteCondition,
+        durability: Durability,
+        encoded_len: usize,
+        metrics: &EngineMetrics,
+    ) -> Result<Arc<CommitRequest>> {
+        self.admit_kind(
+            CommitKind::User(UserCommit {
+                batch,
+                generations,
+                condition,
+            }),
+            durability,
+            encoded_len,
+            metrics,
+        )
+    }
+
+    pub(crate) fn admit_barrier(&self, metrics: &EngineMetrics) -> Result<Arc<CommitRequest>> {
+        // No wire frame, but queue metadata still consumes bounded admission.
+        self.admit_kind(CommitKind::Barrier, Durability::Durable, 16, metrics)
+    }
+
+    fn admit_kind(
+        &self,
+        kind: CommitKind,
+        durability: Durability,
+        encoded_len: usize,
+        metrics: &EngineMetrics,
+    ) -> Result<Arc<CommitRequest>> {
         let admitted_at = Instant::now();
         let mut state = self.state.lock();
         let ticket = state.next_ticket;
@@ -109,10 +193,9 @@ impl GroupCommitCoordinator {
                     && encoded_len <= self.max_pending_bytes.saturating_sub(state.pending_bytes));
             if ticket == state.serving_ticket && fits {
                 let request = Arc::new(CommitRequest {
-                    batch,
-                    generations,
-                    condition,
-                    encoded_len,
+                    kind,
+                    durability,
+                    admission_bytes: encoded_len,
                     admitted_at,
                     result: Mutex::new(None),
                 });
@@ -174,14 +257,15 @@ impl CommitLeader<'_> {
         while let Some(request) = state.queue.front() {
             if !group.is_empty()
                 && (!matches!(policy, WalSyncPolicy::GroupCommit)
-                    || !matches!(request.condition, WriteCondition::Unconditional)
-                    || !matches!(group[0].condition, WriteCondition::Unconditional)
-                    || request.encoded_len > self.coordinator.max_group_bytes.saturating_sub(bytes))
+                    || request.is_fence()
+                    || group[0].is_fence()
+                    || request.admission_bytes
+                        > self.coordinator.max_group_bytes.saturating_sub(bytes))
             {
                 break;
             }
             let request = state.queue.pop_front().expect("front exists");
-            bytes += request.encoded_len;
+            bytes += request.admission_bytes;
             metrics.commit_queue_wait_ns.fetch_add(
                 request
                     .admitted_at
@@ -196,7 +280,7 @@ impl CommitLeader<'_> {
         group
     }
 
-    pub(crate) fn finish(mut self, results: Vec<Result<u64>>) {
+    pub(crate) fn finish(mut self, results: Vec<Result<CommitOutcome>>) {
         let mut state = self.coordinator.state.lock();
         // A poison operation already completed this group's requests. Do not
         // overwrite those results if failure was detected outside the leader.
@@ -204,11 +288,28 @@ impl CommitLeader<'_> {
             self.finished = true;
             return;
         }
+        if state.in_flight.len() != results.len()
+            || state
+                .in_flight
+                .iter()
+                .zip(&results)
+                .any(|(request, result)| {
+                    result
+                        .as_ref()
+                        .is_ok_and(|outcome| !request.accepts(*outcome))
+                })
+        {
+            drop(state);
+            self.coordinator
+                .poison("commit result does not match its typed request".into());
+            self.finished = true;
+            return;
+        }
         let requests = std::mem::take(&mut state.in_flight);
         assert_eq!(requests.len(), results.len());
         for (request, result) in requests.into_iter().zip(results) {
             state.pending_count -= 1;
-            state.pending_bytes -= request.encoded_len;
+            state.pending_bytes -= request.admission_bytes;
             *request.result.lock() = Some(result);
         }
         state.leader_active = false;
@@ -291,7 +392,7 @@ mod tests {
             let group = leader.drain(WalSyncPolicy::GroupCommit, &metrics);
             assert_eq!(group.len(), 1);
             assert!(Arc::ptr_eq(&group[0], expected));
-            leader.finish(vec![Ok(1)]);
+            leader.finish(vec![Ok(CommitOutcome::Write { sequence: 1 })]);
         }
     }
 
@@ -303,14 +404,14 @@ mod tests {
         let leader = lead(&coordinator, &first);
         assert_eq!(leader.drain(WalSyncPolicy::GroupCommit, &metrics).len(), 1);
         let later = request(&coordinator, &metrics, 20, WriteCondition::Unconditional);
-        leader.finish(vec![Ok(1)]);
+        leader.finish(vec![Ok(CommitOutcome::Write { sequence: 1 })]);
         assert!(later.result.lock().is_none());
         let leader = lead(&coordinator, &later);
         assert_eq!(leader.drain(WalSyncPolicy::GroupCommit, &metrics).len(), 1);
-        leader.finish(vec![Ok(2)]);
+        leader.finish(vec![Ok(CommitOutcome::Write { sequence: 2 })]);
         assert!(matches!(
             coordinator.wait(&later),
-            CommitTurn::Complete(Ok(2))
+            CommitTurn::Complete(Ok(CommitOutcome::Write { sequence: 2 }))
         ));
     }
 
@@ -343,13 +444,16 @@ mod tests {
         };
         wait_until(|| coordinator.state.lock().next_ticket == 4);
         assert!(received.try_recv().is_err());
-        leader.finish(vec![Ok(1), Ok(2)]);
+        leader.finish(vec![
+            Ok(CommitOutcome::Write { sequence: 1 }),
+            Ok(CommitOutcome::Write { sequence: 2 }),
+        ]);
         let (name, large_request) = received.recv_timeout(Duration::from_secs(10)).unwrap();
         assert_eq!(name, "large");
         assert!(received.try_recv().is_err());
         let leader = lead(&coordinator, &large_request);
         assert_eq!(leader.drain(WalSyncPolicy::GroupCommit, &metrics).len(), 1);
-        leader.finish(vec![Ok(3)]);
+        leader.finish(vec![Ok(CommitOutcome::Write { sequence: 3 })]);
         let (name, _) = received.recv_timeout(Duration::from_secs(10)).unwrap();
         assert_eq!(name, "small");
         large.join().unwrap();
@@ -408,5 +512,57 @@ mod tests {
             coordinator.ensure_writable(),
             Err(PraxisError::RecoveryRequired)
         ));
+    }
+
+    #[test]
+    fn barriers_are_positive_charged_fences_and_return_only_barrier_outcomes() {
+        let coordinator = GroupCommitCoordinator::with_limits(8, 100, 100);
+        let metrics = EngineMetrics::default();
+        let first = request(&coordinator, &metrics, 20, WriteCondition::Unconditional);
+        let barrier = coordinator.admit_barrier(&metrics).unwrap();
+        let last = request(&coordinator, &metrics, 20, WriteCondition::Unconditional);
+        assert!(barrier.admission_bytes > 0);
+        assert_eq!(barrier.durability, Durability::Durable);
+        assert_eq!(coordinator.state.lock().pending_count, 3);
+        let leader = lead(&coordinator, &first);
+        assert_eq!(leader.drain(WalSyncPolicy::GroupCommit, &metrics).len(), 1);
+        leader.finish(vec![Ok(CommitOutcome::Write { sequence: 1 })]);
+        let leader = lead(&coordinator, &barrier);
+        let group = leader.drain(WalSyncPolicy::GroupCommit, &metrics);
+        assert_eq!(group.len(), 1);
+        assert!(matches!(group[0].kind, CommitKind::Barrier));
+        leader.finish(vec![Ok(CommitOutcome::Barrier {
+            through_sequence: 1,
+        })]);
+        assert!(matches!(
+            coordinator.wait(&barrier),
+            CommitTurn::Complete(Ok(CommitOutcome::Barrier {
+                through_sequence: 1
+            }))
+        ));
+        let leader = lead(&coordinator, &last);
+        assert_eq!(leader.drain(WalSyncPolicy::GroupCommit, &metrics).len(), 1);
+        leader.finish(vec![Ok(CommitOutcome::Write { sequence: 2 })]);
+        assert_eq!(coordinator.state.lock().pending_count, 0);
+    }
+
+    #[test]
+    fn wrong_typed_result_poison_completes_inflight_and_queued_requests() {
+        let coordinator = GroupCommitCoordinator::with_limits(8, 100, 100);
+        let metrics = EngineMetrics::default();
+        let first = request(&coordinator, &metrics, 20, WriteCondition::Unconditional);
+        let later = coordinator.admit_barrier(&metrics).unwrap();
+        let leader = lead(&coordinator, &first);
+        leader.drain(WalSyncPolicy::GroupCommit, &metrics);
+        leader.finish(vec![Ok(CommitOutcome::Barrier {
+            through_sequence: 1,
+        })]);
+        for request in [&first, &later] {
+            assert!(matches!(
+                coordinator.wait(request),
+                CommitTurn::Complete(Err(PraxisError::RecoveryRequired))
+            ));
+        }
+        assert!(coordinator.ensure_writable().is_err());
     }
 }
