@@ -24,6 +24,8 @@ Praxis now exposes a storage-only orchestration API (`store::StorageEngine`) bui
 
 ## Core Shape
 
+Page primitive users should read the [shared ownership and v1 compatibility contract](docs/page-record-ownership.md).
+
 - Sync-first engine API with async wrappers.
 - WAL-backed atomic write batches.
 - MVCC sequence numbers for consistent snapshots.
