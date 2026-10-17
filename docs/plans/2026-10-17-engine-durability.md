@@ -2,11 +2,22 @@
 
 ## Scope and intent
 
-Build the existing SQL, document, graph, vector and relational database ecosystem from its engine upward. This phase hardens the existing storage core before expanding features. Follow the current workspace architecture: Praxor owns the parser, planner, executor, catalog, storage and indexes; Poiesis owns the product runtime and protocols; PoiesiSQL provides optional tooling; Pit owns version history; Poietica consumes public product APIs. The older implementation roadmap assigns a conflicting role to PoiesiSQL and must be reconciled later.
+Build the existing SQL, document, graph, vector and relational database ecosystem from its engine upward. This phase hardens the existing storage core before expanding features. Praxor (package `praxis`) owns the canonical query semantic pipeline and catalog rules above its storage kernel; Poiesis owns product/session/authorization/protocol context; PoiesiSQL provides optional tooling consuming engine contracts; Pit owns separately reviewed durable version history; Poietica consumes public product APIs. The engine depends on neither runtime nor optional tooling.
+
+The [engine architecture](../architecture.md) and [query readiness](../query-readiness.md)
+now state this ownership consistently. [Q0 #60](https://github.com/Astraive/praxor/issues/60)
+preserves current experimental public imports/serde and characterizes readiness;
+ownership and parse/plan success do not establish complete execution, a fallible
+retained-view backend or persisted atomic catalog DDL/data. Those bounded gates
+remain [Q1 #61](https://github.com/Astraive/praxor/issues/61),
+[Q2 #62](https://github.com/Astraive/praxor/issues/62) and
+[Q3 #63](https://github.com/Astraive/praxor/issues/63). This correction supersedes
+the earlier conflicting parser/planner ownership wording, without importing or
+rewriting preserved dirty workspace/PQL sources.
 
 ## Repository baseline
 
-On 2026-10-17 the identified remotes are Astraive/praxor (the original Astraive/praxis URL now redirects), NeerajCodz/poiesis and NeerajCodz/pit, all with default branch main and no preexisting open or draft PRs. Existing local main checkouts contain substantial uncommitted changes and are preserved. Separate worktrees start from fetched origin/main. The engine package on the remote is still named praxis; renaming it to match local praxor requires an explicit integration change. Poietica and PoiesiSQL have local source but no standalone remote; poiesis-wasm is empty.
+At the initial inventory on 2026-10-17, the identified remotes were Astraive/praxor (the original Astraive/praxis URL now redirects), NeerajCodz/poiesis and NeerajCodz/pit, all with default branch main and no preexisting open or draft PRs. Existing local main checkouts contain substantial uncommitted changes and are preserved. Separate worktrees start from fetched origin/main. The engine package on the remote is still named praxis; renaming it to match local praxor requires an explicit integration change. At that inventory, Poietica and PoiesiSQL had local source but no standalone remote, and poiesis-wasm was empty. Separate private Astraive remotes now exist as README-only baselines; importing and verifying their preserved source remains open work.
 
 ## Required invariants
 

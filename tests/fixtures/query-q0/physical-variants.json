@@ -1,0 +1,18 @@
+{
+  "collection":"users",
+  "operators":[
+    "AsOf",
+    {"Filter":{"attribute":"age","operator":">=","value":"18"}},
+    {"Join":{"collection":"teams","left_attribute":"team","right_attribute":"id"}},
+    {"FullText":{"attribute":"bio","query":"rust","top":3}},
+    {"Similarity":{"target":"seed","top":2,"threshold":"0.8"}},
+    {"Traverse":{"target":"seed","hops":2,"edge_label":"follows"}},
+    {"Rank":"text"},
+    {"GroupBy":["team"]},
+    "Distinct",
+    {"Aggregate":{"function":"COUNT","attribute":"age","alias":"n"}},
+    {"Order":{"attribute":"age","descending":true}},
+    {"Offset":1},
+    {"Limit":2}
+  ]
+}
