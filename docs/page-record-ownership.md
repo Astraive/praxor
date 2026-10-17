@@ -45,6 +45,8 @@ Catalog loads and saves hold the same root guard as page/WAL operations. Load do
 
 Supported live catalog loads wait for a complete successful save, or fail closed after an uncertain publication error. After all owners drop, v1 can still contain individually valid catalog files from different publication attempts. The format has no durable catalog generation witness to prove that all ten files belong to one completed save; [#41](https://github.com/Astraive/praxor/issues/41) tracks that crash/recovery boundary. [V1 catalog decoding](catalog-decoding.md) describes the checked count, string, ID, tag, envelope and input-role contract added for [#51](https://github.com/Astraive/praxor/issues/51).
 
+[V1 page manifest decoding](page-manifest-decoding.md) documents the separate checked inventory codec. A present manifest is validated before managed WAL repair/layout initialization even with no discovered collections. This validates its representation; #41 still owns required-inventory presence and acknowledgement completeness.
+
 ## Reopen, replay, and failure outcomes
 
 Normal open classifies the canonical log and validates every directory, allocation high-water and complete-prefix semantic fact before a proven interrupted v2 append can be repaired and synced. Corrupt or ambiguous legacy tails refuse unchanged. Normal open reserves only complete validated WAL allocations and never automatically replays records. Existing tombstones remain barriers to older logged puts. Replay rejects conflicting entity/payload assignments and invalid ordering before publishing records.
