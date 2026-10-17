@@ -10,6 +10,9 @@ const WAL_FILE_MAGIC: u32 = 0x5457_4146;
 const WAL_FILE_VERSION: u32 = 1;
 const WAL_FILE_HEADER_LEN: usize = 16;
 
+#[cfg(test)]
+mod group_commit_failure_tests;
+
 #[derive(Debug)]
 pub struct Wal {
     path: PathBuf,
@@ -79,13 +82,20 @@ impl Wal {
     }
 
     pub fn append(&mut self, record: &WalRecord) -> Result<()> {
+        self.append_unsynced(record)?;
+        if matches!(self.sync_policy, WalSyncPolicy::EveryBatch) {
+            self.file.sync_data()?;
+        }
+        Ok(())
+    }
+
+    /// The core coordinator explicitly syncs its closed group. Public callers
+    /// of append retain the configured EveryBatch behavior above.
+    pub(crate) fn append_unsynced(&mut self, record: &WalRecord) -> Result<()> {
         let encoded = record.encode();
         self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(&encoded)?;
         self.bytes_written += encoded.len() as u64;
-        if matches!(self.sync_policy, WalSyncPolicy::EveryBatch) {
-            self.file.sync_data()?;
-        }
         Ok(())
     }
 
