@@ -42,6 +42,13 @@ pub struct IndirectionTable {
 }
 
 impl IndirectionTable {
+    pub(crate) fn reserve_rid(&mut self) -> Result<RecordId> {
+        self.next_rid = self
+            .next_rid
+            .checked_add(1)
+            .ok_or_else(|| PraxisError::InvalidConfig("record id exhausted".into()))?;
+        Ok(RecordId(self.next_rid))
+    }
     /// Allocate a new logical [`RecordId`] pointing to `location`.
     pub fn allocate(&mut self, location: PhysicalLocation) -> RecordId {
         self.next_rid += 1;
@@ -134,6 +141,10 @@ impl IndirectionTable {
 
     pub fn contains_live(&self, rid: RecordId) -> bool {
         self.entries.get(&rid.0).is_some_and(|entry| entry.alive)
+    }
+
+    pub(crate) fn contains_record(&self, rid: RecordId) -> bool {
+        self.entries.contains_key(&rid.0)
     }
 
     /// The ID of the currently active segment (new records appended here).

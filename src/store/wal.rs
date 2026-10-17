@@ -11,6 +11,12 @@ const STORAGE_WAL_MAGIC: u32 = 0x5453_574c;
 const STORAGE_WAL_VERSION: u8 = 1;
 const STORAGE_WAL_PAYLOAD_MAGIC: u32 = 0x5453_5742;
 const STORAGE_WAL_PAYLOAD_VERSION: u8 = 1;
+const STORAGE_WAL_GROUP_VERSION: u8 = 2;
+const STORAGE_WAL_GROUP_HEADER_LEN: usize = 13;
+// The payload cap includes group and nested-entry metadata. The outer frame
+// contributes another eight bytes; the segment size remains a rotation target.
+pub(crate) const MAX_STORAGE_WAL_GROUP_BYTES: usize = 64 * 1024 * 1024;
+const MIN_ENTRY_PAYLOAD_LEN: usize = 29;
 const STORAGE_WAL_HEADER_LEN: usize = 5;
 const STORAGE_WAL_RECORD_HEADER_LEN: usize = 8;
 const DEFAULT_SEGMENT_BYTES: u64 = 16 * 1024 * 1024;
@@ -39,6 +45,7 @@ pub struct StorageWal {
     file: File,
     active_size: u64,
     max_segment_bytes: u64,
+    recovery_required: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,6 +75,11 @@ impl StorageWal {
         crate::io::create_dir_all_durable(&dir)?;
         let stem = wal_stem(&path);
 
+        // Older databases may still have an unsegmented WAL at `path`.
+        // Validate it before creating a successor; replay retains it as the
+        // immutable prefix when new segmented groups are appended.
+        replay_file(&path)?;
+
         let mut segment_ids = list_segment_ids(&dir, &stem)?;
         segment_ids.sort_unstable();
         let active_segment_id = segment_ids.last().copied().unwrap_or(1);
@@ -88,6 +100,7 @@ impl StorageWal {
             file,
             active_size,
             max_segment_bytes: options.max_segment_bytes.max(1024),
+            recovery_required: false,
         })
     }
 
@@ -95,30 +108,47 @@ impl StorageWal {
         self.append_batch(std::slice::from_ref(entry))
     }
 
+    /// Durably append all entries as one ordered, checksummed v2 group.
+    /// Readers retain v1 binary/JSON support; v2 requires an upgraded reader.
+    /// After an I/O error the handle must be closed and reopened before reuse.
     pub fn append_batch(&mut self, entries: &[StorageWalEntry]) -> Result<()> {
+        if self.recovery_required {
+            return Err(PraxisError::RecoveryRequired);
+        }
         if entries.is_empty() {
             return Ok(());
         }
 
-        let encoded: Vec<Vec<u8>> = entries
-            .iter()
-            .map(encode_record)
-            .collect::<Result<Vec<_>>>()?;
-        let batch_bytes: u64 = encoded.iter().map(|record| record.len() as u64).sum();
-
-        if self.active_size > STORAGE_WAL_HEADER_LEN as u64
-            && self.active_size + batch_bytes > self.max_segment_bytes
-        {
-            self.rotate_segment()?;
+        // Encode and validate before any filesystem mutation. A group has one
+        // checksum and one recovery boundary, even when larger than a segment.
+        let encoded = encode_group_record(entries)?;
+        let batch_bytes = encoded.len() as u64;
+        let result = (|| {
+            if self.active_size > STORAGE_WAL_HEADER_LEN as u64
+                && self.active_size.saturating_add(batch_bytes) > self.max_segment_bytes
+            {
+                self.rotate_segment()?;
+            }
+            self.file.seek(SeekFrom::End(0))?;
+            self.file.write_all(&encoded)?;
+            self.file.sync_data()?;
+            self.active_size += batch_bytes;
+            Ok(())
+        })();
+        if result.is_err() {
+            // A failed write or sync has an ambiguous durable outcome. Reopen
+            // must validate/repair it before another group can be appended.
+            self.recovery_required = true;
         }
+        result
+    }
 
-        self.file.seek(SeekFrom::End(0))?;
-        for record in &encoded {
-            self.file.write_all(record)?;
-        }
-        self.file.sync_data()?;
-        self.active_size += batch_bytes;
-        Ok(())
+    pub(crate) fn requires_recovery(&self) -> bool {
+        self.recovery_required
+    }
+
+    pub(crate) fn validate_batch(entries: &[StorageWalEntry]) -> Result<()> {
+        group_payload_len(entries).map(|_| ())
     }
 
     pub fn replay(path: &Path) -> Result<Vec<StorageWalEntry>> {
@@ -129,11 +159,7 @@ impl StorageWal {
         let stem = wal_stem(path);
         let mut segment_ids = list_segment_ids(&dir, &stem)?;
         segment_ids.sort_unstable();
-        if segment_ids.is_empty() {
-            return replay_file(path);
-        }
-
-        let mut out = Vec::new();
+        let mut out = replay_file(path)?;
         for segment_id in segment_ids {
             let segment = segment_path(&dir, &stem, segment_id);
             out.extend(replay_file(&segment)?);
@@ -147,9 +173,14 @@ impl StorageWal {
 
     fn rotate_segment(&mut self) -> Result<()> {
         self.file.sync_data()?;
-        self.active_segment_id = self.active_segment_id.saturating_add(1);
-        self.active_segment_path = segment_path(&self.dir, &self.stem, self.active_segment_id);
-        let (file, active_size) = open_segment_file(&self.active_segment_path)?;
+        let next_id = self
+            .active_segment_id
+            .checked_add(1)
+            .ok_or_else(|| PraxisError::InvalidConfig("storage WAL segment id exhausted".into()))?;
+        let next_path = segment_path(&self.dir, &self.stem, next_id);
+        let (file, active_size) = open_segment_file(&next_path)?;
+        self.active_segment_id = next_id;
+        self.active_segment_path = next_path;
         self.file = file;
         self.active_size = active_size;
         Ok(())
@@ -281,6 +312,32 @@ fn replay_records(bytes: &[u8], path: &Path) -> Result<(Vec<StorageWalEntry>, us
             bytes[cursor + 7],
         ]);
         let start = cursor + STORAGE_WAL_RECORD_HEADER_LEN;
+        // The mirrored length belongs to the checksummed v2 payload. Inspect
+        // it before treating an oversized outer length as an interrupted write.
+        let available = &bytes[start..];
+        if available.len() >= 5
+            && available[..4] == STORAGE_WAL_PAYLOAD_MAGIC.to_le_bytes()
+            && ![STORAGE_WAL_PAYLOAD_VERSION, STORAGE_WAL_GROUP_VERSION].contains(&available[4])
+        {
+            return Err(payload_corrupt(format!(
+                "unsupported storage WAL payload version {}",
+                available[4]
+            )));
+        }
+        if available.len() >= 5
+            && available[..4] == STORAGE_WAL_PAYLOAD_MAGIC.to_le_bytes()
+            && available[4] == STORAGE_WAL_GROUP_VERSION
+        {
+            if !(STORAGE_WAL_GROUP_HEADER_LEN..=MAX_STORAGE_WAL_GROUP_BYTES).contains(&len) {
+                return Err(payload_corrupt("invalid storage WAL group size"));
+            }
+            if available.len() >= 9 {
+                let mirror = u32::from_le_bytes(available[5..9].try_into().unwrap()) as usize;
+                if mirror != len {
+                    return Err(payload_corrupt("storage WAL group length mismatch"));
+                }
+            }
+        }
         if len > bytes.len() - start {
             break;
         }
@@ -292,8 +349,7 @@ fn replay_records(bytes: &[u8], path: &Path) -> Result<(Vec<StorageWalEntry>, us
                 reason: format!("storage WAL checksum mismatch at offset {cursor}"),
             });
         }
-        let entry = decode_payload(payload)?;
-        out.push(entry);
+        out.extend(decode_record_payload(payload)?);
         cursor = end;
     }
     Ok((out, cursor))
@@ -305,14 +361,94 @@ fn crc32(bytes: &[u8]) -> u32 {
     hasher.finalize()
 }
 
-fn encode_record(entry: &StorageWalEntry) -> Result<Vec<u8>> {
-    let payload = encode_payload(entry)?;
+// V2 payload: [magic:u32][version:u8][payload_len:u32][count:u32], followed
+// by [entry_len:u32][v1_binary_entry] for each ordered entry. The existing
+// outer [length:u32][payload_crc:u32] frame checksums the complete envelope.
+fn encode_group_record(entries: &[StorageWalEntry]) -> Result<Vec<u8>> {
+    let len = group_payload_len(entries)?;
+    let mut payload = Vec::with_capacity(len);
+    payload.extend_from_slice(&STORAGE_WAL_PAYLOAD_MAGIC.to_le_bytes());
+    payload.push(STORAGE_WAL_GROUP_VERSION);
+    payload.extend_from_slice(&(len as u32).to_le_bytes());
+    payload.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for entry in entries {
+        let inner = encode_payload(entry)?;
+        payload.extend_from_slice(&(inner.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&inner);
+    }
     let checksum = crc32(&payload);
     let mut out = Vec::with_capacity(STORAGE_WAL_RECORD_HEADER_LEN + payload.len());
     out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     out.extend_from_slice(&checksum.to_le_bytes());
     out.extend_from_slice(&payload);
     Ok(out)
+}
+
+fn group_payload_len(entries: &[StorageWalEntry]) -> Result<usize> {
+    u32::try_from(entries.len())
+        .map_err(|_| PraxisError::InvalidConfig("too many storage WAL group entries".into()))?;
+    let mut len = STORAGE_WAL_GROUP_HEADER_LEN;
+    for entry in entries {
+        if entry.index_type.len() > u16::MAX as usize || entry.key.len() > u32::MAX as usize {
+            return Err(PraxisError::InvalidConfig(
+                "storage WAL entry exceeds binary payload limit".into(),
+            ));
+        }
+        len = len
+            .checked_add(4)
+            .and_then(|n| n.checked_add(MIN_ENTRY_PAYLOAD_LEN))
+            .and_then(|n| n.checked_add(entry.index_type.len()))
+            .and_then(|n| n.checked_add(entry.key.len()))
+            .ok_or_else(|| PraxisError::InvalidConfig("storage WAL group size overflow".into()))?;
+        if len > MAX_STORAGE_WAL_GROUP_BYTES {
+            return Err(PraxisError::InvalidConfig(
+                "storage WAL group exceeds 64 MiB limit".into(),
+            ));
+        }
+    }
+    Ok(len)
+}
+
+fn decode_record_payload(payload: &[u8]) -> Result<Vec<StorageWalEntry>> {
+    if payload.len() < 5
+        || payload[..4] != STORAGE_WAL_PAYLOAD_MAGIC.to_le_bytes()
+        || payload[4] != STORAGE_WAL_GROUP_VERSION
+    {
+        return decode_payload(payload).map(|entry| vec![entry]);
+    }
+    if payload.len() > MAX_STORAGE_WAL_GROUP_BYTES {
+        return Err(payload_corrupt("storage WAL group exceeds 64 MiB limit"));
+    }
+    let mut cursor = 5;
+    if read_u32(payload, &mut cursor)? as usize != payload.len() {
+        return Err(payload_corrupt("storage WAL group length mismatch"));
+    }
+    let count = read_u32(payload, &mut cursor)? as usize;
+    if count == 0 || count > (payload.len() - cursor) / (4 + MIN_ENTRY_PAYLOAD_LEN) {
+        return Err(payload_corrupt("invalid storage WAL group entry count"));
+    }
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len = read_u32(payload, &mut cursor)? as usize;
+        let end = cursor
+            .checked_add(len)
+            .ok_or_else(|| payload_corrupt("entry length overflow"))?;
+        let inner = payload
+            .get(cursor..end)
+            .ok_or_else(|| payload_corrupt("truncated group entry"))?;
+        if inner.len() < MIN_ENTRY_PAYLOAD_LEN
+            || inner[..4] != STORAGE_WAL_PAYLOAD_MAGIC.to_le_bytes()
+            || inner[4] != STORAGE_WAL_PAYLOAD_VERSION
+        {
+            return Err(payload_corrupt("invalid nested storage WAL entry"));
+        }
+        entries.push(decode_payload(inner)?);
+        cursor = end;
+    }
+    if cursor != payload.len() {
+        return Err(payload_corrupt("trailing storage WAL group bytes"));
+    }
+    Ok(entries)
 }
 
 fn encode_payload(entry: &StorageWalEntry) -> Result<Vec<u8>> {
