@@ -1,4 +1,7 @@
-use super::group_commit::{CommitLeader, CommitTurn, GroupCommitCoordinator, WriteCondition};
+use super::group_commit::{
+    CommitKind, CommitLeader, CommitOutcome, CommitRequest, CommitTurn, Durability,
+    GroupCommitCoordinator, WriteCondition,
+};
 use super::state::{CacheKey, EngineInner};
 use crate::accel::gpu::GpuBackendKind;
 use crate::accel::{Accelerator, CpuAccelerator, GpuAccelerator};
@@ -46,6 +49,10 @@ mod cf_generation_tests;
 #[cfg(test)]
 #[path = "engine/backup_tests.rs"]
 mod backup_tests;
+
+#[cfg(test)]
+#[path = "engine/durability_tests.rs"]
+mod durability_tests;
 
 impl PraxisEngine {
     pub fn open(config: PraxisConfig) -> Result<Self> {
@@ -400,10 +407,13 @@ impl PraxisEngine {
             encoded_len,
             &self.inner.metrics,
         )?;
-        let sequence = loop {
-            match self.inner.group_commit.wait(&request) {
-                CommitTurn::Complete(result) => break result?,
-                CommitTurn::Lead(leader) => self.commit_closed_group(leader),
+        let sequence = match self.wait_for_commit(&request)? {
+            CommitOutcome::Write { sequence } => sequence,
+            _ => {
+                self.inner
+                    .group_commit
+                    .poison("KV request received a non-write outcome".into());
+                return Err(PraxisError::RecoveryRequired);
             }
         };
         // Leadership was handed off before automatic maintenance. Preserve the
@@ -428,6 +438,54 @@ impl PraxisEngine {
         Ok(sequence)
     }
 
+    fn wait_for_commit(&self, request: &CommitRequest) -> Result<CommitOutcome> {
+        loop {
+            match self.inner.group_commit.wait(request) {
+                CommitTurn::Complete(result) => return result,
+                CommitTurn::Lead(leader) => self.commit_closed_group(leader),
+            }
+        }
+    }
+
+    // This complete private primitive is wired into the record facade in the
+    // next F1b checkpoint; it is not a public placeholder writer or a no-op.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "F1b facade wiring follows the queue checkpoint")
+    )]
+    pub(crate) fn durable_barrier(&self) -> Result<u64> {
+        self.inner.group_commit.ensure_writable()?;
+        let request = self.inner.group_commit.admit_barrier(&self.inner.metrics)?;
+        match self.wait_for_commit(&request)? {
+            CommitOutcome::Barrier { through_sequence } => Ok(through_sequence),
+            _ => {
+                self.inner
+                    .group_commit
+                    .poison("barrier received a non-barrier outcome".into());
+                Err(PraxisError::RecoveryRequired)
+            }
+        }
+    }
+
+    fn sync_commit_wal(&self, wal: &mut Wal) -> Result<()> {
+        let started = std::time::Instant::now();
+        self.inner
+            .metrics
+            .commit_sync_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        let result = wal.sync();
+        self.inner.metrics.commit_sync_ns.fetch_add(
+            started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+        result?;
+        self.inner
+            .metrics
+            .commit_syncs
+            .fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
     fn commit_closed_group(&self, leader: CommitLeader<'_>) {
         let writer = self.inner.write_serialization.lock();
         // Rebind after the writer guard so unwind poisoning runs before the
@@ -438,16 +496,37 @@ impl PraxisEngine {
             return;
         }
         let group = leader.drain(self.inner.config.wal_sync_policy, &self.inner.metrics);
+        if group
+            .first()
+            .is_some_and(|request| matches!(request.kind, CommitKind::Barrier))
+        {
+            if group.len() != 1 {
+                leader.fail("barrier was not fenced from writes".into());
+                return;
+            }
+            let through_sequence = self.snapshot().sequence;
+            let result = self.sync_commit_wal(&mut self.inner.wal.lock());
+            match result {
+                Ok(()) => leader.finish(vec![Ok(CommitOutcome::Barrier { through_sequence })]),
+                Err(error) => leader.fail(error.to_string()),
+            }
+            drop(writer);
+            return;
+        }
         let mut results = Vec::with_capacity(group.len());
         let mut valid = Vec::new();
         for request in &group {
+            let CommitKind::User(user) = &request.kind else {
+                leader.fail("barrier was coalesced into a write group".into());
+                return;
+            };
             match self
-                .validate_captured_generations(&request.generations)
-                .and_then(|()| self.validate_write_condition(&request.condition, &request.batch))
+                .validate_captured_generations(&user.generations)
+                .and_then(|()| self.validate_write_condition(&user.condition, &user.batch))
             {
                 Ok(()) => {
-                    results.push(Ok(0));
-                    valid.push(request);
+                    results.push(Ok(CommitOutcome::Write { sequence: 0 }));
+                    valid.push((user, request.admission_bytes, request.durability));
                 }
                 Err(error) => results.push(Err(error)),
             }
@@ -469,7 +548,7 @@ impl PraxisEngine {
             drop(writer);
             return;
         };
-        let bytes = valid.iter().map(|request| request.encoded_len).sum();
+        let bytes = valid.iter().map(|(_, bytes, _)| *bytes).sum();
         if let Err(error) = self.rotate_wal_if_needed(bytes) {
             if self.inner.group_commit.ensure_writable().is_err() {
                 leader.fail(error.to_string());
@@ -489,31 +568,17 @@ impl PraxisEngine {
         let first_sequence = last_sequence - valid.len() as u64 + 1;
         let write_result = (|| -> Result<()> {
             let mut wal = self.inner.wal.lock();
-            for (index, request) in valid.iter().enumerate() {
-                wal.append_unsynced(&WalRecord {
-                    sequence: first_sequence + index as u64,
-                    batch: request.batch.clone(),
-                })?;
+            for (index, (user, _, _)) in valid.iter().enumerate() {
+                wal.append_user_batch_unsynced(first_sequence + index as u64, &user.batch)?;
             }
             if !matches!(
                 self.inner.config.wal_sync_policy,
                 crate::config::WalSyncPolicy::Never
-            ) {
-                let started = std::time::Instant::now();
-                self.inner
-                    .metrics
-                    .commit_sync_attempts
-                    .fetch_add(1, Ordering::Relaxed);
-                let sync_result = wal.sync();
-                self.inner.metrics.commit_sync_ns.fetch_add(
-                    started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-                    Ordering::Relaxed,
-                );
-                sync_result?;
-                self.inner
-                    .metrics
-                    .commit_syncs
-                    .fetch_add(1, Ordering::Release);
+            ) || valid
+                .iter()
+                .any(|(_, _, durability)| *durability == Durability::Durable)
+            {
+                self.sync_commit_wal(&mut wal)?;
             }
             Ok(())
         })();
@@ -533,9 +598,9 @@ impl PraxisEngine {
         }
         {
             let mut memtable = self.inner.memtable.write();
-            for (index, request) in valid.iter().enumerate() {
+            for (index, (user, _, _)) in valid.iter().enumerate() {
                 let sequence = first_sequence + index as u64;
-                for op in request.batch.ops() {
+                for op in user.batch.ops() {
                     memtable.apply(sequence, op);
                     match op {
                         BatchOp::Delete { .. } => {
@@ -569,7 +634,7 @@ impl PraxisEngine {
         let mut sequence = first_sequence;
         for result in &mut results {
             if result.is_ok() {
-                *result = Ok(sequence);
+                *result = Ok(CommitOutcome::Write { sequence });
                 sequence = sequence.saturating_add(1);
             }
         }

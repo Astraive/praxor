@@ -511,9 +511,16 @@ impl Envelope {
         value.validate(sequence, source)?;
         Ok(value)
     }
+    #[cfg(test)]
     pub(crate) fn encode(&self, sequence: u64) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(Self::LEN);
+        self.encode_into(sequence, &mut out)?;
+        Ok(out)
+    }
+
+    pub(crate) fn encode_into(&self, sequence: u64, out: &mut Vec<u8>) -> Result<()> {
         self.validate(sequence, Path::new("record-envelope"))?;
-        let mut out = b"PRR1".to_vec();
+        out.extend(b"PRR1");
         out.extend(1u16.to_le_bytes());
         out.push(self.kind as u8);
         out.push(0);
@@ -531,7 +538,7 @@ impl Envelope {
         }
         out.extend(self.record_count.to_le_bytes());
         out.extend(self.logical_entry_count.to_le_bytes());
-        Ok(out)
+        Ok(())
     }
 }
 

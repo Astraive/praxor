@@ -7,6 +7,22 @@ complete transition validator. F1a and F1b must ship together; this checkpoint
 does not establish record CRUD, record durability barriers, historical payload
 snapshots, legacy import, plugin parity, or product adoption.
 
+F1b checkpoint 1 adds private typed User/Barrier requests and Write/Barrier
+outcomes, with per-request Configured/Durable requirements. A barrier is a
+positive-charged FIFO fence that actually syncs the covering core WAL; it writes
+no frame and consumes no core sequence. It holds no maintenance/WAL/manifest
+guard while waiting. Durable accepted requests sync even under Never without
+changing persisted policy; rejected requests do not force IO. The helper remains
+private pending the complete record facade. No record intent/planner is exposed.
+
+Commit sync attempts/successes/duration include closed write groups and ordered
+barriers; rotation/header/checkpoint syncs remain separate. Earlier rotated WALs
+are covered by the existing sync-before-install protocol. Sync failure poisons
+the common owner and completes later queued requests. A current allocation test
+checks live workspace for one 1 MiB ordinary payload against one encoded frame
+plus 512 bytes; this is not a whole-process memory or throughput measurement.
+Both ordinary and typed WAL encoding use the shared borrowed operation writer.
+
 `CoreDatabase::create_fresh` creates only an absent/empty root (its permanent
 writer lock is neutral). `CoreDatabase::open` requires an existing supported v3
 manifest. `kv()` clones the same `PraxisEngine` owner: lease, queue, health, core
