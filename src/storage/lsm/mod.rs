@@ -18,7 +18,7 @@ use crate::index::{IndexPlugin, IndexStats};
 use crate::io::{BinaryReader, BinaryWriter, crc32c};
 use crate::store::RecordId;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -49,7 +49,7 @@ struct OnDisk {
 const LSM_SNAPSHOT_MAGIC: u32 = 0x4c53_4d32;
 const LSM_SNAPSHOT_VERSION: u8 = 1;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct BloomMetadata {
     bits: Vec<u8>,
     bit_len: usize,
@@ -57,28 +57,20 @@ struct BloomMetadata {
 }
 
 impl BloomMetadata {
-    fn from_keys(keys: &[Vec<u8>], false_positive_rate: f64) -> Self {
-        if keys.is_empty() {
-            return Self {
-                bits: Vec::new(),
-                bit_len: 0,
-                hashes: 0,
-            };
+    fn with_capacity(capacity: usize, false_positive_rate: f64) -> Self {
+        if capacity == 0 {
+            return Self::default();
         }
-        let n = keys.len() as f64;
+        let n = capacity as f64;
         let p = false_positive_rate.clamp(1e-9, 0.5);
         let ln2 = std::f64::consts::LN_2;
         let bit_len = ((-n * p.ln()) / (ln2 * ln2)).ceil().max(1024.0) as usize;
         let hashes = ((bit_len as f64 / n) * ln2).round().clamp(1.0, 16.0) as u8;
-        let mut bloom = Self {
+        Self {
             bits: vec![0u8; bit_len.div_ceil(8)],
             bit_len,
             hashes,
-        };
-        for key in keys {
-            bloom.insert(key);
         }
-        bloom
     }
 
     fn maybe_contains(&self, key: &[u8]) -> bool {
@@ -109,9 +101,13 @@ pub struct LsmIndex {
     dir: PathBuf,
     history: BTreeMap<Vec<u8>, Vec<VersionedRid>>,
     next_sequence: u64,
+    // Current membership is separate from historical versions. One key copy per
+    // live key provides exact bounds without scanning tombstoned history.
+    live_keys: BTreeSet<Vec<u8>>,
+    version_count: u64,
     bloom: BloomMetadata,
-    fence_min: Option<Vec<u8>>,
-    fence_max: Option<Vec<u8>>,
+    bloom_capacity: usize,
+    bloom_insertions: usize,
 }
 
 impl LsmIndex {
@@ -133,25 +129,6 @@ impl LsmIndex {
             };
             next_sequence = on_disk.next_sequence;
             history.extend(on_disk.entries);
-            let mut index = Self {
-                name,
-                dir,
-                history,
-                next_sequence,
-                bloom: if on_disk.bloom_bit_len > 0 && on_disk.bloom_hashes > 0 {
-                    BloomMetadata {
-                        bits: on_disk.bloom_bits,
-                        bit_len: on_disk.bloom_bit_len,
-                        hashes: on_disk.bloom_hashes,
-                    }
-                } else {
-                    BloomMetadata::from_keys(&on_disk.bloom_keys, DEFAULT_BLOOM_FPR)
-                },
-                fence_min: on_disk.fence_min,
-                fence_max: on_disk.fence_max,
-            };
-            index.refresh_metadata();
-            return Ok(index);
         }
 
         let mut index = Self {
@@ -159,15 +136,15 @@ impl LsmIndex {
             dir,
             history,
             next_sequence,
-            bloom: BloomMetadata {
-                bits: Vec::new(),
-                bit_len: 0,
-                hashes: 0,
-            },
-            fence_min: None,
-            fence_max: None,
+            live_keys: BTreeSet::new(),
+            version_count: 0,
+            bloom: BloomMetadata::default(),
+            bloom_capacity: 0,
+            bloom_insertions: 0,
         };
-        index.refresh_metadata();
+        // Both legacy JSON and binary snapshots carry derived metadata. Rebuild
+        // it once from authoritative histories, including the insertion budget.
+        index.rebuild_metadata();
         Ok(index)
     }
 
@@ -193,32 +170,85 @@ impl LsmIndex {
         self.next_sequence
     }
 
-    /// Probabilistic bloom membership check for live keys.
+    /// Probabilistic bloom membership check for current live keys.
+    ///
+    /// Deleted keys may remain false positives until a rebuild. This filter must
+    /// not gate historical snapshot reads, whose keys may now be tombstoned.
     pub fn may_contain_key(&self, key: &[u8]) -> bool {
         self.bloom.maybe_contains(key)
     }
 
     /// Fence pointer bounds `(min_key, max_key)` for live keys.
     pub fn fence_bounds(&self) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
-        (self.fence_min.clone(), self.fence_max.clone())
+        (
+            self.live_keys.first().cloned(),
+            self.live_keys.last().cloned(),
+        )
     }
 
-    fn refresh_metadata(&mut self) {
-        self.fence_min = None;
-        self.fence_max = None;
-        let mut live_keys = Vec::new();
+    fn rebuild_metadata(&mut self) {
+        self.live_keys.clear();
+        self.version_count = 0;
         for (key, versions) in &self.history {
+            self.version_count += versions.len() as u64;
             if latest_visible(versions, u64::MAX).is_some() {
-                live_keys.push(key.clone());
-                if self.fence_min.as_ref().is_none_or(|min| key < min) {
-                    self.fence_min = Some(key.clone());
-                }
-                if self.fence_max.as_ref().is_none_or(|max| key > max) {
-                    self.fence_max = Some(key.clone());
-                }
+                self.live_keys.insert(key.clone());
             }
         }
-        self.bloom = BloomMetadata::from_keys(&live_keys, DEFAULT_BLOOM_FPR);
+        self.rebuild_bloom();
+    }
+
+    fn rebuild_bloom(&mut self) {
+        if self.live_keys.is_empty() {
+            self.bloom = BloomMetadata::default();
+            self.bloom_capacity = 0;
+            self.bloom_insertions = 0;
+            return;
+        }
+        // Geometric headroom amortizes rebuilds over live-key transitions.
+        // The budget counts reinsertions too, so churn cannot saturate the
+        // filter while its live cardinality stays small.
+        let desired = self
+            .live_keys
+            .len()
+            .saturating_mul(2)
+            .max(MIN_BLOOM_CAPACITY);
+        self.bloom_capacity = desired.checked_next_power_of_two().unwrap_or(desired);
+        self.bloom = BloomMetadata::with_capacity(self.bloom_capacity, DEFAULT_BLOOM_FPR);
+        for key in &self.live_keys {
+            self.bloom.insert(key);
+        }
+        self.bloom_insertions = self.live_keys.len();
+    }
+
+    fn append_version(&mut self, key: &[u8], rid: Option<RecordId>, sequence: u64) {
+        self.next_sequence = self.next_sequence.max(sequence);
+        let versions = self.history.entry(key.to_vec()).or_default();
+        let was_live = versions.last().is_some_and(|version| version.rid.is_some());
+        // Preserve append order, including equal/decreasing caller sequences.
+        // Historical visibility continues to use latest_visible unchanged.
+        versions.push(VersionedRid { sequence, rid });
+        self.version_count += 1;
+
+        if rid.is_some() && !was_live {
+            self.live_keys.insert(key.to_vec());
+            if self.bloom_insertions >= self.bloom_capacity {
+                self.rebuild_bloom();
+            } else {
+                self.bloom.insert(key);
+                self.bloom_insertions += 1;
+            }
+        } else if rid.is_none() && was_live {
+            self.live_keys.remove(key);
+            // Clearing shared bits could reject other live keys. Shrink only
+            // after crossing a geometric threshold; otherwise keep stale bits.
+            if self.live_keys.is_empty()
+                || (self.bloom_capacity > MIN_BLOOM_CAPACITY
+                    && self.live_keys.len() < self.bloom_capacity / 4)
+            {
+                self.rebuild_bloom();
+            }
+        }
     }
 }
 
@@ -233,15 +263,7 @@ impl IndexPlugin for LsmIndex {
     }
 
     fn put_with_sequence(&mut self, key: &[u8], rid: RecordId, sequence: u64) -> Result<()> {
-        self.next_sequence = self.next_sequence.max(sequence);
-        self.history
-            .entry(key.to_vec())
-            .or_default()
-            .push(VersionedRid {
-                sequence,
-                rid: Some(rid),
-            });
-        self.refresh_metadata();
+        self.append_version(key, Some(rid), sequence);
         Ok(())
     }
 
@@ -261,19 +283,12 @@ impl IndexPlugin for LsmIndex {
     }
 
     fn delete_with_sequence(&mut self, key: &[u8], sequence: u64) -> Result<()> {
-        self.next_sequence = self.next_sequence.max(sequence);
-        self.history
-            .entry(key.to_vec())
-            .or_default()
-            .push(VersionedRid {
-                sequence,
-                rid: None,
-            });
-        self.refresh_metadata();
+        self.append_version(key, None, sequence);
         Ok(())
     }
 
     fn flush(&mut self) -> Result<()> {
+        let (fence_min, fence_max) = self.fence_bounds();
         let on_disk = OnDisk {
             next_sequence: self.next_sequence,
             entries: self
@@ -285,8 +300,8 @@ impl IndexPlugin for LsmIndex {
             bloom_bit_len: self.bloom.bit_len,
             bloom_hashes: self.bloom.hashes,
             bloom_keys: Vec::new(),
-            fence_min: self.fence_min.clone(),
-            fence_max: self.fence_max.clone(),
+            fence_min,
+            fence_max,
         };
         let bytes = encode_binary_snapshot(&on_disk);
         std::fs::write(Self::snapshot_path(&self.dir, &self.name), bytes)?;
@@ -301,20 +316,14 @@ impl IndexPlugin for LsmIndex {
             }
         }
         self.history.retain(|_, versions| versions[0].rid.is_some());
-        self.refresh_metadata();
+        self.rebuild_metadata();
         Ok(())
     }
 
     fn stats(&self) -> IndexStats {
-        let live_keys = self
-            .history
-            .values()
-            .filter(|versions| latest_visible(versions, u64::MAX).is_some())
-            .count() as u64;
-        let versions = self.history.values().map(|v| v.len() as u64).sum();
         IndexStats {
-            live_keys,
-            versions,
+            live_keys: self.live_keys.len() as u64,
+            versions: self.version_count,
         }
     }
 }
@@ -328,6 +337,7 @@ fn latest_visible(versions: &[VersionedRid], sequence: u64) -> Option<RecordId> 
 }
 
 const DEFAULT_BLOOM_FPR: f64 = 0.01;
+const MIN_BLOOM_CAPACITY: usize = 128;
 
 fn hash_indexes(key: &[u8], hashes: u8, bit_len: usize) -> impl Iterator<Item = usize> + '_ {
     let digest = blake3::hash(key);
