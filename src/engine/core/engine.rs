@@ -60,11 +60,32 @@ mod durability_tests;
 mod record_tests;
 
 #[cfg(test)]
+#[path = "engine/reclaim_fault_tests.rs"]
+mod reclaim_fault_tests;
+
+#[cfg(test)]
 pub(crate) mod reclaim_hooks {
     use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    use crate::Result;
 
     type Hook = Box<dyn FnMut()>;
     thread_local! { static AFTER_LATEST: RefCell<Option<Hook>> = RefCell::new(None); }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub enum Phase {
+        AfterPinnedViews,
+        AfterRunning,
+        BeforeReplacementWrite,
+        AfterReplacementWrite(PathBuf),
+        AfterReplacementValidated,
+        AfterManifestSave,
+        AfterIndexSwapBeforeGc,
+    }
+
+    type RewriteHook = Box<dyn FnMut(Phase) -> Result<()>>;
+    thread_local! { static REWRITE: RefCell<Option<RewriteHook>> = RefCell::new(None); }
 
     pub struct Reset;
     impl Drop for Reset {
@@ -84,6 +105,29 @@ pub(crate) mod reclaim_hooks {
                 hook();
             }
         });
+    }
+
+    pub struct RewriteReset;
+    impl Drop for RewriteReset {
+        fn drop(&mut self) {
+            REWRITE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    pub fn install_rewrite(hook: impl FnMut(Phase) -> Result<()> + 'static) -> RewriteReset {
+        REWRITE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        RewriteReset
+    }
+
+    pub fn try_phase(phase: Phase) -> Result<()> {
+        REWRITE.with(|slot| match slot.borrow_mut().as_mut() {
+            Some(hook) => hook(phase),
+            None => Ok(()),
+        })
+    }
+
+    pub fn cut_phase(phase: Phase) {
+        try_phase(phase).expect("post-install test hook must exit rather than return an error");
     }
 }
 
@@ -1426,6 +1470,8 @@ impl PraxisEngine {
         retained_views.push(latest_sequence);
         retained_views.sort_unstable();
         retained_views.dedup();
+        #[cfg(test)]
+        reclaim_hooks::try_phase(reclaim_hooks::Phase::AfterPinnedViews)?;
         let mut compacted = Vec::new();
         let mut source_protected_versions = 0usize;
         let mut retained_protected_versions = 0usize;
@@ -1493,6 +1539,8 @@ impl PraxisEngine {
         let (job_id, segment_id) =
             self.begin_compaction_job(strategy, source_segment_ids.clone())?;
         self.mark_compaction_job_running(job_id)?;
+        #[cfg(test)]
+        reclaim_hooks::try_phase(reclaim_hooks::Phase::AfterRunning)?;
         let rewritten = self.install_complete_source_rewrite(
             &source_segment_ids,
             job_id,
@@ -1508,6 +1556,8 @@ impl PraxisEngine {
                 "protected rewrite produced no installed segment".into(),
             ));
         }
+        #[cfg(test)]
+        reclaim_hooks::cut_phase(reclaim_hooks::Phase::AfterIndexSwapBeforeGc);
         // The installed manifest is authoritative before either validation or
         // GC; an error here represents uncertain maintenance progress.
         self.verify()?;
@@ -1549,6 +1599,10 @@ impl PraxisEngine {
             return Ok(0);
         }
         let path = self.inner.layout.segment_path(target_level, segment_id);
+        #[cfg(test)]
+        if protected_expectation.is_some() {
+            reclaim_hooks::try_phase(reclaim_hooks::Phase::BeforeReplacementWrite)?;
+        }
         crate::io::create_dir_all_durable(path.parent().expect("segment path has parent"))?;
         let mut value_log = ValueLog::open(self.inner.layout.value_log_path(segment_id))?;
         let mut compaction_limiter =
@@ -1572,6 +1626,10 @@ impl PraxisEngine {
             },
             compacted,
         )?;
+        #[cfg(test)]
+        if protected_expectation.is_some() {
+            reclaim_hooks::try_phase(reclaim_hooks::Phase::AfterReplacementWrite(path.clone()))?;
+        }
         let compacted_entries = metadata.entries;
         let loaded = SegmentReader::read(
             &path,
@@ -1599,6 +1657,10 @@ impl PraxisEngine {
                 });
             }
         }
+        #[cfg(test)]
+        if protected_expectation.is_some() {
+            reclaim_hooks::try_phase(reclaim_hooks::Phase::AfterReplacementValidated)?;
+        }
         let _writer = self.inner.write_serialization.lock();
         self.inner.group_commit.ensure_writable()?;
         let _topology = self.inner.topology.write();
@@ -1618,6 +1680,10 @@ impl PraxisEngine {
             self.inner
                 .manifest_store
                 .save_with_policy(&installed, self.inner.config.direct_io)?;
+            #[cfg(test)]
+            if protected_expectation.is_some() {
+                reclaim_hooks::cut_phase(reclaim_hooks::Phase::AfterManifestSave);
+            }
             *self.inner.segment_index.write() = rebuilt;
             *manifest = installed;
         }
