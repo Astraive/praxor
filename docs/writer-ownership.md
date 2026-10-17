@@ -50,16 +50,19 @@ artifact, even when inactive, before copying/deleting data. The root lock alone
 does not authorize erasing unrelated nested databases. New independent nested
 opens refuse recognized ancestors, closing the race with that preflight under
 the cooperative protocol.
-Cleanup retains permanent lock files recursively and removes directory aliases
+Cleanup retains permanent lock files recursively and refuses directory aliases
 without traversing their targets. Copy omits lock files and rejects source-tree
 symbolic links. Source and destination must be disjoint: neither may contain the
 other. The supported built-in layout uses separate `live`, `backup` and `restore`
 roots. Failed acquisition or copy releases the newly acquired leases.
 
-`restore_from_backup` still copies and returns `Result<()>`; it does not open or
-validate the restored engine. Replacement is not a transactional restore, and
-these changes do not relocate existing absolute/relative blob references or
-establish backup portability or power-loss durability.
+`restore_from_backup` returns `Result<()>` after static role, checksum and complete
+WAL-prefix validation. It relocates validated segment/blob/checkpoint references
+to the final target, without opening an engine. Only Core/Empty destinations and
+recognized interrupted core copies are replaceable; foreign or mixed roots are
+refused even after their writer has stopped. See [core backup](core-backup.md)
+for supported relocation, staging, retry and compatibility boundaries.
+Replacement is not transactional and these checks do not prove power-loss safety.
 
 ## Scope and offline utilities
 

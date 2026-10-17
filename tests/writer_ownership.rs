@@ -1,99 +1,10 @@
-use praxis::store::{RecordId, RecordStore, StorageEngine};
+use praxis::store::{RecordStore, StorageEngine};
 use praxis::{PraxisConfig, PraxisEngine};
-use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use tempfile::tempdir;
 
-const LOCK_NAME: &str = ".praxor.writer.lock";
-
-#[derive(Clone, Copy, Debug)]
-enum Kind {
-    Core,
-    Pointer,
-    Record,
-}
-
-enum Owner {
-    Core(PraxisEngine),
-    Pointer(Box<StorageEngine>),
-    Record(RecordStore),
-}
-
-impl Kind {
-    fn open(self, root: &Path) -> praxis::Result<Owner> {
-        Ok(match self {
-            Self::Core => Owner::Core(PraxisEngine::open(PraxisConfig::new(root))?),
-            Self::Pointer => Owner::Pointer(Box::new(StorageEngine::open(root, 1024)?)),
-            Self::Record => Owner::Record(RecordStore::open(root)?),
-        })
-    }
-    fn name(self) -> &'static str {
-        match self {
-            Self::Core => "core",
-            Self::Pointer => "pointer",
-            Self::Record => "record",
-        }
-    }
-}
-
-impl Owner {
-    fn write_marker(&mut self) {
-        match self {
-            Self::Core(engine) => {
-                engine.put("marker", "acknowledged").unwrap();
-                engine.flush().unwrap();
-            }
-            Self::Pointer(engine) => {
-                assert_eq!(engine.put(b"acknowledged", &[]).unwrap(), RecordId(1));
-                engine.flush().unwrap();
-            }
-            Self::Record(store) => {
-                assert_eq!(store.put(b"acknowledged").unwrap(), RecordId(1));
-                store.flush().unwrap();
-            }
-        }
-    }
-    fn assert_marker(&self) {
-        let bytes = match self {
-            Self::Core(engine) => engine.get("marker").unwrap().unwrap().to_vec(),
-            Self::Pointer(engine) => engine.fetch(RecordId(1)).unwrap(),
-            Self::Record(store) => store.get(RecordId(1)).unwrap(),
-        };
-        assert_eq!(bytes, b"acknowledged");
-    }
-}
-
-fn denied<T>(result: praxis::Result<T>) {
-    match result {
-        Err(praxis::PraxisError::AlreadyOpen { .. }) => {}
-        Err(error) => panic!("expected typed AlreadyOpen, received {error}"),
-        Ok(_) => panic!("a second independent writer was admitted"),
-    }
-}
-
-fn contents(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
-    fn visit(base: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let entry = entry.unwrap();
-            if entry.file_name() == LOCK_NAME {
-                continue;
-            }
-            if entry.file_type().unwrap().is_dir() {
-                visit(base, &entry.path(), out);
-            } else {
-                out.insert(
-                    entry.path().strip_prefix(base).unwrap().to_path_buf(),
-                    std::fs::read(entry.path()).unwrap(),
-                );
-            }
-        }
-    }
-    let mut out = BTreeMap::new();
-    visit(root, root, &mut out);
-    out
-}
+#[path = "support/writer_ownership.rs"]
+mod support;
+use support::{Kind, LOCK_NAME, contents, denied};
 
 #[test]
 fn all_live_root_writers_exclude_each_other_without_changing_data() {
@@ -264,6 +175,11 @@ fn restore_cannot_replace_a_live_root_or_primary_and_releases_ownership_after_co
         assert_eq!(contents(&target), before);
         owner.assert_marker();
         drop(owner);
+        if !matches!(kind, Kind::Core) {
+            assert!(PraxisEngine::restore_from_backup(&backup, &target).is_err());
+            assert_eq!(contents(&target), before);
+            continue;
+        }
         PraxisEngine::restore_from_backup(&backup, &target).unwrap();
         let restored = PraxisEngine::open(PraxisConfig::new(&target)).unwrap();
         assert_eq!(
@@ -275,15 +191,9 @@ fn restore_cannot_replace_a_live_root_or_primary_and_releases_ownership_after_co
     let store = RecordStore::open(target.join("primary")).unwrap();
     denied(PraxisEngine::restore_from_backup(&backup, &target));
     drop(store);
-    PraxisEngine::restore_from_backup(&backup, &target).unwrap();
-}
-
-struct Process(Child);
-impl Drop for Process {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
+    let before = contents(&target);
+    assert!(PraxisEngine::restore_from_backup(&backup, &target).is_err());
+    assert_eq!(contents(&target), before);
 }
 
 #[test]
@@ -300,6 +210,11 @@ fn backup_cannot_replace_a_live_destination_or_its_nested_primary() {
         assert_eq!(contents(&target), before);
         owner.assert_marker();
         drop(owner);
+        if !matches!(kind, Kind::Core) {
+            assert!(source.backup_to(&target).is_err());
+            assert_eq!(contents(&target), before);
+            continue;
+        }
         source.backup_to(&target).unwrap();
         let reopened = PraxisEngine::open(PraxisConfig::new(&target)).unwrap();
         assert_eq!(
@@ -311,7 +226,9 @@ fn backup_cannot_replace_a_live_destination_or_its_nested_primary() {
     let store = RecordStore::open(target.join("primary")).unwrap();
     denied(source.backup_to(&target));
     drop(store);
-    source.backup_to(&target).unwrap();
+    let before = contents(&target);
+    assert!(source.backup_to(&target).is_err());
+    assert_eq!(contents(&target), before);
 }
 
 #[test]
@@ -430,8 +347,8 @@ fn destination_cleanup_never_follows_a_directory_alias_into_another_writer() {
         }
         panic!("cannot create symlink: {error}");
     }
-    source.backup_to(&target).unwrap();
-    assert!(!alias.exists());
+    assert!(source.backup_to(&target).is_err());
+    assert!(alias.exists());
     assert_eq!(contents(&outside), before);
     owner.assert_marker();
 }
@@ -557,71 +474,4 @@ fn reserved_primary_alias_is_rejected_without_locking_or_mutating_its_target() {
         b"untouched"
     );
     assert!(!outside.join(LOCK_NAME).exists());
-}
-
-#[test]
-fn writer_process_holder() {
-    let Some(root) = std::env::var_os("PRAXIS_WRITER_TEST_ROOT") else {
-        return;
-    };
-    let kind = match std::env::var("PRAXIS_WRITER_TEST_KIND").unwrap().as_str() {
-        "core" => Kind::Core,
-        "pointer" => Kind::Pointer,
-        "record" => Kind::Record,
-        _ => unreachable!(),
-    };
-    let mut owner = kind.open(Path::new(&root)).unwrap();
-    owner.write_marker();
-    println!("WRITER_READY");
-    std::io::stdout().flush().unwrap();
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line).unwrap();
-    owner.assert_marker();
-}
-
-#[test]
-fn another_process_is_excluded_and_kill_releases_all_writer_leases() {
-    for kind in [Kind::Core, Kind::Pointer, Kind::Record] {
-        let dir = tempdir().unwrap();
-        let mut child = Process(
-            Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "writer_process_holder",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env("PRAXIS_WRITER_TEST_ROOT", dir.path())
-                .env("PRAXIS_WRITER_TEST_KIND", kind.name())
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap(),
-        );
-        let stdout = child.0.stdout.take().unwrap();
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let reader = std::thread::spawn(move || {
-            let ready = BufReader::new(stdout)
-                .lines()
-                .any(|line| line.is_ok_and(|line| line.contains("WRITER_READY")));
-            let _ = sender.send(ready);
-        });
-        assert!(
-            receiver
-                .recv_timeout(std::time::Duration::from_secs(20))
-                .unwrap(),
-            "child failed to open its writer"
-        );
-        reader.join().unwrap();
-        let before = contents(dir.path());
-        for second in [Kind::Core, Kind::Pointer, Kind::Record] {
-            denied(second.open(dir.path()));
-        }
-        assert_eq!(contents(dir.path()), before);
-        child.0.kill().unwrap();
-        child.0.wait().unwrap();
-        let recovered = kind.open(dir.path()).unwrap();
-        recovered.assert_marker();
-    }
 }
