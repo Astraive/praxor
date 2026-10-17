@@ -1,4 +1,5 @@
 pub mod lsm;
+pub mod root_format;
 pub mod tiered;
 
 pub use lsm::LsmIndex;

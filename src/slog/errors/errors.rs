@@ -4,6 +4,37 @@ use std::path::PathBuf;
 pub enum PraxisError {
     #[error("database is already open for writing: {path}")]
     AlreadyOpen { path: PathBuf },
+    #[error("storage format mismatch at {path}: requested {expected}, detected {detected:?}")]
+    StorageFormatMismatch {
+        path: PathBuf,
+        expected: crate::storage::root_format::RootOwner,
+        detected: crate::storage::root_format::RootKind,
+        evidence: Vec<PathBuf>,
+    },
+    #[error(
+        "ambiguous storage format at {path}: requested {expected}, detected {detected:?}; {reason}"
+    )]
+    StorageFormatAmbiguous {
+        path: PathBuf,
+        expected: crate::storage::root_format::RootOwner,
+        detected: crate::storage::root_format::RootKind,
+        reason: String,
+        evidence: Vec<PathBuf>,
+    },
+    #[error("incomplete storage root at {path}: requested {expected}; {reason}")]
+    StorageFormatIncomplete {
+        path: PathBuf,
+        expected: crate::storage::root_format::RootOwner,
+        reason: String,
+        evidence: Vec<PathBuf>,
+    },
+    #[error("unsupported storage format at {path}: requested {expected}; {reason}")]
+    StorageFormatUnsupported {
+        path: PathBuf,
+        expected: crate::storage::root_format::RootOwner,
+        reason: String,
+        evidence: Vec<PathBuf>,
+    },
     #[error("storage handle requires recovery; close and reopen it before continuing")]
     RecoveryRequired,
     #[error(

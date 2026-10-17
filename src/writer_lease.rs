@@ -78,13 +78,24 @@ impl WriterLease {
         Self::acquire_impl(&path, Some(self.root()))
     }
 
-    pub(crate) fn acquire_record_root(root: impl AsRef<Path>) -> Result<Self> {
-        create_dir_all_durable(root.as_ref())?;
-        let root = std::fs::canonicalize(root)?;
+    pub(crate) fn acquire_record_root(
+        root: impl AsRef<Path>,
+        validate_parent: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<Self> {
+        let root = match std::fs::canonicalize(root.as_ref()) {
+            Ok(root) => root,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::path::absolute(root.as_ref())?
+            }
+            Err(error) => return Err(error.into()),
+        };
         if is_primary_name(&root)
             && let Some(parent) = root.parent()
         {
             let parent_lease = Self::acquire(parent)?;
+            // Admission runs under retained parent ownership before a missing
+            // reserved child or its permanent artifact can be created.
+            validate_parent(parent_lease.root())?;
             let mut child = parent_lease.acquire_primary()?;
             child._parent = Some(Box::new(parent_lease));
             Ok(child)

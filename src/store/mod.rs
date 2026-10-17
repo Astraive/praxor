@@ -110,7 +110,18 @@ impl RecordStore {
 
     /// Open or create a record store rooted at `dir`.
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self> {
-        Self::open_with_lease(WriterLease::acquire_record_root(dir.into())?)
+        let writer_lease = WriterLease::acquire_record_root(dir.into(), |parent| {
+            crate::storage::root_format::require_primary_parent_compatible(
+                parent,
+                crate::storage::root_format::InspectionOptions::for_admission(),
+            )
+        })?;
+        crate::storage::root_format::inspect_storage_root(
+            writer_lease.root(),
+            crate::storage::root_format::InspectionOptions::for_admission(),
+        )?
+        .require_compatible(crate::storage::root_format::RootOwner::Record)?;
+        Self::open_with_lease(writer_lease)
     }
 
     pub(crate) fn open_with_lease(writer_lease: WriterLease) -> Result<Self> {
