@@ -520,7 +520,7 @@ impl<'a> PageOperation<'a> {
                 if !path.is_file() {
                     return corrupt(&path, "typed record overflow file is missing");
                 }
-                self.overflow_store()?.read(&BlobLocation {
+                BlobStore::existing_overflow(path).read(&BlobLocation {
                     family: None,
                     file_id: page_id,
                     offset: offset as u64,
@@ -551,7 +551,7 @@ impl<'a> PageOperation<'a> {
                 if !path.is_file() {
                     return corrupt(&path, "typed record segment file is missing");
                 }
-                self.segment_store(family)?.read(&BlobLocation {
+                BlobStore::existing_segment(path, family, 1).read(&BlobLocation {
                     family: Some(family),
                     file_id: segment_id,
                     offset,
@@ -1138,8 +1138,11 @@ fn decode_typed_record(bytes: &[u8], source: &Path) -> Result<Vec<TypedFieldCell
     }
     let len = u32::from_le_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]) as usize;
     let expected = u32::from_le_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]);
-    if bytes.len() < 13 + len {
-        return corrupt(source, "truncated typed record payload");
+    if len.checked_add(13) != Some(bytes.len()) {
+        return corrupt(
+            source,
+            "typed record payload length does not match its envelope",
+        );
     }
     let payload = &bytes[13..13 + len];
     let actual = crc32c(payload);
@@ -1153,17 +1156,93 @@ fn decode_typed_record(bytes: &[u8], source: &Path) -> Result<Vec<TypedFieldCell
     }
     let mut reader = BinaryReader::new(payload, source.to_path_buf());
     let count = reader.read_u32()? as usize;
-    let mut cells = Vec::with_capacity(count);
+    // Even an empty inline cell needs a field tag/id, type, storage class,
+    // length and pointer tag. Prove the count from actual input before reserve.
+    if count > reader.remaining() / 12 {
+        return corrupt(source, "typed cell count exceeds remaining payload");
+    }
+    let mut cells = Vec::new();
+    cells
+        .try_reserve_exact(count)
+        .map_err(|_| PraxisError::Corrupt {
+            path: source.to_path_buf(),
+            reason: "cannot reserve validated typed cell count".to_string(),
+        })?;
     for _ in 0..count {
-        cells.push(TypedFieldCell {
+        let cell = TypedFieldCell {
             field: read_field(&mut reader, source)?,
             type_code: tag_to_type_code(reader.read_u8()?, source)?,
             storage_class: tag_to_storage_class(reader.read_u8()?, source)?,
-            inline_bytes: reader.read_len_bytes()?,
+            inline_bytes: copy_typed_bytes(reader.read_len_slice()?, source)?,
             pointer: read_external_pointer(&mut reader, source)?,
-        });
+        };
+        validate_typed_cell(&cell, source)?;
+        cells.push(cell);
+    }
+    if reader.remaining() != 0 {
+        return corrupt(source, "trailing bytes in typed record payload");
     }
     Ok(cells)
+}
+
+fn copy_typed_bytes(bytes: &[u8], source: &Path) -> Result<Vec<u8>> {
+    let mut copied = Vec::new();
+    copied
+        .try_reserve_exact(bytes.len())
+        .map_err(|_| PraxisError::Corrupt {
+            path: source.to_path_buf(),
+            reason: "cannot reserve validated typed field bytes".to_string(),
+        })?;
+    copied.extend_from_slice(bytes);
+    Ok(copied)
+}
+
+fn validate_typed_cell(cell: &TypedFieldCell, source: &Path) -> Result<()> {
+    let valid = match (cell.storage_class, &cell.pointer) {
+        (StorageClass::Inline, None) => true,
+        (
+            StorageClass::External,
+            Some(ExternalPointer::Overflow {
+                page_id,
+                offset,
+                len,
+                ..
+            }),
+        ) => {
+            cell.inline_bytes.is_empty()
+                && *page_id == 1
+                && *offset >= 5
+                && u64::from(*offset)
+                    .checked_add(8)
+                    .and_then(|end| end.checked_add(u64::from(*len)))
+                    .is_some()
+        }
+        (
+            StorageClass::Segment,
+            Some(ExternalPointer::Segment {
+                segment_id,
+                offset,
+                len,
+                ..
+            }),
+        ) => {
+            cell.inline_bytes.is_empty()
+                && *segment_id == 1
+                && *offset >= 5
+                && offset
+                    .checked_add(8)
+                    .and_then(|end| end.checked_add(u64::from(*len)))
+                    .is_some()
+        }
+        (StorageClass::Catalog, Some(ExternalPointer::Catalog { .. })) => {
+            cell.inline_bytes.is_empty()
+        }
+        _ => false,
+    };
+    if !valid {
+        return corrupt(source, "typed storage class and pointer shape do not agree");
+    }
+    Ok(())
 }
 
 fn pointer_family(pointer: Option<ExternalPointer>) -> Result<SegmentFamily> {
@@ -1189,11 +1268,18 @@ fn write_field(writer: &mut BinaryWriter, field: FieldId) {
 }
 
 fn read_field(reader: &mut BinaryReader<'_>, source: &Path) -> Result<FieldId> {
-    match reader.read_u8()? {
-        1 => Ok(FieldId::Fixed(Aid(reader.read_u32()? as u16))),
-        2 => Ok(FieldId::Dynamic(Did(reader.read_u32()? as u16))),
-        tag => corrupt(source, &format!("invalid typed field tag {tag}")),
+    let tag = reader.read_u8()?;
+    if !matches!(tag, 1 | 2) {
+        return corrupt(source, &format!("invalid typed field tag {tag}"));
     }
+    let id = u16::try_from(reader.read_u32()?).map_err(|_| PraxisError::Corrupt {
+        path: source.to_path_buf(),
+        reason: "typed field ID exceeds its identifier range".to_string(),
+    })?;
+    Ok(match tag {
+        1 => FieldId::Fixed(Aid(id)),
+        _ => FieldId::Dynamic(Did(id)),
+    })
 }
 
 fn write_external_pointer(writer: &mut BinaryWriter, pointer: Option<ExternalPointer>) {
@@ -1250,8 +1336,11 @@ fn read_external_pointer(
             len: reader.read_u32()?,
         })),
         3 => {
-            let catalog = String::from_utf8(reader.read_len_bytes()?)
-                .map_err(|err| PraxisError::InvalidConfig(err.to_string()))?;
+            let catalog = String::from_utf8(copy_typed_bytes(reader.read_len_slice()?, source)?)
+                .map_err(|_| PraxisError::Corrupt {
+                    path: source.to_path_buf(),
+                    reason: "typed catalog name is not UTF-8".to_string(),
+                })?;
             Ok(Some(ExternalPointer::Catalog {
                 catalog,
                 key: reader.read_u64()?,
