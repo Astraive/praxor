@@ -153,7 +153,13 @@ impl PraxisEngine {
     }
 
     pub fn pin_snapshot(&self) -> crate::memory::PinnedSnapshot {
-        self.inner.snapshots.pin()
+        self.try_pin_snapshot()
+            .expect("snapshot pin identifiers exhausted")
+    }
+
+    /// Register the current published view, failing without reusing a live pin ID.
+    pub fn try_pin_snapshot(&self) -> Result<crate::memory::PinnedSnapshot> {
+        self.inner.snapshots.try_pin()
     }
 }
 

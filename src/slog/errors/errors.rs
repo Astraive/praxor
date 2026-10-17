@@ -2,6 +2,10 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PraxisError {
+    #[error("snapshot pin identifiers exhausted")]
+    SnapshotPinExhausted,
+    #[error("record snapshot belongs to a different owner or authority: {reason}")]
+    ForeignRecordSnapshot { reason: &'static str },
     #[error("database is already open for writing: {path}")]
     AlreadyOpen { path: PathBuf },
     #[error("record-authority database requires CoreDatabase::open: {path}")]
