@@ -78,6 +78,7 @@ fn engine_open_completes_pending_compaction_cleanup_from_manifest() {
     });
     manifest_store.save(&manifest).unwrap();
 
+    drop(store);
     let _engine = StorageEngine::open(dir.path(), 1024 * 1024).unwrap();
 
     assert!(!primary_root.join("records").join("00000000.trec").exists());
@@ -109,6 +110,7 @@ fn engine_open_marks_started_without_install_as_aborted() {
     });
     manifest_store.save(&manifest).unwrap();
 
+    drop(store);
     let _engine = StorageEngine::open(dir.path(), 1024 * 1024).unwrap();
 
     assert!(primary_root.join("records").join("00000000.trec").exists());

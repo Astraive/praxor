@@ -25,6 +25,7 @@ use crate::types::{
 };
 use crate::values::ValueLog;
 use crate::wal::{Wal, WalRecord};
+use crate::writer_lease::{LOCK_FILE_NAME, WriterLease, lock_artifact_exists};
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, HashSet};
@@ -45,6 +46,7 @@ mod cf_generation_tests;
 impl PraxisEngine {
     pub fn open(config: PraxisConfig) -> Result<Self> {
         config.validate()?;
+        let writer_lease = WriterLease::acquire(&config.data_dir)?;
         slog::Logger::init(config.logging.clone());
         let accelerator: Arc<dyn Accelerator> = match config.accelerator {
             AcceleratorBackend::Cpu => Arc::new(CpuAccelerator),
@@ -52,7 +54,7 @@ impl PraxisEngine {
             AcceleratorBackend::Vulkan => Arc::new(GpuAccelerator::new(GpuBackendKind::Vulkan)),
             AcceleratorBackend::Metal => Arc::new(GpuAccelerator::new(GpuBackendKind::Metal)),
         };
-        let layout = DiskLayout::create(&config.data_dir)?;
+        let layout = DiskLayout::create(writer_lease.root())?;
         let manifest_store = ManifestStore::new(layout.manifest_path());
         let mut manifest = manifest_store.load_or_create(&config)?;
         if manifest.effective_config != config.persisted() {
@@ -182,6 +184,7 @@ impl PraxisEngine {
                 snapshots,
                 metrics,
                 accelerator,
+                _writer_lease: writer_lease,
             }),
         };
         slog::info(
@@ -1470,12 +1473,17 @@ impl PraxisEngine {
 
     pub fn backup_to(&self, backup_dir: impl AsRef<Path>) -> Result<()> {
         let started = std::time::Instant::now();
+        let source_primary = lease_existing_primary(&self.inner._writer_lease)?;
+        validate_copy_tree(
+            self.inner.layout.root(),
+            source_primary.as_ref().map(WriterLease::root),
+            false,
+        )?;
+        let (destination, _primary) =
+            acquire_copy_destination(self.inner.layout.root(), backup_dir.as_ref())?;
         self.checkpoint()?;
-        let backup_dir = backup_dir.as_ref();
-        if backup_dir.exists() {
-            fs::remove_dir_all(backup_dir)?;
-        }
-        fs::create_dir_all(backup_dir)?;
+        let backup_dir = destination.root();
+        clear_copy_destination(backup_dir)?;
         copy_dir_recursive(self.inner.layout.root(), backup_dir)?;
         slog::info(
             "backup_complete",
@@ -1492,18 +1500,22 @@ impl PraxisEngine {
         target_dir: impl AsRef<Path>,
     ) -> Result<()> {
         let backup_dir = backup_dir.as_ref();
-        let target_dir = target_dir.as_ref();
         if !backup_dir.exists() {
             return Err(PraxisError::InvalidConfig(format!(
                 "backup directory does not exist: {}",
                 backup_dir.to_string_lossy()
             )));
         }
-        if target_dir.exists() {
-            fs::remove_dir_all(target_dir)?;
-        }
-        fs::create_dir_all(target_dir)?;
-        copy_dir_recursive(backup_dir, target_dir)?;
+        let source = WriterLease::acquire(backup_dir)?;
+        let source_primary = lease_existing_primary(&source)?;
+        validate_copy_tree(
+            source.root(),
+            source_primary.as_ref().map(WriterLease::root),
+            false,
+        )?;
+        let (destination, _primary) = acquire_copy_destination(source.root(), target_dir.as_ref())?;
+        clear_copy_destination(destination.root())?;
+        copy_dir_recursive(source.root(), destination.root())?;
         Ok(())
     }
 
@@ -1635,13 +1647,123 @@ fn apply_merge_operator(name: &str, current: &[u8], delta: &[u8]) -> Option<Vec<
 fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
     for entry in fs::read_dir(source)? {
         let entry = entry?;
+        if entry.file_name() == LOCK_FILE_NAME {
+            continue;
+        }
         let src = entry.path();
         let dst = destination.join(entry.file_name());
-        if src.is_dir() {
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            return Err(PraxisError::InvalidConfig(format!(
+                "backup source contains a symbolic link: {}",
+                src.display()
+            )));
+        }
+        if kind.is_dir() {
             fs::create_dir_all(&dst)?;
             copy_dir_recursive(&src, &dst)?;
         } else {
             fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
+}
+
+fn acquire_copy_destination(
+    source: &Path,
+    destination: &Path,
+) -> Result<(WriterLease, Option<WriterLease>)> {
+    let source = fs::canonicalize(source)?;
+    crate::io::create_dir_all_durable(destination)?;
+    let destination = fs::canonicalize(destination)?;
+    if source.starts_with(&destination) || destination.starts_with(&source) {
+        return Err(PraxisError::InvalidConfig(
+            "backup and restore require disjoint source and destination roots".to_string(),
+        ));
+    }
+    let lease = WriterLease::acquire(destination)?;
+    // A standalone primary store can own this subtree independently. Retain
+    // its lease before clearing any destination files, just as StorageEngine
+    // does before opening its nested RecordStore.
+    let primary_lease = lease_existing_primary(&lease)?;
+    validate_copy_tree(
+        lease.root(),
+        primary_lease.as_ref().map(WriterLease::root),
+        true,
+    )?;
+    Ok((lease, primary_lease))
+}
+
+fn lease_existing_primary(parent: &WriterLease) -> Result<Option<WriterLease>> {
+    let path = parent.root().join("primary");
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            if path.join("MANIFEST").exists() || path.join("MANIFEST.store").exists() {
+                return Err(PraxisError::InvalidConfig(
+                    "the reserved primary subtree contains an independent database".to_string(),
+                ));
+            }
+            parent.acquire_primary().map(Some)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn validate_copy_tree(root: &Path, primary: Option<&Path>, destination: bool) -> Result<()> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if dir != root
+            && lock_artifact_exists(&dir.join(LOCK_FILE_NAME))?
+            && Some(dir.as_path()) != primary
+        {
+            return Err(PraxisError::InvalidConfig(format!(
+                "backup/restore refuses an unrelated nested writer root: {}",
+                dir.display()
+            )));
+        }
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_symlink() {
+                if !destination {
+                    return Err(PraxisError::InvalidConfig(format!(
+                        "backup source contains a symbolic link: {}",
+                        entry.path().display()
+                    )));
+                }
+            } else if kind.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn clear_copy_destination(root: &Path) -> Result<()> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.file_name() == LOCK_FILE_NAME {
+            continue;
+        }
+        let path = entry.path();
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            // remove_dir removes a directory link itself on Windows. Never
+            // recurse through a destination link into another owned root.
+            #[cfg(windows)]
+            if path.is_dir() {
+                fs::remove_dir(path)?;
+                continue;
+            }
+            fs::remove_file(path)?;
+        } else if kind.is_dir() {
+            clear_copy_destination(&path)?;
+            if fs::read_dir(&path)?.next().is_none() {
+                fs::remove_dir(path)?;
+            }
+        } else {
+            fs::remove_file(path)?;
         }
     }
     Ok(())

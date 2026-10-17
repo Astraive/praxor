@@ -1644,6 +1644,7 @@ fn fault_injection_crash_during_compaction_leaves_coherent_index() {
         )
         .unwrap();
     let _compaction_report = engine.compact_indexes().unwrap();
+    drop(engine);
 
     // Simulate crash: truncate or corrupt index snapshot (if one was written).
     // In this test, the LSM snapshot may be in JSON or binary format; we corrupt

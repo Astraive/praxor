@@ -38,4 +38,6 @@ pub(crate) struct EngineInner {
     pub(crate) snapshots: Arc<SnapshotManager>,
     pub(crate) metrics: EngineMetrics,
     pub(crate) accelerator: Arc<dyn Accelerator>,
+    // Declared last so file-backed engine state is dropped before its lease.
+    pub(crate) _writer_lease: crate::writer_lease::WriterLease,
 }
