@@ -5,6 +5,146 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 #[test]
+fn core_service_and_client_share_real_append_and_sync_failure_poison() {
+    use crate::api::service::{
+        BatchRecordInput, CorePrimitiveStorageService, CoreRecordServiceCapability,
+        GetRecordRequest, PutRecordBatchRequest, RequestContext,
+    };
+    use crate::core_records::{CoreDatabase, RecordAuthorityOptions};
+    use crate::sdk::LocalCorepraxisClient;
+    for fail_sync in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = PraxisConfig::new(dir.path());
+        config.wal_sync_policy = WalSyncPolicy::GroupCommit;
+        let db =
+            CoreDatabase::create_fresh(config.clone(), RecordAuthorityOptions { indexes: vec![] })
+                .unwrap();
+        let service = CorePrimitiveStorageService::new(db.records());
+        let client = LocalCorepraxisClient::new(service.clone());
+        let prior = client
+            .put_record(RequestContext::new("prior"), b"prior".to_vec(), vec![])
+            .unwrap()
+            .record_id;
+        let engine = db.kv();
+        let sequence = engine.snapshot().sequence;
+        let writer = engine.inner.write_serialization.lock();
+        let wal_path = engine.inner.wal.lock().path().to_path_buf();
+        let before = std::fs::read(&wal_path).unwrap();
+        engine.inner.wal.lock().file = if fail_sync {
+            #[cfg(windows)]
+            let device = "NUL";
+            #[cfg(not(windows))]
+            let device = "/dev/null";
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(device)
+                .unwrap()
+        } else {
+            File::open(&wal_path).unwrap()
+        };
+        let mut joins = Vec::new();
+        for worker in 0..4 {
+            let service = service.clone();
+            let client = client.clone();
+            joins.push(std::thread::spawn(move || {
+                let request = PutRecordBatchRequest {
+                    context: RequestContext::new("failing-batch"),
+                    records: vec![
+                        BatchRecordInput {
+                            value: b"a".to_vec(),
+                            indexes: vec![],
+                        },
+                        BatchRecordInput {
+                            value: b"b".to_vec(),
+                            indexes: vec![],
+                        },
+                    ],
+                };
+                if worker % 2 == 0 {
+                    service.put_record_batch(request)
+                } else {
+                    client.put_record_batch(request.context, request.records)
+                }
+            }));
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while engine
+            .inner
+            .metrics
+            .write_admissions
+            .load(Ordering::Relaxed)
+            != 5
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        drop(writer);
+        for join in joins {
+            assert!(matches!(
+                join.join().unwrap(),
+                Err(PraxisError::RecoveryRequired)
+            ));
+        }
+        assert_eq!(engine.snapshot().sequence, sequence);
+        assert_eq!(std::fs::read(wal_path).unwrap(), before);
+        assert!(matches!(
+            service.get_record(GetRecordRequest {
+                context: RequestContext::new("poison"),
+                record_id: prior
+            }),
+            Err(PraxisError::RecoveryRequired)
+        ));
+        assert!(matches!(
+            client.get_record(RequestContext::new("poison"), prior),
+            Err(PraxisError::RecoveryRequired)
+        ));
+        assert!(matches!(
+            client.get_record(
+                RequestContext::new("missing-on-poison"),
+                crate::RecordId(999)
+            ),
+            Err(PraxisError::RecoveryRequired)
+        ));
+        assert!(matches!(
+            client.put_record_batch(RequestContext::new("empty-on-poison"), vec![]),
+            Err(PraxisError::RecoveryRequired)
+        ));
+        assert!(matches!(
+            client.delete_record(RequestContext::new("delete-on-poison"), prior),
+            Err(PraxisError::RecoveryRequired)
+        ));
+        assert!(matches!(
+            client.flush(RequestContext::new("flush-on-poison")),
+            Err(PraxisError::RecoveryRequired)
+        ));
+        assert!(matches!(
+            client.records().fetch(prior),
+            Err(PraxisError::RecoveryRequired)
+        ));
+        assert!(matches!(
+            engine.put("user", "value"),
+            Err(PraxisError::RecoveryRequired)
+        ));
+        // Static support does not imply owner health or readiness.
+        assert_eq!(
+            client.require_capability(CoreRecordServiceCapability::LogicalCrud),
+            Ok(())
+        );
+        drop(client);
+        drop(service);
+        drop(engine);
+        drop(db);
+        let reopened = CoreDatabase::open(config).unwrap();
+        assert_eq!(reopened.records().fetch(prior).unwrap(), b"prior");
+        assert_eq!(
+            reopened.records().put(b"next", &[]).unwrap(),
+            crate::RecordId(2)
+        );
+    }
+}
+
+#[test]
 fn public_record_batches_and_flush_share_real_io_failure_poison() {
     use crate::core_records::{CoreDatabase, RecordAuthorityOptions};
     use crate::store::BatchRecord;

@@ -11,6 +11,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+mod core_records;
+pub use core_records::{
+    CorePrimitiveStorageService, CoreRecordServiceCapability,
+    UnsupportedCoreRecordServiceCapability,
+};
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RequestContext {
     pub request_id: String,
