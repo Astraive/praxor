@@ -236,7 +236,7 @@ impl PraxisEngine {
     }
 
     pub fn begin_transaction(&self) -> OptimisticTransaction {
-        OptimisticTransaction::new(self.clone(), self.snapshot())
+        OptimisticTransaction::new(self.clone(), self.pin_snapshot())
     }
 
     pub(crate) fn commit_optimistic_transaction(
