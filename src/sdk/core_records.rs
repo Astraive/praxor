@@ -22,6 +22,8 @@ impl LocalCorepraxisClient {
         Self { service }
     }
 
+    /// Share the service owner for process-local retained views and requested
+    /// history reclaim, without a token DTO or independent connection.
     pub fn records(&self) -> CoreRecordStore {
         self.service.records()
     }

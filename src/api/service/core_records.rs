@@ -11,8 +11,8 @@ use crate::store::BatchRecord;
 use std::time::Instant;
 
 /// Static support of this bounded core record service, independent of owner
-/// health, readiness or authorization. Raw mapping ceilings are supported;
-/// historical payload views and dynamic mapping registries are not.
+/// health, readiness or authorization. Retained historical payload views are
+/// available through `records()`; numeric raw ceilings do not retain payloads.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CoreRecordServiceCapability {
     LogicalCrud,
@@ -34,9 +34,10 @@ pub struct UnsupportedCoreRecordServiceCapability {
 /// Cloneable logical service sharing the injected store's lease, health,
 /// commit queue and WAL. Construction does no IO and never opens an owner.
 ///
-/// Requests reuse the legacy logical DTOs, but physical reports, snapshots,
-/// compaction and plugin attachment are deliberately absent. A bare RecordId
-/// is interpreted within the injected database; it is not a cross-database token.
+/// Requests reuse the legacy logical DTOs. `records()` also exposes retained
+/// process-local views and requested history reclaim on the same owner, without
+/// adding a token or compaction DTO. A bare RecordId is interpreted within the
+/// injected database; it is not a cross-database token.
 #[derive(Clone)]
 pub struct CorePrimitiveStorageService {
     records: CoreRecordStore,
@@ -47,8 +48,8 @@ impl CorePrimitiveStorageService {
         Self { records }
     }
 
-    /// Retain the same owner and expose its existing mapping operations,
-    /// including combined fetches that use one core read view.
+    /// Retain the same owner and expose mapping operations plus process-local
+    /// snapshot pin/read/reclaim; no independent owner or wire token is made.
     pub fn records(&self) -> CoreRecordStore {
         self.records.clone()
     }
@@ -61,7 +62,8 @@ impl CorePrimitiveStorageService {
         match capability {
             CoreRecordServiceCapability::LogicalCrud
             | CoreRecordServiceCapability::FixedMappingIndex
-            | CoreRecordServiceCapability::DurableFlush => Ok(()),
+            | CoreRecordServiceCapability::DurableFlush
+            | CoreRecordServiceCapability::HistoricalPayload => Ok(()),
             _ => Err(UnsupportedCoreRecordServiceCapability { capability }),
         }
     }
