@@ -5,6 +5,7 @@ use super::intent::{IntentKind, Mapping, NewRecord, RecordIntent, RecordResult};
 use super::schema::corrupt;
 use super::snapshot::CoreRecordSnapshot;
 use crate::memory::PinnedSnapshot;
+use crate::recovery::GcReport;
 use crate::store::{BatchRecord, IndexInsert, RecordId};
 use crate::types::ColumnFamily;
 use crate::{PraxisEngine, PraxisError, Result};
@@ -16,6 +17,14 @@ use std::sync::atomic::Ordering;
 #[derive(Clone)]
 pub struct CoreRecordStore {
     engine: PraxisEngine,
+}
+
+/// Result of one requested protected-history rewrite and ordinary whole-file GC.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RecordHistoryReclaimReport {
+    pub rewrite_performed: bool,
+    pub protected_versions_removed: u64,
+    pub gc: GcReport,
 }
 
 impl CoreRecordStore {
@@ -439,6 +448,14 @@ impl CoreRecordStore {
         self.engine.durable_barrier()?;
         self.engine.flush()?;
         Ok(())
+    }
+
+    /// Remove protected versions needed by neither the latest view nor any
+    /// registered core pin. Physical bytes are reclaimed only by whole-file GC.
+    pub fn reclaim_snapshot_history(&self) -> Result<RecordHistoryReclaimReport> {
+        self.engine.inner.group_commit.ensure_writable()?;
+        self.engine.durable_barrier()?;
+        self.engine.reclaim_record_snapshot_history()
     }
 }
 

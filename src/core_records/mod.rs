@@ -16,7 +16,7 @@ mod transition_tests;
 pub use database::CoreDatabase;
 pub use schema::{MappingDescriptor, RecordAuthority, RecordAuthorityOptions, RecordRoleBinding};
 pub use snapshot::CoreRecordSnapshot;
-pub use store::CoreRecordStore;
+pub use store::{CoreRecordStore, RecordHistoryReclaimReport};
 
 pub(crate) fn ensure_public_cf(
     manifest: &crate::manifest::Manifest,
