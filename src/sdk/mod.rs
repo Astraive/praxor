@@ -88,10 +88,12 @@ impl LocalpraxisClient {
 }
 
 impl LocalPagepraxisClient {
-    pub fn open(root: impl Into<PathBuf>) -> Self {
-        Self {
-            service: PagePrimitiveStorageService::open(root),
-        }
+    pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
+        Ok(Self::new(PagePrimitiveStorageService::open(root)?))
+    }
+
+    pub fn new(service: PagePrimitiveStorageService) -> Self {
+        Self { service }
     }
 
     pub fn put_page_record(

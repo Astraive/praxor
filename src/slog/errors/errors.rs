@@ -37,6 +37,8 @@ pub enum PraxisError {
     },
     #[error("storage handle requires recovery; close and reopen it before continuing")]
     RecoveryRequired,
+    #[error("page storage at {path} requires explicit recovery: {reason}")]
+    PageRecoveryRequired { path: PathBuf, reason: String },
     #[error(
         "index {index} does not support raw sequence snapshot reads; register a plugin with an explicit snapshot capability"
     )]

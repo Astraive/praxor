@@ -203,19 +203,51 @@ impl RecordPage {
         let kind = tag_to_kind(reader.read_u8()?, &source)?;
         let slot_count = reader.read_u32()? as usize;
         let payload_len = reader.read_u32()? as usize;
+        let required_bytes = slot_count
+            .checked_mul(13)
+            .and_then(|slots| slots.checked_add(payload_len));
+        if required_bytes.is_none_or(|required| required > reader.remaining())
+            || slot_count > payload.len().saturating_sub(21) / 13
+            || payload_len
+                .checked_add(slot_count.saturating_mul(16))
+                .is_none_or(|required| required > page_size as usize)
+        {
+            return corrupt(&source, "page slot count or payload exceeds page bounds");
+        }
         let mut slots = Vec::with_capacity(slot_count);
+        let mut identities = std::collections::BTreeSet::new();
         for _ in 0..slot_count {
+            let sid = match u16::try_from(reader.read_u32()?) {
+                Ok(raw) if raw != 0 => Sid(raw),
+                _ => {
+                    return corrupt(
+                        &source,
+                        "physical slot ID exceeds its nonzero identifier range",
+                    );
+                }
+            };
+            let offset = reader.read_u32()?;
+            let len = reader.read_u32()?;
+            let tombstone = reader.read_u8()?;
+            if !identities.insert(sid)
+                || tombstone > 1
+                || (offset as usize)
+                    .checked_add(len as usize)
+                    .is_none_or(|end| end > payload_len)
+            {
+                return corrupt(
+                    &source,
+                    "duplicate slot identity or invalid physical slot bounds",
+                );
+            }
             slots.push(SlotDirectoryEntry {
-                sid: Sid(reader.read_u32()? as u16),
-                offset: reader.read_u32()?,
-                len: reader.read_u32()?,
-                tombstone: reader.read_u8()? != 0,
+                sid,
+                offset,
+                len,
+                tombstone: tombstone != 0,
             });
         }
-        let mut stored_payload = vec![0_u8; payload_len];
-        for byte in &mut stored_payload {
-            *byte = reader.read_u8()?;
-        }
+        let stored_payload = reader.read_slice(payload_len)?.to_vec();
         let mut page = Self {
             header: PageHeader {
                 page_size,
