@@ -1,9 +1,13 @@
-//! Strict syntax stage for the bounded, engine-owned SELECT compiler.
-//! Binding, execution, and the public entrypoint follow in later checkpoints.
+//! Bounded syntax, detached binding, and pure in-memory SELECT row semantics.
+//! The public compiler and distinct EXPLAIN artifact follow in later checkpoints.
 mod binder;
 mod catalog;
+mod evaluator;
 mod lexer;
 mod syntax;
+
+#[cfg(test)]
+mod stage4_tests;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ByteSpan {
@@ -539,6 +543,10 @@ pub(super) enum QueryCompileError {
     StaleCatalog,
     #[error("foreign catalog view")]
     ForeignCatalog,
+    #[error("row data contract violation: {code}")]
+    DataContract { code: &'static str },
+    #[error("invalid bound predicate: {code}")]
+    InvalidBoundPlan { code: &'static str },
     #[error("query limit exceeded: {code}")]
     LimitExceeded {
         code: &'static str,
