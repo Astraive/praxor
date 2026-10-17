@@ -17,6 +17,39 @@ use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
 
+/// Add exact replay duplicates, which can be reclaimed at every raw sequence
+/// ceiling. Increasing sequence histories alone are not safe pruning jobs.
+fn append_replayed_index_duplicates(
+    engine: &mut StorageEngine,
+    index_dir: &std::path::Path,
+    index_type: &str,
+    duplicates: usize,
+) {
+    engine.flush().unwrap();
+    let entry = StorageWal::replay(engine.wal_path())
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find(|entry| entry.index_type == index_type && entry.key == b"hot")
+        .unwrap();
+    let mut index: Box<dyn IndexPlugin> = match index_type {
+        "kv" => Box::new(LsmIndex::open(index_type, index_dir).unwrap()),
+        "bt" => Box::new(BTreeIndex::open(index_type, index_dir).unwrap()),
+        _ => panic!("unexpected test index {index_type}"),
+    };
+    for _ in 0..duplicates {
+        match entry.rid {
+            Some(rid) => index
+                .put_with_sequence(&entry.key, rid, entry.sequence)
+                .unwrap(),
+            None => index
+                .delete_with_sequence(&entry.key, entry.sequence)
+                .unwrap(),
+        }
+    }
+    engine.register_index(index_type, "default", index).unwrap();
+}
+
 // ──────────────────────────────────────────────
 // 1.  Single-copy guarantee across multiple indexes
 // ──────────────────────────────────────────────
@@ -889,7 +922,7 @@ fn storage_engine_stats_report_per_index_counts() {
 }
 
 #[test]
-fn storage_engine_compact_indexes_reports_version_reduction() {
+fn storage_engine_compact_indexes_preserves_required_snapshot_versions() {
     let dir = tempdir().unwrap();
     let index_dir = dir.path().join("indexes");
 
@@ -917,7 +950,19 @@ fn storage_engine_compact_indexes_reports_version_reduction() {
     let reports = engine.compact_indexes().unwrap();
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].index_type, "kv");
-    assert!(reports[0].after.versions <= reports[0].before.versions);
+    assert_eq!(reports[0].after.versions, reports[0].before.versions);
+    let put_sequence = StorageWal::replay(engine.wal_path())
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.index_type == "kv" && entry.rid == Some(rid1))
+        .unwrap()
+        .sequence;
+    assert_eq!(
+        engine
+            .lookup_rid_at("kv", b"hot-key", put_sequence)
+            .unwrap(),
+        Some(rid1)
+    );
 
     let after = engine.stats();
     assert_eq!(after.index_compaction_runs.get("kv"), Some(&1));
@@ -935,7 +980,7 @@ fn storage_engine_compact_selected_indexes_errors_on_unknown() {
 }
 
 #[test]
-fn storage_engine_suggests_index_compactions_from_version_pressure() {
+fn storage_engine_does_not_suggest_pruning_required_snapshot_history() {
     let dir = tempdir().unwrap();
     let index_dir = dir.path().join("indexes");
     let mut engine = StorageEngine::open(dir.path(), 1024 * 1024).unwrap();
@@ -954,9 +999,8 @@ fn storage_engine_suggests_index_compactions_from_version_pressure() {
     engine.delete_index("kv", b"hot").unwrap();
 
     let jobs = engine.suggest_index_compactions(2);
-    assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[0].index_type, "kv");
-    assert!(jobs[0].estimated_versions_pruned >= 2);
+    assert!(jobs.is_empty());
+    assert!(engine.suggest_index_compactions(0).is_empty());
 }
 
 #[test]
@@ -1045,12 +1089,31 @@ fn maintenance_cycle_suggests_and_executes_compaction_end_to_end() {
     engine.put_index("kv", b"hot", r1).unwrap();
     engine.put_index("kv", b"hot", r2).unwrap();
     engine.delete_index("kv", b"hot").unwrap();
+    append_replayed_index_duplicates(&mut engine, &index_dir, "kv", 2);
 
     let cycle = engine.run_maintenance_cycle(2).unwrap();
     assert_eq!(cycle.suggested.len(), 1);
     assert_eq!(cycle.suggested[0].index_type, "kv");
     assert_eq!(cycle.executed.len(), 1);
     assert_eq!(cycle.executed[0].index_type, "kv");
+    assert_eq!(cycle.suggested[0].estimated_versions_pruned, 2);
+    assert_eq!(
+        cycle.executed[0].before.versions - cycle.executed[0].after.versions,
+        2
+    );
+    assert!(engine.suggest_index_compactions(0).is_empty());
+    assert_eq!(engine.lookup_rid("kv", b"hot").unwrap(), None);
+    engine.flush().unwrap();
+    drop(engine);
+    let mut engine = StorageEngine::open(dir.path(), 1024 * 1024).unwrap();
+    engine
+        .register_index(
+            "kv",
+            "default",
+            Box::new(LsmIndex::open("kv", &index_dir).unwrap()),
+        )
+        .unwrap();
+    assert_eq!(engine.lookup_rid("kv", b"hot").unwrap(), None);
     let stats = engine.stats();
     assert_eq!(stats.index_compaction_runs.get("kv"), Some(&1));
 }
@@ -1117,11 +1180,13 @@ fn maintenance_suggestions_are_deterministically_ordered() {
 
     let r1 = engine.put(b"a", &[]).unwrap();
     let r2 = engine.put(b"b", &[]).unwrap();
-    // Both indexes receive the same stale-version pressure (1 stale version).
+    // Both indexes receive one safely reclaimable replay duplicate.
     engine.put_index("kv", b"hot", r1).unwrap();
     engine.put_index("kv", b"hot", r2).unwrap();
     engine.put_index("bt", b"hot", r1).unwrap();
     engine.put_index("bt", b"hot", r2).unwrap();
+    append_replayed_index_duplicates(&mut engine, &index_dir, "kv", 1);
+    append_replayed_index_duplicates(&mut engine, &index_dir, "bt", 1);
 
     let suggestions = engine.suggest_index_compactions(1);
     assert_eq!(suggestions.len(), 2);
@@ -1161,6 +1226,8 @@ fn maintenance_cycle_with_options_respects_max_jobs() {
     engine.put_index("kv", b"hot", r2).unwrap();
     engine.put_index("bt", b"hot", r1).unwrap();
     engine.put_index("bt", b"hot", r2).unwrap();
+    append_replayed_index_duplicates(&mut engine, &index_dir, "kv", 1);
+    append_replayed_index_duplicates(&mut engine, &index_dir, "bt", 1);
 
     let report = engine
         .run_maintenance_cycle_with_options(MaintenanceCycleOptions {
@@ -1229,6 +1296,7 @@ fn storage_runtime_executes_maintenance_cycles_in_background() {
     engine.put_index("kv", b"hot", r1).unwrap();
     engine.put_index("kv", b"hot", r2).unwrap();
     engine.delete_index("kv", b"hot").unwrap();
+    append_replayed_index_duplicates(&mut engine, &index_dir, "kv", 1);
 
     let shared: SharedStorageEngine = Arc::new(parking_lot::Mutex::new(engine));
     let mut runtime = StorageMaintenanceRuntimeController::default();

@@ -4,7 +4,8 @@ pub mod binary;
 pub mod manager;
 pub mod page;
 
-use super::{IndexPlugin, IndexStats};
+use super::history::{reclaimable_versions, retain_snapshot_versions};
+use super::{IndexPlugin, IndexSnapshotCapability, IndexStats};
 use crate::errors::{PraxisError, Result};
 use crate::io::{BinaryReader, BinaryWriter, crc32c};
 use crate::store::RecordId;
@@ -178,6 +179,10 @@ impl IndexPlugin for BTreeIndex {
             .and_then(|versions| latest_visible(versions, sequence))
     }
 
+    fn snapshot_read_capability(&self) -> IndexSnapshotCapability {
+        IndexSnapshotCapability::RawSequenceCeilings
+    }
+
     fn delete(&mut self, key: &[u8]) -> Result<()> {
         let sequence = self.next_seq();
         self.delete_with_sequence(key, sequence)
@@ -214,12 +219,9 @@ impl IndexPlugin for BTreeIndex {
 
     fn compact(&mut self) -> Result<()> {
         for versions in self.entries.values_mut() {
-            if let Some(last) = versions.last().copied() {
-                versions.clear();
-                versions.push(last);
-            }
+            retain_snapshot_versions(versions, |version| version.sequence);
         }
-        self.entries.retain(|_, versions| versions[0].rid.is_some());
+        self.entries.retain(|_, versions| !versions.is_empty());
         self.refresh_pages();
         Ok(())
     }
@@ -235,6 +237,13 @@ impl IndexPlugin for BTreeIndex {
             live_keys,
             versions,
         }
+    }
+
+    fn reclaimable_version_count(&self) -> u64 {
+        self.entries
+            .values()
+            .map(|versions| reclaimable_versions(versions, |version| version.sequence))
+            .sum()
     }
 }
 

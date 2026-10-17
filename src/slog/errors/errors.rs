@@ -4,6 +4,10 @@ use std::path::PathBuf;
 pub enum PraxisError {
     #[error("storage handle requires recovery; close and reopen it before continuing")]
     RecoveryRequired,
+    #[error(
+        "index {index} does not support raw sequence snapshot reads; register a plugin with an explicit snapshot capability"
+    )]
+    UnsupportedIndexSnapshotRead { index: String },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("serialization error: {0}")]
