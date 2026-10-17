@@ -1,0 +1,30 @@
+{
+  "QueryLanguage": ["Sql","Pql"],
+  "QueryOperation": ["Select","Insert","Update","Delete","Watch","Explain","CreateCollection","AlterCollection","DropCollection","ShowCollections","ListRoles","ListBranches","CreateBranch","DropBranch"],
+  "AsOfClause": [{"Commit":"c1"},{"Branch":"main"},{"Timestamp":"2026-10-18T00:00:00Z"}],
+  "MutationPlan": [
+    {"Insert":{"key":"u1","attributes":{"active":true,"age":18,"name":"Ada","nullable":null}}},
+    {"Update":{"key":"u1","attributes":{"age":19}}},
+    {"Delete":{"key":"u1"}}
+  ],
+  "DdlPlan": [
+    {"CreateCollection":{"name":"users","attributes":[{"name":"age","type_name":"int","nullable":false}]}},
+    {"AlterCollection":{"name":"users","actions":[{"AddAttribute":{"name":"name","type_name":"text","nullable":true}},{"DropAttribute":{"name":"old"}}]}},
+    {"DropCollection":{"name":"users"}}
+  ],
+  "BooleanExpression": {"And":[
+    {"Predicate":{"attribute":"age","operator":">=","value":"18"}},
+    {"Or":[
+      {"Predicate":{"attribute":"active","operator":"=","value":"true"}},
+      {"Predicate":{"attribute":"name","operator":"=","value":"Ada"}}
+    ]}
+  ]},
+  "JoinClause": {"collection":"teams","left_attribute":"users.team","right_attribute":"teams.id"},
+  "FullTextClause": {"attribute":"bio","query":"rust","top":3},
+  "VectorClause": {"target":"seed","top":2,"threshold":"0.8"},
+  "TraversalClause": {"target":"seed","hops":2,"edge_label":"follows"},
+  "OrderClause": {"attribute":"age","descending":true},
+  "QueryParams": {"positional":["18"],"named":{"active":"true","name":"'Ada'"}},
+  "WindowFunction": {"function":"LAG","args":["age"],"partition_by":["team"],"order_by":[{"attribute":"age","descending":true}],"alias":"prev_age"},
+  "Catalog": {"collections":{}}
+}
