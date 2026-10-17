@@ -7,10 +7,13 @@ Open one explicit owner and obtain entity views from it:
 ```rust
 use praxis::config::WalSyncPolicy;
 use praxis::identity::{Aid, Cid, Eid, FieldId};
+use praxis::catalog::CatalogStore;
 use praxis::record::PageDatabase;
 
 fn example() -> praxis::Result<()> {
     let database = PageDatabase::open("example-page-data")?;
+    let catalog = CatalogStore::new(database.clone());
+    let _catalog_snapshot = catalog.load()?;
     let mut first = database.entity(Cid(1), Eid(2))?;
     let mut second = database.entity(Cid(1), Eid(3))?;
     let mut wal = database.page_wal(WalSyncPolicy::EveryBatch)?;
@@ -25,17 +28,22 @@ The owner shares one collection directory and RID allocator, independent page/sl
 
 The common OS lease excludes independent writers at the caller's canonical base. Every view and WAL handle retains ownership after its creating facade drops. Drop the final owner before independently reopening. A lease coordinates supported library writers; it does not sandbox arbitrary filesystem writes or public low-level codecs.
 
-Page database opens inspect physical storage format under that lease before reading a WAL or initializing the namespace. Foreign engine roots, reserved identities, aliases, and incomplete namespaces are refused without changing durable data. Ordinary application siblings are permitted. An exact v1 header-only page WAL is accepted on a complete empty page scaffold. This page-open integration is one part of [#40](https://github.com/Astraive/praxor/issues/40); [#48](https://github.com/Astraive/praxor/issues/48) separately tracks catalog constructors.
+Page database and independent catalog opens inspect physical storage format under that lease before reading a WAL or initializing the namespace. Foreign engine roots, reserved identities, aliases, and incomplete namespaces are refused without changing durable data. Ordinary application siblings are permitted. An exact v1 header-only page WAL is accepted on a complete empty page scaffold. Catalog constructors share this admission/ownership path through [#48](https://github.com/Astraive/praxor/issues/48), completing the catalog portion of [#40](https://github.com/Astraive/praxor/issues/40).
 
 ## Intentional source changes in 0.0
 
 - `PagePrimitiveStorageService::open` and `LocalPagepraxisClient::open` return `Result`. Propagate the error with `?`. Their `new` constructors accept an existing explicit database/service owner.
 - `PageRecordStore::open(base,cid,eid)` remains a fallible independent open. Additional entities use `PageDatabase::entity`; simultaneous independent opens return `AlreadyOpen`.
+- `CatalogStore::open(base)` independently owns the same page root. Use `CatalogStore::new(database.clone())` to share it with page and WAL views. Catalog clones retain ownership; resource equality derives were removed while snapshot equality remains unchanged. `layout()` keeps its existing return shape.
 - `PageRecordStore::directory()` returns `Result<RidDirectory>`, a current owned snapshot. Resource equality derives were removed; cloning a view shares ownership.
 - Obtain writable WAL handles with `database.page_wal(policy)`. Raw path writer construction and raw append methods are private. `path()` remains available; `bytes_written()` is fallible. Durable store methods reject another owner's handle before IO.
 - All handles use one writer/sequence allocator. Conflicting sync policies are rejected. `EveryBatch` and `GroupCommit` currently sync every operation; the latter does not implement group batching here. `Never` stays unsynced until explicit `sync()`.
 
 Page, RID-directory, manifest, and PageWal v1 bytes remain unchanged, including the actual IEEE CRC32 checksum bytes historically named `crc32c`. Headerless v1 page logs remain readable and appendable when otherwise valid.
+
+Catalog loads and saves hold the same root guard as page/WAL operations. Load does not create or repair missing optional catalogs. Save validates and prepares all ten v1 payloads and destinations before publication; pure preparation errors leave shared views healthy. Catalog-only legacy roots remain supported without page manifests or RID directories, and existing zero/duplicate IDs and optional-string encodings retain their behavior. Catalog publications keep the existing per-file temporary/rename behavior; PageWal sync policies do not make catalog saves durable or make ten files one atomic transaction.
+
+Supported live catalog loads wait for a complete successful save, or fail closed after an uncertain publication error. After all owners drop, v1 can still contain individually valid catalog files from different publication attempts. The format has no durable catalog generation witness to prove that all ten files belong to one completed save; [#41](https://github.com/Astraive/praxor/issues/41) tracks that crash/recovery boundary. [#51](https://github.com/Astraive/praxor/issues/51) separately tracks the existing catalog decoder count, narrowing, and trailing-data bounds.
 
 ## Reopen, replay, and failure outcomes
 
