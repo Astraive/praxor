@@ -5,12 +5,16 @@ use crate::errors::{PraxisError, Result};
 use crate::identity::{Cid, Eid, Fid, Pid, Rid};
 use crate::layout::PraxisLayout;
 use crate::storage::root_format::{InspectionOptions, require_page_base_compatible};
+use crate::wal::page::owned::{WalLifecycle, read_owner_report, repair_validated};
 use crate::wal::{PageWal, PageWalMutation, PageWalRecord, PageWalWriter, read_page_wal_strict};
 use crate::writer_lease::WriterLease;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
+
+#[cfg(test)]
+mod wal_lifecycle_tests;
 
 /// Explicit owner of one page database root and its collection state.
 #[derive(Clone)]
@@ -96,12 +100,18 @@ impl PageDatabase {
     }
 
     pub fn open(base: impl Into<PathBuf>) -> Result<Self> {
+        Self::open_with_lifecycle(base, &mut WalLifecycle::default())
+    }
+
+    fn open_with_lifecycle(base: impl Into<PathBuf>, lifecycle: &mut WalLifecycle) -> Result<Self> {
         let writer_lease = WriterLease::acquire(base.into())?;
         require_page_base_compatible(writer_lease.root(), InspectionOptions::for_admission())?;
         let layout = PraxisLayout::new(writer_lease.root());
-        let records = read_page_wal_strict(&layout.logs_root().join("page.wal"))?;
+        let wal_path = layout.logs_root().join("page.wal");
+        let report = read_owner_report(&wal_path)?;
+        let records = &report.records;
         let mut high_water = BTreeMap::new();
-        for record in &records {
+        for record in records {
             let (cid, rid) = match &record.mutation {
                 PageWalMutation::Put { cid, rid, .. }
                 | PageWalMutation::Delete { cid, rid, .. } => (*cid, *rid),
@@ -135,7 +145,10 @@ impl PageDatabase {
                 .max(high_water.get(&cid).copied().unwrap_or(1));
             collections.insert(cid, collection);
         }
-        validate_canonical_log(&layout, &collections, &records)?;
+        validate_canonical_log(&layout, &collections, records)?;
+        // All directories, high-water witnesses and semantics have passed.
+        // No collection loop or forensic report alone may authorize truncation.
+        repair_validated(&wal_path, &report, lifecycle)?;
         layout.create_all()?;
         Ok(Self {
             inner: Arc::new(PageDatabaseInner {
@@ -150,6 +163,14 @@ impl PageDatabase {
     }
 
     pub fn page_wal(&self, policy: WalSyncPolicy) -> Result<PageWal> {
+        self.page_wal_with_lifecycle(policy, &mut WalLifecycle::default())
+    }
+
+    fn page_wal_with_lifecycle(
+        &self,
+        policy: WalSyncPolicy,
+        lifecycle: &mut WalLifecycle,
+    ) -> Result<PageWal> {
         let mut state = self.lock()?;
         let path = self.inner.layout.logs_root().join("page.wal");
         if let Some(writer) = &state.wal {
@@ -159,7 +180,7 @@ impl PageDatabase {
                 ));
             }
         } else {
-            match PageWalWriter::open(&path, policy) {
+            match PageWalWriter::open(&path, policy, lifecycle) {
                 Ok(writer) => state.wal = Some(writer),
                 Err(error) => {
                     // Opening may create/sync a header. Retain ownership and fail
@@ -475,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_wal_append_poison_is_shared_and_torn_reopen_is_refused() {
+    fn partial_v2_append_poison_is_shared_until_final_owner_then_repairs() {
         let dir = tempfile::tempdir().unwrap();
         let (database, mut store, mut wal) = initialized(dir.path(), WalSyncPolicy::EveryBatch);
         let before = std::fs::read(wal.path()).unwrap();
@@ -503,8 +524,34 @@ mod tests {
         ));
         let path = wal.path().to_owned();
         drop(wal);
-        assert!(PageDatabase::open(dir.path()).is_err());
-        assert_eq!(std::fs::read(path).unwrap(), torn);
+        assert!(PageWal::replay(&path).is_err());
+        let reopened = PageDatabase::open(dir.path()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let mut store = reopened.entity(Cid(1), Eid(2)).unwrap();
+        assert_eq!(store.get(Rid(1)).unwrap(), b"old");
+        assert!(matches!(store.get(Rid(2)), Err(PraxisError::KeyNotFound)));
+        let mut wal = reopened.page_wal(WalSyncPolicy::EveryBatch).unwrap();
+        assert_eq!(
+            store
+                .put_durable(&mut wal, &[(FieldId::Fixed(Aid(1)), b"retry")])
+                .unwrap(),
+            Rid(2)
+        );
+        drop(wal);
+        drop(store);
+        drop(reopened);
+        for _ in 0..2 {
+            let reopened = PageDatabase::open(dir.path()).unwrap();
+            assert_eq!(
+                reopened
+                    .entity(Cid(1), Eid(2))
+                    .unwrap()
+                    .get(Rid(2))
+                    .unwrap(),
+                b"retry"
+            );
+            assert_eq!(PageWal::replay(&path).unwrap().len(), 1);
+        }
     }
 
     #[test]

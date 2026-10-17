@@ -1,4 +1,5 @@
 use praxis::api::service::PagePrimitiveStorageService;
+use praxis::catalog::CatalogStore;
 use praxis::identity::{Aid, Cid, Eid, FieldId};
 use praxis::record::{PageDatabase, PageRecordStore};
 use praxis::sdk::LocalPagepraxisClient;
@@ -68,6 +69,7 @@ fn refusal_matrix(root: &Path) -> bool {
         refused(PagePrimitiveStorageService::open(root).map(drop)),
         refused(LocalPagepraxisClient::open(root).map(drop)),
         refused(PageDatabase::recover_from_page_wal(root).map(drop)),
+        refused(CatalogStore::open(root).map(drop)),
     ];
     results.into_iter().all(|result| result) && tree(root) == before
 }
@@ -262,4 +264,73 @@ fn header_only_wal_requires_exact_bytes_and_a_complete_page_scaffold() {
     drop(PageDatabase::open(unknown.path()).unwrap());
     write(unknown.path(), ".praxis/logs/unknown.wal", &header);
     assert!(refusal_matrix(unknown.path()));
+}
+
+#[test]
+fn v2_header_scaffold_admission_is_exact_across_all_page_facades() {
+    let mut v2 = 0x5450_5746_u32.to_le_bytes().to_vec();
+    v2.extend_from_slice(&2_u32.to_le_bytes());
+    v2.extend_from_slice(&0_u32.to_le_bytes());
+    v2.extend_from_slice(&praxis::io::crc32_ieee(&v2).to_le_bytes());
+    for version in [1, 2] {
+        let dir = tempfile::tempdir().unwrap();
+        drop(PageDatabase::open(dir.path()).unwrap());
+        let mut bytes = v2.clone();
+        if version == 1 {
+            bytes[4..8].copy_from_slice(&1_u32.to_le_bytes());
+            bytes[8..].fill(0);
+        }
+        write(dir.path(), ".praxis/logs/page.wal", &bytes);
+        let before = tree(dir.path());
+        PageDatabase::open(dir.path()).map(drop).unwrap();
+        PageRecordStore::open(dir.path(), Cid(1), Eid(2))
+            .map(drop)
+            .unwrap();
+        PagePrimitiveStorageService::open(dir.path())
+            .map(drop)
+            .unwrap();
+        LocalPagepraxisClient::open(dir.path()).map(drop).unwrap();
+        PageDatabase::recover_from_page_wal(dir.path())
+            .map(drop)
+            .unwrap();
+        CatalogStore::open(dir.path()).map(drop).unwrap();
+        // Opening the entity adds only its permitted scaffold; no WAL activation.
+        assert_eq!(
+            std::fs::read(dir.path().join(".praxis/logs/page.wal")).unwrap(),
+            bytes
+        );
+        for (path, entry) in before {
+            assert_eq!(tree(dir.path()).get(&path), Some(&entry));
+        }
+    }
+    let mut malformed: Vec<Vec<u8>> = (0..16).map(|cut| v2[..cut].to_vec()).collect();
+    let mut checksum = v2.clone();
+    checksum[12] ^= 1;
+    malformed.push(checksum);
+    let mut flags = v2.clone();
+    flags[8] = 1;
+    let crc = praxis::io::crc32_ieee(&flags[..12]);
+    flags[12..].copy_from_slice(&crc.to_le_bytes());
+    malformed.push(flags);
+    let mut extra = v2.clone();
+    extra.push(0);
+    malformed.push(extra);
+    let record = praxis::wal::PageWalRecord {
+        sequence: 1,
+        mutation: praxis::wal::PageWalMutation::Delete {
+            cid: Cid(1),
+            eid: Eid(2),
+            rid: praxis::identity::Rid(1),
+        },
+    };
+    malformed.push([v2.clone(), record.try_encode().unwrap()].concat());
+    for bytes in malformed {
+        let dir = tempfile::tempdir().unwrap();
+        drop(PageDatabase::open(dir.path()).unwrap());
+        write(dir.path(), ".praxis/logs/page.wal", &bytes);
+        assert!(refusal_matrix(dir.path()), "unowned v2 prefix: {bytes:?}");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), ".praxis/logs/page.wal", &v2);
+    assert!(refusal_matrix(dir.path()), "logs-only v2 root adopted");
 }

@@ -1,3 +1,5 @@
+#[path = "../support/page_wal_legacy.rs"]
+mod legacy;
 use praxis::PraxisError;
 use praxis::config::WalSyncPolicy;
 use praxis::identity::{Aid, Cid, Eid, FieldId, Rid};
@@ -26,7 +28,7 @@ fn write_log(root: &Path, records: &[PageWalRecord], tail: &[u8]) -> PathBuf {
     bytes.extend_from_slice(&1_u32.to_le_bytes());
     bytes.extend_from_slice(&0_u64.to_le_bytes());
     for record in records {
-        bytes.extend_from_slice(&record.encode());
+        bytes.extend_from_slice(&legacy::encode(record));
     }
     bytes.extend_from_slice(tail);
     std::fs::write(&path, bytes).unwrap();
@@ -202,13 +204,19 @@ fn forensic_prefix_does_not_authorize_writable_open_after_a_torn_record() {
     let database = PageDatabase::open(dir.path()).unwrap();
     drop(database);
     let first = put_record(1, 1, b"good");
-    let second = put_record(2, 2, b"torn").encode();
+    let second = legacy::encode(&put_record(2, 2, b"torn"));
     let path = write_log(
         dir.path(),
         std::slice::from_ref(&first),
         &second[..second.len() / 2],
     );
-    assert_eq!(PageWal::replay(&path).unwrap(), vec![first]);
+    assert!(PageWal::replay(&path).is_err());
+    let report = PageWal::replay_prefix(&path).unwrap();
+    assert_eq!(report.records, vec![first]);
+    assert!(matches!(
+        report.stop,
+        praxis::wal::page::PageWalScanStop::LegacyAmbiguousTail { .. }
+    ));
     let before = contents(dir.path());
     assert!(PageDatabase::open(dir.path()).is_err());
     assert_eq!(contents(dir.path()), before);
@@ -336,7 +344,7 @@ fn unapplied_wal_allocation_is_reserved_without_automatic_replay() {
 }
 
 #[test]
-fn managed_writer_preserves_headerless_v1_logs() {
+fn managed_writer_upgrades_headerless_v1_without_reencoding_legacy_frames() {
     let dir = tempfile::tempdir().unwrap();
     let database = PageDatabase::open(dir.path()).unwrap();
     let mut store = database.entity(Cid(1), Eid(2)).unwrap();
@@ -350,6 +358,7 @@ fn managed_writer_preserves_headerless_v1_logs() {
     let file = std::fs::read(&path).unwrap();
     std::fs::write(&path, &file[16..]).unwrap();
     let database = PageDatabase::open(dir.path()).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), file[16..]);
     let mut wal = database.page_wal(WalSyncPolicy::EveryBatch).unwrap();
     let mut store = database.entity(Cid(1), Eid(2)).unwrap();
     assert_eq!(
@@ -358,10 +367,10 @@ fn managed_writer_preserves_headerless_v1_logs() {
             .unwrap(),
         Rid(2)
     );
-    assert_eq!(
-        &std::fs::read(&path).unwrap()[..4],
-        &0x5450_5752_u32.to_le_bytes()
-    );
+    let installed = std::fs::read(&path).unwrap();
+    assert_eq!(&installed[..4], &0x5450_5746_u32.to_le_bytes());
+    assert_eq!(&installed[4..8], &2_u32.to_le_bytes());
+    assert_eq!(&installed[16..file.len()], &file[16..]);
     assert_eq!(
         PageWal::replay(&path)
             .unwrap()
