@@ -86,9 +86,9 @@ fn late_publication_io_error_poison_is_shared_by_every_view_and_retains_ownershi
     // Actual publication occurred before the late IO error, but it is not an
     // acknowledged complete snapshot and no ten-file rollback is promised.
     assert_ne!(
-        decode_collections(
-            &read_catalog(&catalog.layout().catalog_root().join("collections.cat")).unwrap(),
-            Path::new("collections")
+        decode::read_optional(
+            &catalog.layout().catalog_root().join("collections.cat"),
+            decode::decode_collections
         )
         .unwrap(),
         original.collections
@@ -230,17 +230,17 @@ fn paused_catalog_publication_hides_split_epochs_from_load_page_and_wal_operatio
     // This is a real split-file window, independently inspected via private raw
     // codecs while the supported root owner is paused under its guard.
     assert_eq!(
-        decode_collections(
-            &read_catalog(&catalog.layout().catalog_root().join("collections.cat")).unwrap(),
-            Path::new("collections")
+        decode::read_optional(
+            &catalog.layout().catalog_root().join("collections.cat"),
+            decode::decode_collections
         )
         .unwrap(),
         expected.collections
     );
     assert_eq!(
-        decode_entities(
-            &read_catalog(&catalog.layout().catalog_root().join("entities.cat")).unwrap(),
-            Path::new("entities")
+        decode::read_optional(
+            &catalog.layout().catalog_root().join("entities.cat"),
+            decode::decode_entities
         )
         .unwrap(),
         original.entities
