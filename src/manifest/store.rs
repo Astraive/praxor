@@ -21,7 +21,7 @@ impl ManifestStore {
     pub fn load_or_create(&self, config: &PraxisConfig) -> Result<Manifest> {
         if self.path.exists() {
             let (bytes, _) = read_file_with_policy(&self.path, config.direct_io)?;
-            Ok(toml::from_str(&String::from_utf8_lossy(&bytes))?)
+            Manifest::decode(&bytes, &self.path)
         } else {
             let manifest = Manifest::fresh(config);
             self.save_with_policy(&manifest, config.direct_io)?;
@@ -34,8 +34,10 @@ impl ManifestStore {
     }
 
     pub fn save_with_policy(&self, manifest: &Manifest, requested_direct_io: bool) -> Result<()> {
+        let mut manifest = manifest.clone();
+        manifest.validate_and_upgrade(&self.path)?;
         let tmp = self.path.with_extension("tmp");
-        let bytes = toml::to_string_pretty(manifest)?;
+        let bytes = toml::to_string_pretty(&manifest)?;
         write_file_with_policy(&tmp, bytes.as_bytes(), requested_direct_io)?;
         fs::rename(tmp, &self.path)?;
         sync_parent_dir(&self.path)?;
