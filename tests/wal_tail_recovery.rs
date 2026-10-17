@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use praxis::wal::record::WAL_RECORD_HEADER_LEN;
 use praxis::wal::{Wal, WalRecord};
 use praxis::{PraxisConfig, PraxisEngine, PraxisError, WalSyncPolicy, WriteBatch};
 use std::fs::{self, OpenOptions};
@@ -29,7 +30,7 @@ fn append_after_recovering_a_torn_record_survives_another_reopen() {
 
     // Exercise an incomplete header, a complete header without its payload,
     // and a record missing only its last byte.
-    for cut in [3, 12, torn.len() - 1] {
+    for cut in [3, WAL_RECORD_HEADER_LEN, torn.len() - 1] {
         let dir = tempdir().unwrap();
         let path = dir.path().join("active.wal");
         let mut wal = Wal::open(&path, 1, WalSyncPolicy::EveryBatch).unwrap();
@@ -63,7 +64,7 @@ fn append_after_recovering_a_torn_record_survives_another_reopen() {
 }
 
 #[test]
-fn legacy_headerless_wal_can_repair_a_torn_tail_and_keep_appending() {
+fn headerless_wal_can_repair_a_torn_tail_and_keep_appending() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("legacy.wal");
     let first = record(1, "legacy");
