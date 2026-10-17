@@ -67,6 +67,8 @@ pub fn resolve_io_execution(requested_direct_io: bool) -> IoExecution {
     }
 }
 
+/// Write and sync file contents before returning, including buffered fallbacks.
+/// On Unix, also sync the parent directory so a new file entry is durable.
 pub fn write_file_with_policy(
     path: &Path,
     bytes: &[u8],
@@ -80,11 +82,12 @@ pub fn write_file_with_policy(
         match open_direct_write(path) {
             Ok(mut file) => {
                 if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+                    drop(file);
                     execution.effective_mode = "buffered_io".to_string();
                     execution.fallback_reason =
                         Some(format!("direct_write_failed: {error}").replace('\n', " "));
                     emit_fallback(path, &execution);
-                    fs::write(path, bytes)?;
+                    write_buffered_durable(path, bytes)?;
                 }
             }
             Err(error) => {
@@ -92,7 +95,7 @@ pub fn write_file_with_policy(
                 execution.fallback_reason =
                     Some(format!("direct_open_failed: {error}").replace('\n', " "));
                 emit_fallback(path, &execution);
-                fs::write(path, bytes)?;
+                write_buffered_durable(path, bytes)?;
             }
         }
     } else {
@@ -101,9 +104,52 @@ pub fn write_file_with_policy(
             execution.fallback_reason = Some("unaligned_payload".to_string());
             emit_fallback(path, &execution);
         }
-        fs::write(path, bytes)?;
+        write_buffered_durable(path, bytes)?;
     }
+    sync_parent_dir(path)?;
     Ok(execution)
+}
+
+fn write_buffered_durable(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Persist every new directory entry from the deepest directory to its first
+/// existing ancestor. Directory syncing remains unavailable on non-Unix hosts.
+pub(crate) fn create_dir_all_durable(path: &Path) -> Result<()> {
+    let mut missing = Vec::new();
+    let mut ancestor = path;
+    while !ancestor.as_os_str().is_empty() && !ancestor.try_exists()? {
+        missing.push(ancestor.to_path_buf());
+        let Some(parent) = ancestor.parent() else {
+            break;
+        };
+        ancestor = parent;
+    }
+    fs::create_dir_all(path)?;
+    for directory in missing {
+        sync_parent_dir(&directory)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn sync_parent_dir(_path: &Path) -> Result<()> {
+    // Rust has no portable directory-fsync operation on these platforms.
+    Ok(())
 }
 
 pub fn read_file_with_policy(
@@ -264,6 +310,27 @@ fn set_macos_nocache(file: &File) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn durable_directory_creation_is_nested_and_idempotent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("new").join("nested").join("records");
+        create_dir_all_durable(&path).unwrap();
+        assert!(path.is_dir());
+        let record = path.join("existing.bin");
+        fs::write(&record, b"keep").unwrap();
+        create_dir_all_durable(&path).unwrap();
+        assert_eq!(fs::read(record).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn durable_directory_creation_rejects_a_file_ancestor() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("file");
+        fs::write(&file, b"keep").unwrap();
+        assert!(create_dir_all_durable(&file.join("records")).is_err());
+        assert_eq!(fs::read(file).unwrap(), b"keep");
+    }
 
     #[test]
     fn unaligned_direct_write_falls_back_explicitly() {

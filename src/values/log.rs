@@ -1,5 +1,5 @@
 use crate::errors::{PraxisError, Result};
-use crate::io::crc32c;
+use crate::io::{crc32c, sync_parent_dir};
 use crate::types::ValuePointer;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -20,6 +20,10 @@ impl ValueLog {
             .write(true)
             .truncate(false)
             .open(&path)?;
+        // Persist the log's inode and directory entry before a flush can
+        // checkpoint WAL records whose values will reference this file.
+        file.sync_all()?;
+        sync_parent_dir(&path)?;
         Ok(Self { path, file })
     }
 

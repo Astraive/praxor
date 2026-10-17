@@ -10,6 +10,7 @@ pub use capability::{
     IoCapability, IoExecution, detect_io_capability, read_file_with_policy, resolve_io_execution,
     write_file_with_policy,
 };
+pub(crate) use capability::{create_dir_all_durable, sync_parent_dir};
 pub use checksum::{crc32c, file_digest};
 pub use compression::{decode_block, encode_block};
 pub use hardware::{HardwareBackend, HardwareCapability, HardwareIoProfile, HardwareOperation};

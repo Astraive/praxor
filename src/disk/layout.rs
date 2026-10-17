@@ -1,5 +1,5 @@
 use crate::errors::Result;
-use std::fs;
+use crate::io::create_dir_all_durable;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
@@ -18,7 +18,7 @@ impl DiskLayout {
             "checkpoints",
             "tmp",
         ] {
-            fs::create_dir_all(root.join(dir))?;
+            create_dir_all_durable(&root.join(dir))?;
         }
         Ok(Self { root })
     }
