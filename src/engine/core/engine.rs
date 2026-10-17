@@ -47,6 +47,11 @@ impl PraxisEngine {
     pub fn open(config: PraxisConfig) -> Result<Self> {
         config.validate()?;
         let writer_lease = WriterLease::acquire(&config.data_dir)?;
+        crate::storage::root_format::inspect_storage_root(
+            writer_lease.root(),
+            crate::storage::root_format::InspectionOptions::for_admission(),
+        )?
+        .require_compatible(crate::storage::root_format::RootOwner::Core)?;
         slog::Logger::init(config.logging.clone());
         let accelerator: Arc<dyn Accelerator> = match config.accelerator {
             AcceleratorBackend::Cpu => Arc::new(CpuAccelerator),
@@ -1674,7 +1679,13 @@ fn acquire_copy_destination(
     destination: &Path,
 ) -> Result<(WriterLease, Option<WriterLease>)> {
     let source = fs::canonicalize(source)?;
-    crate::io::create_dir_all_durable(destination)?;
+    let destination = resolve_copy_destination(destination)?;
+    if source.starts_with(&destination) || destination.starts_with(&source) {
+        return Err(PraxisError::InvalidConfig(
+            "backup and restore require disjoint source and destination roots".to_string(),
+        ));
+    }
+    crate::io::create_dir_all_durable(&destination)?;
     let destination = fs::canonicalize(destination)?;
     if source.starts_with(&destination) || destination.starts_with(&source) {
         return Err(PraxisError::InvalidConfig(
@@ -1692,6 +1703,56 @@ fn acquire_copy_destination(
         true,
     )?;
     Ok((lease, primary_lease))
+}
+
+fn resolve_copy_destination(path: &Path) -> Result<PathBuf> {
+    // Resolve each existing component before applying `..`: normalizing the
+    // complete spelling first can erase a symlink's actual parent relationship.
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    if !absolute.is_absolute() {
+        return Err(PraxisError::InvalidConfig(
+            "backup destination must resolve to an absolute path".into(),
+        ));
+    }
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                resolved.push(component.as_os_str())
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                resolved.pop();
+            }
+            std::path::Component::Normal(name) => {
+                let candidate = resolved.join(name);
+                match fs::canonicalize(&candidate) {
+                    Ok(canonical) => {
+                        if !fs::metadata(&canonical)?.is_dir() {
+                            return Err(PraxisError::InvalidConfig(
+                                "backup destination components must be directories".into(),
+                            ));
+                        }
+                        resolved = canonical;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        if fs::symlink_metadata(&candidate).is_ok() {
+                            return Err(PraxisError::InvalidConfig(
+                                "backup destination contains a dangling alias".into(),
+                            ));
+                        }
+                        resolved = candidate;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 fn lease_existing_primary(parent: &WriterLease) -> Result<Option<WriterLease>> {

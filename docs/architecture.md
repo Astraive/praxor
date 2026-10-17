@@ -392,3 +392,6 @@ All of that should share one canonical value layer, one WAL/recovery system, one
 Supported durable writers follow the [exclusive ownership contract](writer-ownership.md).
 Independent handles retain OS leases; legitimate sharing uses explicit owners
 and clones. Raw physical utilities remain offline building blocks.
+
+Writable engine opens also follow the [storage root format contract](storage-root-formats.md)
+before mutable initialization; read-only diagnostics preserve explicit inspection limits.

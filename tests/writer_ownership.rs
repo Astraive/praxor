@@ -467,14 +467,23 @@ fn copy_refuses_unrelated_nested_writer_roots_before_any_deletion() {
 }
 
 #[test]
-fn copy_refuses_nested_source_databases_as_an_inconsistent_backup() {
+fn core_open_refuses_nested_source_databases_before_they_can_be_backed_up() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("source");
     let nested = Kind::Core.open(&root.join("other_db")).unwrap();
-    let source = PraxisEngine::open(PraxisConfig::new(&root)).unwrap();
-    assert!(source.backup_to(dir.path().join("backup")).is_err());
+    let before = contents(&root);
+    assert!(matches!(
+        PraxisEngine::open(PraxisConfig::new(&root)),
+        Err(praxis::PraxisError::StorageFormatAmbiguous { .. })
+    ));
+    assert_eq!(contents(&root), before);
     drop(nested);
-    assert!(source.backup_to(dir.path().join("backup")).is_err());
+    assert!(matches!(
+        PraxisEngine::open(PraxisConfig::new(&root)),
+        Err(praxis::PraxisError::StorageFormatAmbiguous { .. })
+    ));
+    assert_eq!(contents(&root), before);
+    assert!(!dir.path().join("backup").exists());
 }
 
 #[test]
@@ -541,7 +550,7 @@ fn reserved_primary_alias_is_rejected_without_locking_or_mutating_its_target() {
     ));
     assert!(matches!(
         StorageEngine::open(&target, 1024),
-        Err(praxis::PraxisError::InvalidConfig(_))
+        Err(praxis::PraxisError::StorageFormatIncomplete { .. })
     ));
     assert_eq!(
         std::fs::read(outside.join("payload")).unwrap(),
