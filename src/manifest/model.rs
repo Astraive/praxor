@@ -2,7 +2,10 @@ use crate::config::{
     CompactionStrategy, Compression, DEFAULT_LARGE_VALUE_THRESHOLD,
     DEFAULT_MEMTABLE_FLUSH_THRESHOLD_BYTES, MemTableKind, PersistedEngineConfig, PraxisConfig,
 };
+use crate::errors::{PraxisError, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
@@ -27,13 +30,17 @@ pub struct Manifest {
     #[serde(default)]
     pub tier_migrations: Vec<crate::storage::TierMigrationRecord>,
     pub column_families: Vec<ColumnFamilyDescriptor>,
+    #[serde(default)]
+    pub column_family_generations: BTreeMap<String, ColumnFamilyGeneration>,
+    #[serde(default = "default_next_column_family_generation")]
+    pub next_column_family_generation: u64,
     pub segments: Vec<SegmentMetadata>,
 }
 
 impl Manifest {
     pub fn fresh(config: &PraxisConfig) -> Self {
         Self {
-            format_version: 1,
+            format_version: 2,
             effective_config: config.persisted(),
             active_wal_id: 1,
             next_wal_id: 2,
@@ -52,9 +59,137 @@ impl Manifest {
                 },
                 ..ColumnFamilyDescriptor::default()
             }],
+            column_family_generations: BTreeMap::from([(
+                "default".to_string(),
+                ColumnFamilyGeneration::default(),
+            )]),
+            next_column_family_generation: 1,
             segments: Vec::new(),
         }
     }
+
+    pub(crate) fn decode(bytes: &[u8], source: &Path) -> Result<Self> {
+        #[derive(Deserialize)]
+        struct Header {
+            format_version: u32,
+            column_family_generations: Option<serde::de::IgnoredAny>,
+            next_column_family_generation: Option<serde::de::IgnoredAny>,
+        }
+        // A generic toml::Value would incorrectly reject u64 Bloom bits and
+        // configurations above i64::MAX. Keep the complete model typed.
+        let text = String::from_utf8_lossy(bytes);
+        let header: Header = toml::from_str(&text)?;
+        let corrupt = |reason: &str| PraxisError::Corrupt {
+            path: source.to_path_buf(),
+            reason: reason.to_string(),
+        };
+        if !matches!(header.format_version, 1 | 2) {
+            return Err(corrupt("unsupported manifest format version"));
+        }
+        // Defaults exist solely for v1; every v2 file carries complete metadata.
+        if header.format_version == 2
+            && (header.column_family_generations.is_none()
+                || header.next_column_family_generation.is_none())
+        {
+            return Err(corrupt(
+                "v2 manifest is missing column-family generation metadata",
+            ));
+        }
+        let mut manifest: Self = toml::from_str(&text)?;
+        manifest.validate_and_upgrade(source)?;
+        Ok(manifest)
+    }
+
+    pub(crate) fn validate_and_upgrade(&mut self, source: &Path) -> Result<()> {
+        let corrupt = |reason: &str| PraxisError::Corrupt {
+            path: source.to_path_buf(),
+            reason: reason.to_string(),
+        };
+        if !matches!(self.format_version, 1 | 2) {
+            return Err(corrupt("unsupported manifest format version"));
+        }
+        if self.format_version == 1 {
+            if !self.column_family_generations.is_empty() || self.next_column_family_generation != 1
+            {
+                return Err(corrupt(
+                    "v1 manifest unexpectedly contains incarnation metadata",
+                ));
+            }
+            if self.column_families.is_empty() {
+                self.column_families.push(ColumnFamilyDescriptor::default());
+            }
+            self.column_family_generations = self
+                .column_families
+                .iter()
+                .map(|family| (family.name.clone(), ColumnFamilyGeneration::default()))
+                .collect();
+            self.format_version = 2;
+        }
+        let mut names = BTreeSet::new();
+        for family in &self.column_families {
+            if !names.insert(family.name.as_str()) {
+                return Err(corrupt("duplicate column-family name"));
+            }
+        }
+        if !names.contains("default") {
+            return Err(corrupt("manifest is missing the default column family"));
+        }
+        if names.len() != self.column_family_generations.len()
+            || self
+                .column_family_generations
+                .keys()
+                .any(|name| !names.contains(name.as_str()))
+        {
+            return Err(corrupt(
+                "column-family generation coverage does not match active families",
+            ));
+        }
+        let mut nonzero_ids = BTreeSet::new();
+        let watermark = self.last_sequence.max(self.flushed_sequence);
+        for (name, generation) in &self.column_family_generations {
+            if name == "default" && *generation != ColumnFamilyGeneration::default() {
+                return Err(corrupt(
+                    "default column family must retain legacy generation zero",
+                ));
+            }
+            if generation.id == 0 && generation.visible_after_sequence != 0 {
+                return Err(corrupt("legacy generation must have a zero sequence floor"));
+            }
+            if generation.visible_after_sequence > watermark {
+                return Err(corrupt(
+                    "column-family floor exceeds persisted sequence watermark",
+                ));
+            }
+            if generation.id != 0 && !nonzero_ids.insert(generation.id) {
+                return Err(corrupt("duplicate column-family incarnation ID"));
+            }
+            if generation.id >= self.next_column_family_generation {
+                return Err(corrupt(
+                    "column-family generation counter does not exceed allocated IDs",
+                ));
+            }
+        }
+        if self.next_column_family_generation == 0 {
+            return Err(corrupt("column-family generation counter must be positive"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ColumnFamilyGeneration {
+    pub id: u64,
+    pub visible_after_sequence: u64,
+}
+
+impl ColumnFamilyGeneration {
+    pub(crate) fn includes(&self, sequence: u64) -> bool {
+        self.id == 0 || sequence > self.visible_after_sequence
+    }
+}
+
+pub(crate) fn default_next_column_family_generation() -> u64 {
+    1
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
