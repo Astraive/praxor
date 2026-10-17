@@ -61,8 +61,11 @@ impl WalRecord {
     }
 
     pub fn encoded_len(&self) -> usize {
-        let operations = self
-            .batch
+        Self::encoded_batch_len(&self.batch)
+    }
+
+    pub(crate) fn encoded_batch_len(batch: &WriteBatch) -> usize {
+        let operations = batch
             .ops()
             .iter()
             .map(|op| match op {
