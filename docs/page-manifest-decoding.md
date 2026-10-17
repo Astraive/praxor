@@ -26,11 +26,11 @@ startup collection checks. The existing pure format inspector still performs
 its own bounded structural probe. A later new-entity load keeps its existing
 fresh-manifest wrapper and uses the same private collection-validation helper.
 
-This addresses [#57](https://github.com/Astraive/praxor/issues/57), separately
-from the ten catalog table decoders. It does not require every tracked path to
-exist, prove an acknowledged inventory, relocate old manifest paths, or add a
-completion witness. [#41](https://github.com/Astraive/praxor/issues/41) retains
-whole-collection loss detection and multi-file publication/recovery completeness.
-Valid unresolved inventory entries remain compatible; selected canonical files
-retain the existing checksum checks. No new generation, repair inference or
-crash-atomicity guarantee is introduced.
+This codec addresses [#57](https://github.com/Astraive/praxor/issues/57), separately
+from the ten catalog table decoders. Managed startup additionally checks
+[known v1 writer-role presence](page-inventory-presence.md) using current-layout
+identities. Unknown annotations remain opaque; selected canonical files retain
+the existing checksum checks. [#41](https://github.com/Astraive/praxor/issues/41)
+still owns inventory completeness and multi-file publication/recovery guarantees.
+Neither check adds a mandatory manifest, a generation or completion witness,
+relocated checksum provenance, repair inference, or crash atomicity.
