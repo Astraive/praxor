@@ -16,10 +16,6 @@ pub(crate) struct NewRecord {
 }
 
 #[derive(Clone)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "private planner checkpoint; facade follows")
-)]
 pub(crate) enum IntentKind {
     Create(Vec<NewRecord>),
     DeleteRecords(Vec<RecordId>),

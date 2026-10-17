@@ -9,7 +9,6 @@ use crate::writer_lease::{LOCK_FILE_NAME, WriterLease};
 use crate::{PraxisConfig, PraxisEngine};
 
 /// One retained core owner; its KV view shares lease, health, queue and pins.
-/// Record mutation is added only with the complete sealed intent implementation.
 #[derive(Clone)]
 pub struct CoreDatabase {
     engine: PraxisEngine,
@@ -87,6 +86,10 @@ impl CoreDatabase {
 
     pub fn kv(&self) -> PraxisEngine {
         self.engine.clone()
+    }
+
+    pub fn records(&self) -> super::CoreRecordStore {
+        super::CoreRecordStore::new(self.engine.clone())
     }
 
     /// Immutable durable identity/roles, not a mutable metadata handle.

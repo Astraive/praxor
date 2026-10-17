@@ -116,6 +116,18 @@ impl MemTable {
         self.entries.keys().map(|(cf, key)| (cf, key))
     }
 
+    /// Inclusive bounds in one CF, without visiting unrelated keys or values.
+    pub(crate) fn keys_in_range<'a>(
+        &'a self,
+        cf: &ColumnFamily,
+        start: &Key,
+        end: &Key,
+    ) -> impl Iterator<Item = &'a Key> {
+        self.entries
+            .range((cf.clone(), start.clone())..=(cf.clone(), end.clone()))
+            .map(|((_, key), _)| key)
+    }
+
     pub fn drain_latest(&self) -> Vec<(ColumnFamily, Key, VersionedValue)> {
         self.entries
             .iter()

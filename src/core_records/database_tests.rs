@@ -885,3 +885,40 @@ fn canonical_nonbootstrap_create_recovers_through_existing_owner_and_backup_apis
     drop(db);
     CoreDatabase::open(config).unwrap();
 }
+
+fn semantic_verify_checks_wal(flushed: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = CoreDatabase::create_fresh(PraxisConfig::new(dir.path()), options()).unwrap();
+    let engine = db.kv();
+    let path = engine.inner.wal.lock().path().to_path_buf();
+    let original = std::fs::read(&path).unwrap();
+    if flushed {
+        engine.flush().unwrap();
+    }
+    let (mut records, _) = crate::wal::writer::replay_core_records(&original, &path).unwrap();
+    let CoreWalRecord::Record { envelope, .. } = &mut records[0] else {
+        panic!()
+    };
+    envelope.database_id[0] ^= 1;
+    let mut changed = original[..16].to_vec();
+    for record in records {
+        changed.extend(record.try_encode().unwrap());
+    }
+    std::fs::write(path, changed).unwrap();
+    let before = tree(dir.path());
+    assert!(
+        engine.verify().is_err(),
+        "v3 verify must validate complete protected WAL semantics, including flushed evidence"
+    );
+    assert_eq!(tree(dir.path()), before);
+}
+
+#[test]
+fn semantic_verify_checks_active_typed_wal_identity() {
+    semantic_verify_checks_wal(false);
+}
+
+#[test]
+fn semantic_verify_checks_typed_wal_below_the_flush_cutoff() {
+    semantic_verify_checks_wal(true);
+}

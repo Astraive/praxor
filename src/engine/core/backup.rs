@@ -86,10 +86,7 @@ impl Capture {
         }
         if let Some(checkpoint) = capture.manifest.latest_checkpoint.clone() {
             capture.accept_label(&checkpoint.path, &checkpoint_relative(checkpoint.id))?;
-            let path = capture.local(&checkpoint_relative(checkpoint.id))?;
-            if crate::io::file_digest(&path)?.to_hex().as_str() != checkpoint.file_digest {
-                return corrupt(&path, "captured checkpoint digest mismatch");
-            }
+            capture.local(&checkpoint_relative(checkpoint.id))?;
         }
         let wal_root = root.join("wal");
         if wal_root.exists() {
@@ -136,7 +133,11 @@ impl Capture {
     pub(super) fn from_bundle(root: &Path) -> Result<Self> {
         let path = root.join("MANIFEST");
         let bytes = fs::read(&path)?;
-        Self::new(root, Manifest::decode(&bytes, &path)?)
+        let capture = Self::new(root, Manifest::decode(&bytes, &path)?)?;
+        // Offline restore must refuse before acquiring/creating a destination.
+        // No live writer guard is held here, so bulk hashing is appropriate.
+        capture.validate_checkpoint()?;
+        Ok(capture)
     }
 
     pub(super) fn from_live(root: &Path, manifest: Manifest) -> Result<Self> {
@@ -149,7 +150,20 @@ impl Capture {
         Ok(capture)
     }
 
-    pub(super) fn validate(mut self, accelerator: &dyn Accelerator) -> Result<()> {
+    pub(super) fn validate(
+        mut self,
+        accelerator: &dyn Accelerator,
+    ) -> Result<crate::recovery::VerificationReport> {
+        let mut report = crate::recovery::VerificationReport {
+            manifest_generation: self.manifest.next_segment_id,
+            ..Default::default()
+        };
+        let mut value_files = BTreeSet::new();
+        let mut value_extents = BTreeSet::new();
+        if self.manifest.latest_checkpoint.is_some() {
+            report.checkpoints_checked = 1;
+            report.bytes_checked = self.validate_checkpoint()?;
+        }
         let mut protected = crate::core_records::recovery::Evidence::new(
             &self.manifest,
             &self.root.join("MANIFEST"),
@@ -160,6 +174,11 @@ impl Capture {
             if blake3::hash(&bytes).to_hex().as_str() != metadata.file_digest {
                 return corrupt(&path, "backup segment digest mismatch");
             }
+            report.segments_checked += 1;
+            report.bytes_checked = report
+                .bytes_checked
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| error(&path, "verification byte count overflow"))?;
             let raw = decode_segment(&bytes, &path, accelerator)?;
             if raw.id != metadata.id
                 || raw.level != metadata.level
@@ -185,6 +204,14 @@ impl Capture {
                     let relative = value_relative(id);
                     self.accept_label(&pointer.path, &relative)?;
                     validate_pointer(&self.local(&relative)?, pointer)?;
+                    value_files.insert(id);
+                    if value_extents.insert((id, pointer.offset, pointer.len, pointer.checksum)) {
+                        report.bytes_checked = report
+                            .bytes_checked
+                            .checked_add(pointer.len)
+                            .and_then(|n| n.checked_add(12))
+                            .ok_or_else(|| error(&path, "verification byte count overflow"))?;
+                    }
                 }
             }
         }
@@ -196,6 +223,10 @@ impl Capture {
             if bytes.len() as u64 != *len {
                 return corrupt(&path, "backup WAL changed during validation");
             }
+            report.bytes_checked = report
+                .bytes_checked
+                .checked_add(*len)
+                .ok_or_else(|| error(&path, "verification byte count overflow"))?;
             let records =
                 Wal::validate_backup_prefix(&bytes, &path, *id, self.manifest.last_sequence)?;
             for record in &records {
@@ -210,7 +241,21 @@ impl Capture {
         }
         require_coverage(&self.root, covered, self.manifest.last_sequence)?;
         protected.finish()?;
-        Ok(())
+        report.value_logs_checked = value_files.len() as u64;
+        Ok(report)
+    }
+
+    /// Bulk checkpoint hashing runs after live capture releases the writer.
+    /// Offline/legacy copies use the same policy before creating layout files.
+    fn validate_checkpoint(&self) -> Result<u64> {
+        let Some(checkpoint) = &self.manifest.latest_checkpoint else {
+            return Ok(0);
+        };
+        let path = self.local(&checkpoint_relative(checkpoint.id))?;
+        if crate::io::file_digest(&path)?.to_hex().as_str() != checkpoint.file_digest {
+            return corrupt(&path, "captured checkpoint digest mismatch");
+        }
+        Ok(fs::metadata(path)?.len())
     }
 
     fn accept_label(&mut self, label: &str, relative: &Path) -> Result<()> {
@@ -267,6 +312,8 @@ impl Capture {
     ) -> Result<Staged> {
         if self.manifest.record_authority.is_some() {
             self.clone().validate(accelerator)?;
+        } else {
+            self.validate_checkpoint()?;
         }
         let layout = DiskLayout::create(stage)?;
         let mut files = BTreeSet::new();

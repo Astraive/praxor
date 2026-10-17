@@ -35,6 +35,55 @@ fn mapping() -> Mapping {
         key: b"k".to_vec(),
     }
 }
+
+#[test]
+fn public_semantic_verify_uses_one_capture_while_never_writes_continue() {
+    use crate::engine::core::backup::{Phase, hooks};
+    let (dir, _config, db) = database(crate::WalSyncPolicy::Never, usize::MAX);
+    db.records().put(b"record", &[]).unwrap();
+    let engine = db.kv();
+    let captured_bytes = std::fs::metadata(engine.inner.wal.lock().path())
+        .unwrap()
+        .len();
+    let attempts = engine
+        .inner
+        .metrics
+        .commit_sync_attempts
+        .load(Ordering::Relaxed);
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let reader = engine.clone();
+    let join = std::thread::spawn(move || {
+        let _hook = hooks::install(move |phase| {
+            if phase == Phase::Captured {
+                ready_tx.send(()).unwrap();
+                resume_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+            }
+            Ok(())
+        });
+        reader.verify()
+    });
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    assert!(engine.inner.maintenance_serialization.try_lock().is_none());
+    engine.put("late never", "published after capture").unwrap();
+    let before = disk_state(dir.path());
+    resume_tx.send(()).unwrap();
+    let report = join.join().unwrap().unwrap();
+    assert_eq!(report.bytes_checked, captured_bytes);
+    assert_eq!(
+        engine
+            .inner
+            .metrics
+            .commit_sync_attempts
+            .load(Ordering::Relaxed),
+        attempts
+    );
+    assert_eq!(disk_state(dir.path()), before);
+}
 fn create(payload: &[u8], mappings: usize) -> IntentKind {
     IntentKind::Create(vec![NewRecord {
         payload: payload.into(),

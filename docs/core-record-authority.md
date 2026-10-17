@@ -1,9 +1,9 @@
 # Core record authority checkpoints (#46 F1a/F1b)
 
-This is an unshipped review checkpoint within the complete F1 branch. It has no
-public record writer. F1a and F1b must ship together; this checkpoint
-does not establish public record CRUD, historical payload
-snapshots, legacy import, plugin parity, or product adoption.
+This F1 slice adds the explicit `CoreDatabase` and cloneable `CoreRecordStore`
+over one core authority. Foundation and CRUD form one reviewed format change.
+Historical payload snapshots, legacy import, plugin parity and product adoption
+remain separate phases of #46.
 
 F1b checkpoint 1 adds private typed User/Barrier requests and Write/Barrier
 outcomes, with per-request Configured/Durable requirements. A barrier is a
@@ -11,7 +11,7 @@ positive-charged FIFO fence that actually syncs the covering core WAL; it writes
 no frame and consumes no core sequence. It holds no maintenance/WAL/manifest
 guard while waiting. Durable accepted requests sync even under Never without
 changing persisted policy; rejected requests do not force IO. The helper remains
-private pending the complete record facade. No record intent/planner is exposed.
+private and serves the record facade. No record intent/planner is exposed.
 
 Checkpoint 2 adds private sealed owned record intents and typed RID receipts to
 that same queue. Its canonical builder/parser covers the six envelope kinds;
@@ -20,8 +20,49 @@ intents alone advance the request-local overlay, RID/counters and core sequence.
 Receipts and exact frame size are prepared before merging. Every accepted record
 request is Durable. Conservative owned-memory admission may exceed the wire cap
 as an oversized singleton; exact materialized frames obey the existing 64 MiB
-payload limit before rotation or append. Empty public batch handling, facade
-reads/flush and semantic v3 verify are pending checkpoint 3.
+payload limit before rotation or append. Checkpoint 3 adds public batch handling,
+current reads, ordered record flush and semantic v3 verification.
+
+`CoreDatabase::records()` returns a view of the same owner. It reuses `RecordId`,
+`store::IndexInsert` and `store::BatchRecord` and offers logical put/batch, fetch,
+index mapping reads/writes, primary deletes and cleanup. Methods take `&self`;
+clones share the queue and retained lease. Live/dead/byte counters and the fresh
+`compatibility_sequence()` watermark are fallible reads. Healthy empty create or
+delete batches return success without a frame, RID/counter advancement or sync
+claim; shared poison is checked first. Every accepted nonempty record mutation
+is durable under all three KV sync policies. A later automatic flush error can
+be returned after commit and is therefore ambiguous.
+
+Each record read holds one current core pin through all of its resolutions.
+`fetch_by_index` uses that same pin for Head, State and Payload. Unknown/dead RIDs
+are absence; live State with missing/malformed Payload is corruption or IO error,
+never index absence. Record reads/counters fail closed on common poison, while
+ordinary KV retains its documented last-published-read behavior.
+
+`lookup_rid_at` is mapping-only at a raw ceiling, including zero and `u64::MAX`.
+It selects greatest eligible append ordinal, including delete decisions, using
+an exact descriptor/incarnation/L32 binary-key range. Key capture uses ordered
+tier ranges; locks are released before point resolution. A concurrent future
+fact absent at the captured pin is skipped. Registry lookup binary-searches the
+validated immutable sorted descriptors without a new cache. Range scratch space
+follows matching keys; the work includes per-tier range lookup/deduplication and
+canonical resolution of those keys, not a whole-database scan or a throughput
+claim. There is no public numeric late pin or historical payload API.
+
+Record `flush()` waits for a real ordered durable barrier before core flush,
+including covering earlier Never writes across WAL rotations. It consumes no
+logical entry/core sequence and changes no sync policy.
+
+V3 `kv().verify()` captures one RAM manifest and exact retained WAL prefix lengths
+under maintenance then writer, releases writer and retains maintenance through
+the shared owner/backup semantic evidence proof. Clone appends can continue;
+they do not enlarge that capture. Verification syncs/repairs/writes nothing.
+Its report counts validated segments/checkpoints, unique value files having
+referenced validated extents, and bytes comprising complete segments/checkpoint,
+exact WAL prefixes and unique referenced value extents including each 12-byte
+header. It does not count unreferenced value-file bytes, repeated physical reads,
+or RAM manifest bytes as checked disk bytes. Legacy verify accounting remains
+unchanged. Verification is an integrity check, not a durability acknowledgement.
 
 Reopen and captured backup validation share the canonical parser. Complete old
 envelopes prove their own RID ranges and counter relationships: floors never
