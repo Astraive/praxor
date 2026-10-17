@@ -16,7 +16,7 @@ $forbidden = @(
     @{ Name = "eprintln!"; Pattern = "eprintln!" },
     @{ Name = "dbg!"; Pattern = "dbg!" },
     @{ Name = "tracing::"; Pattern = "tracing::" },
-    @{ Name = "log::"; Pattern = "(?<!s)log::" }
+    @{ Name = "log::"; Pattern = "(?<![A-Za-z0-9_])log::" }
 )
 
 $violations = @()
