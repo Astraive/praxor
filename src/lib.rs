@@ -58,6 +58,7 @@ pub use catalog::schema::{
 pub use config::{CompactionStrategy, Compression, PraxisConfig, WalSyncPolicy};
 pub use core_records::{
     CoreDatabase, CoreRecordSnapshot, CoreRecordStore, MappingDescriptor, RecordAuthorityOptions,
+    RecordHistoryReclaimReport,
 };
 pub use document::{Edge, Record, RecordDirectory};
 pub use engine::PraxisEngine;
