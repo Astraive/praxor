@@ -83,10 +83,36 @@ impl<'a> BinaryReader<'a> {
     }
 
     pub fn read_len_bytes(&mut self) -> Result<Vec<u8>> {
+        self.read_len_slice().map(<[u8]>::to_vec)
+    }
+
+    /// Borrow a length-prefixed field only after checking the available input.
+    pub fn read_len_slice(&mut self) -> Result<&'a [u8]> {
         let len = self.read_u32()? as usize;
-        let mut bytes = vec![0; len];
-        self.read_exact(&mut bytes)?;
-        Ok(bytes)
+        self.read_slice(len)
+    }
+
+    pub fn position(&self) -> usize {
+        self.cursor.position() as usize
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.cursor.get_ref().len().saturating_sub(self.position())
+    }
+
+    /// Borrow checked bytes without allocating from an untrusted length.
+    pub fn read_slice(&mut self, len: usize) -> Result<&'a [u8]> {
+        let start = self.position();
+        let bytes = *self.cursor.get_ref();
+        let slice = start
+            .checked_add(len)
+            .and_then(|end| bytes.get(start..end))
+            .ok_or_else(|| PraxisError::Corrupt {
+                path: self.source.clone(),
+                reason: "unexpected end of data".to_string(),
+            })?;
+        self.cursor.set_position((start + len) as u64);
+        Ok(slice)
     }
 
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {

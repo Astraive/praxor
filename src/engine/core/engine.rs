@@ -311,9 +311,9 @@ impl PraxisEngine {
             return Ok(self.snapshot().sequence);
         }
         let (batch, generations) = self.normalize_batch_with_cf_policies(batch)?;
+        let encoded_len = WalRecord::checked_encoded_batch_len(&batch)?;
         self.relieve_l0_pressure_before_write()?;
         let ops = batch.len();
-        let encoded_len = WalRecord::encoded_batch_len(&batch);
         let request = self.inner.group_commit.admit(
             batch,
             generations,
