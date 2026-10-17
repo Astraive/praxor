@@ -1,7 +1,8 @@
 use crate::errors::Result;
 use crate::io::{file_digest, write_file_with_policy};
-use crate::manifest::{CheckpointMetadata, Manifest};
+use crate::manifest::{CheckpointMetadata, ColumnFamilyGeneration, Manifest};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 #[cfg(unix)]
 use std::fs::File;
@@ -12,6 +13,10 @@ pub struct CheckpointFile {
     pub format_version: u32,
     pub sequence: u64,
     pub segment_paths: Vec<String>,
+    #[serde(default)]
+    pub column_family_generations: BTreeMap<String, ColumnFamilyGeneration>,
+    #[serde(default = "crate::manifest::model::default_next_column_family_generation")]
+    pub next_column_family_generation: u64,
 }
 
 pub fn write_checkpoint(path: &Path, id: u64, manifest: &Manifest) -> Result<CheckpointMetadata> {
@@ -27,6 +32,8 @@ pub fn write_checkpoint_with_policy(
     let checkpoint = CheckpointFile {
         format_version: manifest.format_version,
         sequence: manifest.last_sequence,
+        column_family_generations: manifest.column_family_generations.clone(),
+        next_column_family_generation: manifest.next_column_family_generation,
         segment_paths: manifest
             .segments
             .iter()

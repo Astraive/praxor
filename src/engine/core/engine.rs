@@ -10,8 +10,8 @@ use crate::errors::{PraxisError, Result};
 use crate::io::{IoRateLimiter, resolve_io_execution};
 use crate::maintenance::MaintenanceScheduler;
 use crate::manifest::{
-    CheckpointMetadata, ColumnFamilyDescriptor, ColumnFamilyOptions, CompactionJobStatus,
-    ManifestStore,
+    CheckpointMetadata, ColumnFamilyDescriptor, ColumnFamilyGeneration, ColumnFamilyOptions,
+    CompactionJobStatus, ManifestStore,
 };
 use crate::memory::{MemTable, SnapshotManager};
 use crate::metrics::EngineMetrics;
@@ -38,6 +38,10 @@ pub struct PraxisEngine {
     pub(crate) inner: Arc<EngineInner>,
 }
 
+#[cfg(test)]
+#[path = "engine/cf_generation_tests.rs"]
+mod cf_generation_tests;
+
 impl PraxisEngine {
     pub fn open(config: PraxisConfig) -> Result<Self> {
         config.validate()?;
@@ -56,17 +60,12 @@ impl PraxisEngine {
                 "open config differs from persisted effective engine config".to_string(),
             ));
         }
-        if manifest.column_families.is_empty() {
-            manifest
-                .column_families
-                .push(ColumnFamilyDescriptor::default());
-            manifest_store.save_with_policy(&manifest, config.direct_io)?;
-        }
         if job_state::reconcile_unfinished_jobs(&mut manifest) {
             manifest_store.save_with_policy(&manifest, config.direct_io)?;
         }
         let mut segment_index: BTreeMap<(ColumnFamily, Key), Vec<crate::types::VersionedValue>> =
             BTreeMap::new();
+        let active_generations = &manifest.column_family_generations;
         for segment in &manifest.segments {
             let entries = SegmentReader::read(
                 std::path::Path::new(&segment.path),
@@ -75,6 +74,12 @@ impl PraxisEngine {
             )?;
             let mut groups = BTreeMap::<(ColumnFamily, Key), Vec<VersionedValue>>::new();
             for entry in entries {
+                if !active_generations
+                    .get(&entry.cf.0)
+                    .is_some_and(|generation| generation.includes(entry.version.sequence))
+                {
+                    continue;
+                }
                 groups
                     .entry((entry.cf, entry.key))
                     .or_default()
@@ -97,11 +102,28 @@ impl PraxisEngine {
         let wal_records = Wal::replay_dir(&layout.wal_root())?;
         let mut memtable = MemTable::default();
         let snapshots = Arc::new(SnapshotManager::default());
-        for record in wal_records
-            .iter()
-            .filter(|record| record.sequence > manifest.flushed_sequence)
-        {
+        for record in &wal_records {
+            // Retired operations are invisible, but their durable sequence IDs
+            // must never be reused, including records below a flush cutoff.
+            snapshots.observe(record.sequence);
+            if record.sequence <= manifest.flushed_sequence
+                && !(record.sequence == 0 && manifest.flushed_sequence == 0)
+            {
+                continue;
+            }
             for op in record.batch.ops() {
+                let cf = match op {
+                    BatchOp::Put { cf, .. }
+                    | BatchOp::PutWithExpiry { cf, .. }
+                    | BatchOp::Merge { cf, .. }
+                    | BatchOp::Delete { cf, .. } => cf,
+                };
+                if !active_generations
+                    .get(&cf.0)
+                    .is_some_and(|generation| generation.includes(record.sequence))
+                {
+                    continue;
+                }
                 if manifest.flushed_sequence == 0 {
                     // Legacy flushes retained WALs without a durable cutoff.
                     // Prefer the complete WAL batch over its persisted copies;
@@ -120,7 +142,6 @@ impl PraxisEngine {
                 }
                 memtable.apply(record.sequence, op);
             }
-            snapshots.observe(record.sequence);
         }
         snapshots.observe(manifest.last_sequence);
         snapshots.observe(manifest.flushed_sequence);
@@ -289,15 +310,17 @@ impl PraxisEngine {
             self.validate_write_condition(&condition, &batch)?;
             return Ok(self.snapshot().sequence);
         }
-        self.validate_batch_column_families(&batch)?;
-        let batch = self.normalize_batch_with_cf_policies(batch)?;
+        let (batch, generations) = self.normalize_batch_with_cf_policies(batch)?;
         self.relieve_l0_pressure_before_write()?;
         let ops = batch.len();
         let encoded_len = WalRecord::encoded_batch_len(&batch);
-        let request =
-            self.inner
-                .group_commit
-                .admit(batch, condition, encoded_len, &self.inner.metrics)?;
+        let request = self.inner.group_commit.admit(
+            batch,
+            generations,
+            condition,
+            encoded_len,
+            &self.inner.metrics,
+        )?;
         let sequence = loop {
             match self.inner.group_commit.wait(&request) {
                 CommitTurn::Complete(result) => break result?,
@@ -339,7 +362,10 @@ impl PraxisEngine {
         let mut results = Vec::with_capacity(group.len());
         let mut valid = Vec::new();
         for request in &group {
-            match self.validate_write_condition(&request.condition, &request.batch) {
+            match self
+                .validate_captured_generations(&request.generations)
+                .and_then(|()| self.validate_write_condition(&request.condition, &request.batch))
+            {
                 Ok(()) => {
                     results.push(Ok(0));
                     valid.push(request);
@@ -472,8 +498,62 @@ impl PraxisEngine {
         drop(writer);
     }
 
-    fn normalize_batch_with_cf_policies(&self, batch: WriteBatch) -> Result<WriteBatch> {
-        let options = self.cf_options_map();
+    fn validate_captured_generations(&self, captured: &BTreeMap<String, u64>) -> Result<()> {
+        let manifest = self.inner.manifest.lock();
+        for (name, id) in captured {
+            if manifest
+                .column_family_generations
+                .get(name)
+                .map(|generation| generation.id)
+                != Some(*id)
+            {
+                return Err(PraxisError::WriteStalled {
+                    reason: format!(
+                        "column family {name:?} was dropped or replaced while its write was pending; retry the entire batch"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn normalize_batch_with_cf_policies(
+        &self,
+        batch: WriteBatch,
+    ) -> Result<(WriteBatch, BTreeMap<String, u64>)> {
+        let mut options = BTreeMap::new();
+        let mut generations = BTreeMap::new();
+        {
+            // Capture policy and incarnation in one manifest view, without the
+            // writer mutex. Followers can still accumulate behind that mutex.
+            let manifest = self.inner.manifest.lock();
+            for op in batch.ops() {
+                let cf = match op {
+                    BatchOp::Put { cf, .. }
+                    | BatchOp::PutWithExpiry { cf, .. }
+                    | BatchOp::Merge { cf, .. }
+                    | BatchOp::Delete { cf, .. } => cf,
+                };
+                if options.contains_key(&cf.0) {
+                    continue;
+                }
+                let descriptor = manifest
+                    .column_families
+                    .iter()
+                    .find(|descriptor| descriptor.name == cf.0)
+                    .ok_or_else(|| PraxisError::UnknownColumnFamily(cf.0.clone()))?;
+                let generation =
+                    manifest
+                        .column_family_generations
+                        .get(&cf.0)
+                        .ok_or_else(|| PraxisError::Corrupt {
+                            path: self.inner.manifest_store.path().to_path_buf(),
+                            reason: "active column family has no incarnation metadata".to_string(),
+                        })?;
+                options.insert(cf.0.clone(), descriptor.options.clone());
+                generations.insert(cf.0.clone(), generation.id);
+            }
+        }
         let mut normalized = WriteBatch::new();
         for op in batch.ops() {
             match op {
@@ -519,7 +599,7 @@ impl PraxisEngine {
                 }
             };
         }
-        Ok(normalized)
+        Ok((normalized, generations))
     }
 
     fn rotate_wal_if_needed(&self, next_record_len: usize) -> Result<()> {
@@ -644,6 +724,18 @@ impl PraxisEngine {
         }
         let name = descriptor.name.clone();
         let mut installed = manifest.clone();
+        let id = installed.next_column_family_generation;
+        installed.next_column_family_generation =
+            id.checked_add(1).ok_or_else(|| PraxisError::WriteStalled {
+                reason: "column-family generation space exhausted".to_string(),
+            })?;
+        installed.column_family_generations.insert(
+            name.clone(),
+            ColumnFamilyGeneration {
+                id,
+                visible_after_sequence: self.snapshot().sequence,
+            },
+        );
         installed.column_families.push(descriptor);
         if let Err(error) = self
             .inner
@@ -684,6 +776,7 @@ impl PraxisEngine {
             if installed.column_families.len() == original_len {
                 return Err(PraxisError::UnknownColumnFamily(name.to_string()));
             }
+            installed.column_family_generations.remove(name);
             if let Err(error) = self
                 .inner
                 .manifest_store
