@@ -22,6 +22,7 @@ const RECORD_MAGIC: u32 = 0x5452_4543;
 const PAGE_MANIFEST_MAGIC: u32 = 0x5450_4d46;
 const RID_DIRECTORY_MAGIC: u32 = 0x5452_4944;
 const CATALOG_MAGIC: u32 = 0x5443_4154;
+pub(crate) const CORE_COPY_INCOMPLETE: &str = "CORE_COPY_INCOMPLETE";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InspectionScope {
@@ -300,6 +301,16 @@ pub fn inspect_storage_root(path: &Path, options: InspectionOptions) -> Result<R
             inspector.report.diagnostics.push(problem);
         }
     }
+    if fs::symlink_metadata(root.join(CORE_COPY_INCOMPLETE)).is_ok() {
+        if inspector.report.kind != RootKind::Mixed {
+            inspector.report.kind = RootKind::Incomplete;
+        }
+        inspector.report.diagnostics.push(diagnostic(
+            &root.join(CORE_COPY_INCOMPLETE),
+            DiagnosticKind::MissingAuthority,
+            "core copy publication is incomplete; explicit retry or discard is required",
+        ));
+    }
     Ok(inspector.report)
 }
 
@@ -347,6 +358,7 @@ pub fn require_page_base_compatible(base: &Path, options: InspectionOptions) -> 
         Err(err) => return Err(err.into()),
     }
     for name in [
+        CORE_COPY_INCOMPLETE,
         "PRAXOR_ROOT",
         "PRAXOR_ROOT.tmp",
         "MANIFEST",

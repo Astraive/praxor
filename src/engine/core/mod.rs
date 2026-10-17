@@ -1,3 +1,4 @@
+mod backup;
 pub mod engine;
 pub(crate) mod group_commit;
 pub mod state;

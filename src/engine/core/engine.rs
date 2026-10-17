@@ -43,6 +43,10 @@ pub struct PraxisEngine {
 #[path = "engine/cf_generation_tests.rs"]
 mod cf_generation_tests;
 
+#[cfg(test)]
+#[path = "engine/backup_tests.rs"]
+mod backup_tests;
+
 impl PraxisEngine {
     pub fn open(config: PraxisConfig) -> Result<Self> {
         config.validate()?;
@@ -1477,23 +1481,52 @@ impl PraxisEngine {
     }
 
     pub fn backup_to(&self, backup_dir: impl AsRef<Path>) -> Result<()> {
+        use super::backup::{self, Capture, Phase, Stage};
         let started = std::time::Instant::now();
         let source_primary = lease_existing_primary(&self.inner._writer_lease)?;
-        validate_copy_tree(
-            self.inner.layout.root(),
-            source_primary.as_ref().map(WriterLease::root),
-            false,
-        )?;
         let (destination, _primary) =
             acquire_copy_destination(self.inner.layout.root(), backup_dir.as_ref())?;
-        self.checkpoint()?;
-        let backup_dir = destination.root();
-        clear_copy_destination(backup_dir)?;
-        copy_dir_recursive(self.inner.layout.root(), backup_dir)?;
+        let _maintenance = self.inner.maintenance_serialization.lock();
+        let capture = {
+            let _writer = self.inner.write_serialization.lock();
+            self.inner.group_commit.ensure_writable()?;
+            crate::storage::root_format::inspect_storage_root(
+                self.inner.layout.root(),
+                crate::storage::root_format::InspectionOptions::for_admission(),
+            )?
+            .require_compatible(crate::storage::root_format::RootOwner::Core)?;
+            validate_copy_tree(
+                self.inner.layout.root(),
+                source_primary.as_ref().map(WriterLease::root),
+                false,
+            )?;
+            if let Err(error) = self.inner.wal.lock().sync() {
+                self.inner.group_commit.poison(error.to_string());
+                return Err(PraxisError::RecoveryRequired);
+            }
+            let manifest = self.inner.manifest.lock().clone();
+            Capture::from_live(self.inner.layout.root(), manifest)?
+        };
+        backup::phase(Phase::Captured)?;
+        let stage = Stage::create(destination.root())?;
+        let staged = capture.stage(
+            stage.root(),
+            destination.root(),
+            self.inner.accelerator.as_ref(),
+        )?;
+        backup::publish(
+            destination.root(),
+            &stage,
+            staged,
+            self.inner.accelerator.as_ref(),
+        )?;
         slog::info(
             "backup_complete",
             slog::context()
-                .with_str("backup_dir", backup_dir.to_string_lossy().to_string())
+                .with_str(
+                    "backup_dir",
+                    destination.root().to_string_lossy().to_string(),
+                )
                 .with_u64("duration_ms", started.elapsed().as_millis() as u64)
                 .with_str("outcome", "success"),
         );
@@ -1504,24 +1537,30 @@ impl PraxisEngine {
         backup_dir: impl AsRef<Path>,
         target_dir: impl AsRef<Path>,
     ) -> Result<()> {
+        use super::backup::{self, Capture, Stage};
         let backup_dir = backup_dir.as_ref();
-        if !backup_dir.exists() {
-            return Err(PraxisError::InvalidConfig(format!(
-                "backup directory does not exist: {}",
-                backup_dir.to_string_lossy()
-            )));
+        if !backup_dir.is_dir() {
+            return Err(PraxisError::InvalidConfig(
+                "backup source must be an existing directory".into(),
+            ));
         }
         let source = WriterLease::acquire(backup_dir)?;
+        crate::storage::root_format::inspect_storage_root(
+            source.root(),
+            crate::storage::root_format::InspectionOptions::for_admission(),
+        )?
+        .require_compatible(crate::storage::root_format::RootOwner::Core)?;
         let source_primary = lease_existing_primary(&source)?;
         validate_copy_tree(
             source.root(),
             source_primary.as_ref().map(WriterLease::root),
             false,
         )?;
+        let capture = Capture::from_bundle(source.root())?;
         let (destination, _primary) = acquire_copy_destination(source.root(), target_dir.as_ref())?;
-        clear_copy_destination(destination.root())?;
-        copy_dir_recursive(source.root(), destination.root())?;
-        Ok(())
+        let stage = Stage::create(destination.root())?;
+        let staged = capture.stage(stage.root(), destination.root(), &CpuAccelerator)?;
+        backup::publish(destination.root(), &stage, staged, &CpuAccelerator)
     }
 
     pub fn close(&self) -> Result<()> {
@@ -1649,31 +1688,6 @@ fn apply_merge_operator(name: &str, current: &[u8], delta: &[u8]) -> Option<Vec<
     }
 }
 
-fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        if entry.file_name() == LOCK_FILE_NAME {
-            continue;
-        }
-        let src = entry.path();
-        let dst = destination.join(entry.file_name());
-        let kind = entry.file_type()?;
-        if kind.is_symlink() {
-            return Err(PraxisError::InvalidConfig(format!(
-                "backup source contains a symbolic link: {}",
-                src.display()
-            )));
-        }
-        if kind.is_dir() {
-            fs::create_dir_all(&dst)?;
-            copy_dir_recursive(&src, &dst)?;
-        } else {
-            fs::copy(&src, &dst)?;
-        }
-    }
-    Ok(())
-}
-
 fn acquire_copy_destination(
     source: &Path,
     destination: &Path,
@@ -1702,6 +1716,7 @@ fn acquire_copy_destination(
         primary_lease.as_ref().map(WriterLease::root),
         true,
     )?;
+    super::backup::require_destination(lease.root())?;
     Ok((lease, primary_lease))
 }
 
@@ -1796,35 +1811,6 @@ fn validate_copy_tree(root: &Path, primary: Option<&Path>, destination: bool) ->
             } else if kind.is_dir() {
                 stack.push(entry.path());
             }
-        }
-    }
-    Ok(())
-}
-
-fn clear_copy_destination(root: &Path) -> Result<()> {
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        if entry.file_name() == LOCK_FILE_NAME {
-            continue;
-        }
-        let path = entry.path();
-        let kind = entry.file_type()?;
-        if kind.is_symlink() {
-            // remove_dir removes a directory link itself on Windows. Never
-            // recurse through a destination link into another owned root.
-            #[cfg(windows)]
-            if path.is_dir() {
-                fs::remove_dir(path)?;
-                continue;
-            }
-            fs::remove_file(path)?;
-        } else if kind.is_dir() {
-            clear_copy_destination(&path)?;
-            if fs::read_dir(&path)?.next().is_none() {
-                fs::remove_dir(path)?;
-            }
-        } else {
-            fs::remove_file(path)?;
         }
     }
     Ok(())
