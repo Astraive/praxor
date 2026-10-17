@@ -1,7 +1,7 @@
 use crate::config::WalSyncPolicy;
 use crate::errors::{PraxisError, Result};
-use crate::io::BinaryWriter;
-use crate::wal::record::{WAL_RECORD_HEADER_LEN, WalRecord};
+use crate::io::{BinaryWriter, sync_parent_dir};
+use crate::wal::record::{WAL_MAGIC, WAL_RECORD_HEADER_LEN, WalRecord};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -37,7 +37,32 @@ impl Wal {
             let header = file_header(segment_id);
             file.write_all(&header)?;
             file.sync_data()?;
+            sync_parent_dir(&path)?;
             bytes_written = header.len() as u64;
+        } else {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            let (_, valid_len) = replay_records(&bytes, &path)?;
+            if is_partial_file_header(&bytes) {
+                let header = file_header(segment_id);
+                if !header.starts_with(&bytes) {
+                    return Err(PraxisError::Corrupt {
+                        path: path.clone(),
+                        reason: "WAL file header prefix does not match segment id".to_string(),
+                    });
+                }
+                file.seek(SeekFrom::Start(0))?;
+                file.write_all(&header)?;
+                file.sync_data()?;
+                sync_parent_dir(&path)?;
+                bytes_written = header.len() as u64;
+            } else if valid_len < bytes.len() {
+                // Remove the incomplete append before any new records can be
+                // written behind it and become unreachable during replay.
+                file.set_len(valid_len as u64)?;
+                file.sync_data()?;
+                bytes_written = valid_len as u64;
+            }
         }
         Ok(Self {
             path,
@@ -96,26 +121,7 @@ impl Wal {
         let mut file = File::open(path)?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
-        let mut offset = file_payload_offset(&bytes, path)?;
-        let mut records = Vec::new();
-        while offset + WAL_RECORD_HEADER_LEN <= bytes.len() {
-            let len = u32::from_le_bytes([
-                bytes[offset + 4],
-                bytes[offset + 5],
-                bytes[offset + 6],
-                bytes[offset + 7],
-            ]) as usize;
-            if offset + WAL_RECORD_HEADER_LEN + len > bytes.len() {
-                break;
-            }
-            let record_bytes = &bytes[offset..offset + WAL_RECORD_HEADER_LEN + len];
-            match WalRecord::decode(record_bytes, path) {
-                Ok(record) => records.push(record),
-                Err(_) => break,
-            }
-            offset += WAL_RECORD_HEADER_LEN + len;
-        }
-        Ok(records)
+        replay_records(&bytes, path).map(|(records, _)| records)
     }
 
     pub fn truncate(&mut self) -> Result<()> {
@@ -134,6 +140,33 @@ impl Wal {
     }
 }
 
+/// Return the decoded records and the end of the last complete record.
+/// A short final header, or a valid header whose payload extends past EOF,
+/// is an incomplete append. A complete header with bad magic, or a complete
+/// record that fails decoding/checksum validation, is corruption and must
+/// never be silently discarded. Headerless legacy WALs use the same rules.
+fn replay_records(bytes: &[u8], path: &Path) -> Result<(Vec<WalRecord>, usize)> {
+    let mut offset = file_payload_offset(bytes, path)?;
+    let mut records = Vec::new();
+    while bytes.len() - offset >= WAL_RECORD_HEADER_LEN {
+        let magic = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        if magic != WAL_MAGIC {
+            return Err(PraxisError::Corrupt {
+                path: path.to_path_buf(),
+                reason: format!("bad WAL magic at offset {offset}"),
+            });
+        }
+        let len = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        if len > bytes.len() - offset - WAL_RECORD_HEADER_LEN {
+            break;
+        }
+        let end = offset + WAL_RECORD_HEADER_LEN + len;
+        records.push(WalRecord::decode(&bytes[offset..end], path)?);
+        offset = end;
+    }
+    Ok((records, offset))
+}
+
 fn file_header(segment_id: u64) -> Vec<u8> {
     let mut writer = BinaryWriter::new();
     writer.write_u32(WAL_FILE_MAGIC);
@@ -143,17 +176,28 @@ fn file_header(segment_id: u64) -> Vec<u8> {
 }
 
 fn file_payload_offset(bytes: &[u8], path: &Path) -> Result<usize> {
+    if is_partial_file_header(bytes) {
+        // An interrupted new segment has no complete records to replay.
+        // Wal::open will complete the header before reusing the segment.
+        return Ok(bytes.len());
+    }
+    if bytes.len() < 4 && WAL_MAGIC.to_le_bytes().starts_with(bytes) {
+        return Ok(0);
+    }
     if bytes.len() < 4 {
-        return Ok(0);
-    }
-    let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    if magic != WAL_FILE_MAGIC {
-        return Ok(0);
-    }
-    if bytes.len() < WAL_FILE_HEADER_LEN {
         return Err(PraxisError::Corrupt {
             path: path.to_path_buf(),
-            reason: "torn WAL file header".to_string(),
+            reason: "bad WAL file header prefix".to_string(),
+        });
+    }
+    let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    if magic == WAL_MAGIC {
+        return Ok(0); // Legacy headerless WAL.
+    }
+    if magic != WAL_FILE_MAGIC || bytes.len() < WAL_FILE_HEADER_LEN {
+        return Err(PraxisError::Corrupt {
+            path: path.to_path_buf(),
+            reason: "invalid WAL file header".to_string(),
         });
     }
     let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
@@ -164,4 +208,11 @@ fn file_payload_offset(bytes: &[u8], path: &Path) -> Result<usize> {
         });
     }
     Ok(WAL_FILE_HEADER_LEN)
+}
+
+fn is_partial_file_header(bytes: &[u8]) -> bool {
+    // Replay need not know the segment id, but every available byte of the
+    // magic and version must match. Open also checks the supplied segment id.
+    let known_len = bytes.len().min(8);
+    bytes.len() < WAL_FILE_HEADER_LEN && file_header(0)[..known_len] == bytes[..known_len]
 }

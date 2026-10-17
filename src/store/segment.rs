@@ -1,4 +1,5 @@
 use crate::errors::{PraxisError, Result};
+use crate::io::sync_parent_dir;
 use crc32fast::Hasher as Crc32Hasher;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -48,7 +49,10 @@ impl RecordSegment {
             file.write_all(&SEGMENT_MAGIC.to_le_bytes())?;
             file.write_all(&[SEGMENT_VERSION])?;
             file.write_all(&segment_id.to_le_bytes())?;
-            file.flush()?;
+            // Relocation WAL may outlive the source segments after compaction.
+            // Persist the new segment's header and directory entry first.
+            file.sync_all()?;
+            sync_parent_dir(path)?;
         }
 
         let write_offset = file.seek(SeekFrom::End(0))?;

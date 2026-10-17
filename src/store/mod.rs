@@ -34,6 +34,7 @@ pub use segment::RecordSegment;
 pub use wal::{StorageWal, StorageWalEntry, StorageWalOperation, StorageWalOptions};
 
 use crate::errors::Result;
+use crate::io::create_dir_all_durable;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
@@ -103,7 +104,7 @@ impl RecordStore {
     /// Open or create a record store rooted at `dir`.
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self> {
         let dir = dir.into();
-        fs::create_dir_all(dir.join(Self::SEGMENT_SUBDIR))?;
+        create_dir_all_durable(&dir.join(Self::SEGMENT_SUBDIR))?;
 
         let ind_path = dir.join(Self::INDIRECTION_FILE);
         let indirection = if ind_path.exists() {

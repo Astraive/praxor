@@ -9,7 +9,7 @@ use crate::memory::{MemTable, SnapshotManager};
 use crate::metrics::EngineMetrics;
 use crate::types::{ColumnFamily, Key, VersionedValue};
 use crate::wal::Wal;
-use parking_lot::{Condvar, Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, ReentrantMutex, RwLock};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -34,6 +34,9 @@ pub(crate) struct EngineInner {
     pub(crate) layout: DiskLayout,
     pub(crate) manifest_store: ManifestStore,
     pub(crate) cas_serialization: Mutex<()>,
+    pub(crate) write_serialization: Mutex<()>,
+    pub(crate) maintenance_serialization: ReentrantMutex<()>,
+    pub(crate) topology: RwLock<()>,
     pub(crate) manifest: Mutex<Manifest>,
     pub(crate) wal: Mutex<Wal>,
     pub(crate) memtable: RwLock<MemTable>,

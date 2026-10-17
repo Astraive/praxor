@@ -111,12 +111,30 @@ impl MemTable {
         out
     }
 
+    /// Enumerate keys without materializing or cloning their stored values.
+    pub fn keys(&self) -> impl Iterator<Item = (&ColumnFamily, &Key)> {
+        self.entries.keys().map(|(cf, key)| (cf, key))
+    }
+
     pub fn drain_latest(&self) -> Vec<(ColumnFamily, Key, VersionedValue)> {
         self.entries
             .iter()
             .filter_map(|((cf, key), versions)| {
                 versions
                     .last()
+                    .cloned()
+                    .map(|version| (cf.clone(), key.clone(), version))
+            })
+            .collect()
+    }
+
+    /// Flush every version; compaction alone decides when history is obsolete.
+    pub fn versions(&self) -> Vec<(ColumnFamily, Key, VersionedValue)> {
+        self.entries
+            .iter()
+            .flat_map(|((cf, key), versions)| {
+                versions
+                    .iter()
                     .cloned()
                     .map(|version| (cf.clone(), key.clone(), version))
             })
