@@ -6,6 +6,7 @@ use super::{CompactionStats, PhysicalLocation, PreparedCompaction, RecordId, Rec
 use crate::cache::BlockCache;
 use crate::errors::{PraxisError, Result};
 use crate::index::{IndexPlugin, IndexStats};
+use crate::io::create_dir_all_durable;
 use crate::kernel::{
     KernelCompactionReport, KernelInvariantValidator, KernelSnapshot, KernelStorageReport,
     StorageKernel, StorageOperationMetrics,
@@ -258,9 +259,9 @@ impl StorageEngine {
         options: StorageEngineOptions,
     ) -> Result<Self> {
         let root = root.into();
-        std::fs::create_dir_all(&root)?;
-        std::fs::create_dir_all(root.join(Self::INDEX_DIR))?;
-        std::fs::create_dir_all(root.join(Self::WAL_DIR))?;
+        create_dir_all_durable(&root)?;
+        create_dir_all_durable(&root.join(Self::INDEX_DIR))?;
+        create_dir_all_durable(&root.join(Self::WAL_DIR))?;
 
         let mut store = RecordStore::open(root.join(Self::PRIMARY_DIR))?;
         let wal_path = root.join(Self::WAL_DIR).join(Self::WAL_FILE);
@@ -652,12 +653,13 @@ impl StorageEngine {
 
     pub fn compact_primary(&mut self) -> Result<CompactionStats> {
         let started = Instant::now();
+        let job_id = compaction_job_id(self.manifest.last_sequence);
         let prepared = self.prepare_primary_compaction()?;
         let cleaned_segments = self
             .store
             .complete_compaction_cleanup(&prepared.old_segment_ids, prepared.new_segment_id)?;
         self.append_manifest_edit(ManifestEdit::CompactionCleanupComplete {
-            job_id: compaction_job_id(self.manifest.last_sequence),
+            job_id,
             cleaned_segments,
         })?;
         record_latency(&self.compaction_latency, started);
@@ -968,6 +970,26 @@ impl StorageEngine {
             old_segments: old_segments.clone(),
         })?;
         let prepared = self.store.compact_prepare()?;
+        // Recovery replays the complete primary WAL, including the physical
+        // locations written before compaction. Persist replacement locations
+        // before installing the compaction or deleting any source segments.
+        // This also makes relocation recoverable if the directory is lost.
+        let mut relocations = self
+            .store
+            .indirection
+            .live_rids()
+            .map(|rid| {
+                Ok(StorageWalEntry {
+                    sequence: 0,
+                    index_type: "primary".to_string(),
+                    key: encode_location(self.store.location(rid)?),
+                    rid: Some(rid),
+                    operation: StorageWalOperation::Put,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        relocations.sort_by_key(|entry| entry.rid);
+        self.append_wal_batch(&mut relocations)?;
         self.append_manifest_edit(ManifestEdit::CompactionInstalled {
             job_id,
             old_segments,
