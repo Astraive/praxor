@@ -91,7 +91,7 @@ fn local_sdk_executes_primitive_batch_record_flow() {
 #[test]
 fn local_page_sdk_executes_cid_eid_rid_flow() {
     let dir = tempdir().unwrap();
-    let client = LocalPagepraxisClient::open(dir.path());
+    let client = LocalPagepraxisClient::open(dir.path()).unwrap();
 
     let put = client
         .put_page_record(

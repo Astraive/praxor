@@ -132,11 +132,13 @@ fn page_record_store_persists_rid_to_page_slot_mapping() {
             .exists()
     );
 
+    drop(store);
     let reopened = PageRecordStore::open(dir.path(), Cid(1), Eid(2)).unwrap();
     assert_eq!(reopened.get(rid).unwrap(), b"Neeraj");
     assert_eq!(
         reopened
             .directory()
+            .unwrap()
             .vid_for(rid, FieldId::Fixed(Aid(1)))
             .unwrap()
             .to_global_hex(),

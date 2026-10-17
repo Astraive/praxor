@@ -2,6 +2,7 @@ use crate::config::WalSyncPolicy;
 use crate::errors::{PraxisError, Result};
 use crate::identity::{Aid, Cid, Did, Eid, FieldId, Rid};
 use crate::io::{BinaryReader, BinaryWriter, crc32c};
+use crate::record::PageDatabase;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -36,11 +37,31 @@ pub struct PageWalRecord {
 
 #[derive(Debug)]
 pub struct PageWal {
+    pub(crate) database: PageDatabase,
     path: PathBuf,
+}
+
+pub(crate) struct PageWalWriter {
     file: File,
     sync_policy: WalSyncPolicy,
     next_sequence: u64,
     bytes_written: u64,
+    #[cfg(test)]
+    failure: Option<PageWalFailure>,
+}
+
+/// Per-writer, one-shot IO faults; absent from non-test builds.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum PageWalFailure {
+    AppendAfterPrefix(usize),
+    Sync,
+}
+
+pub(crate) struct PreparedPageWalRecord {
+    record: PageWalRecord,
+    encoded: Vec<u8>,
+    next_bytes: u64,
 }
 
 impl PageWalRecord {
@@ -120,6 +141,9 @@ impl PageWalRecord {
                 let eid = Eid(reader.read_u32()?);
                 let rid = Rid(reader.read_u64()?);
                 let count = reader.read_u32()? as usize;
+                if count > reader.remaining() / 9 {
+                    return corrupt(&source, "page WAL field count exceeds its actual payload");
+                }
                 let mut fields = Vec::with_capacity(count);
                 for _ in 0..count {
                     let field = read_field(&mut reader, &source)?;
@@ -140,13 +164,40 @@ impl PageWalRecord {
             },
             _ => return corrupt(&source, &format!("unknown page WAL mutation tag {tag}")),
         };
+        if reader.remaining() != 0 {
+            return corrupt(&source, "trailing bytes in page WAL mutation");
+        }
         Ok(Self { sequence, mutation })
     }
 }
 
 impl PageWal {
-    pub fn open(path: impl Into<PathBuf>, sync_policy: WalSyncPolicy) -> Result<Self> {
+    pub(crate) fn from_owner(database: PageDatabase, path: PathBuf) -> Self {
+        Self { database, path }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn bytes_written(&self) -> Result<u64> {
+        self.database.page_wal_bytes()
+    }
+
+    pub fn sync(&mut self) -> Result<()> {
+        self.database.sync_page_wal()
+    }
+
+    /// Forensic prefix replay only. A successful prefix is not complete recovery.
+    pub fn replay(path: &Path) -> Result<Vec<PageWalRecord>> {
+        replay_prefix(path)
+    }
+}
+
+impl PageWalWriter {
+    pub(crate) fn open(path: impl Into<PathBuf>, sync_policy: WalSyncPolicy) -> Result<Self> {
         let path = path.into();
+        let records = read_records_strict(&path)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -163,30 +214,39 @@ impl PageWal {
             file.sync_data()?;
             bytes_written = header.len() as u64;
         }
-        let next_sequence = Self::replay(&path)?
+        let next_sequence = records
             .iter()
             .map(|record| record.sequence)
             .max()
             .unwrap_or(0)
             .saturating_add(1);
         Ok(Self {
-            path,
             file,
             sync_policy,
             next_sequence,
             bytes_written,
+            #[cfg(test)]
+            failure: None,
         })
     }
 
-    pub fn append_put(
-        &mut self,
+    pub(crate) fn prepare_put(
+        &self,
         cid: Cid,
         eid: Eid,
         rid: Rid,
         fields: &[(FieldId, &[u8])],
-    ) -> Result<PageWalRecord> {
+    ) -> Result<PreparedPageWalRecord> {
+        u32::try_from(fields.len()).map_err(|_| {
+            PraxisError::InvalidConfig("page WAL field count exceeds v1 range".to_string())
+        })?;
+        for (_, bytes) in fields {
+            u32::try_from(bytes.len()).map_err(|_| {
+                PraxisError::InvalidConfig("page WAL field length exceeds v1 range".to_string())
+            })?;
+        }
         let record = PageWalRecord {
-            sequence: self.claim_sequence(),
+            sequence: self.claim_sequence()?,
             mutation: PageWalMutation::Put {
                 cid,
                 eid,
@@ -197,77 +257,183 @@ impl PageWal {
                     .collect(),
             },
         };
-        self.append(&record)?;
-        Ok(record)
+        self.prepare(record)
     }
 
-    pub fn append_delete(&mut self, cid: Cid, eid: Eid, rid: Rid) -> Result<PageWalRecord> {
+    pub(crate) fn prepare_delete(
+        &self,
+        cid: Cid,
+        eid: Eid,
+        rid: Rid,
+    ) -> Result<PreparedPageWalRecord> {
         let record = PageWalRecord {
-            sequence: self.claim_sequence(),
+            sequence: self.claim_sequence()?,
             mutation: PageWalMutation::Delete { cid, eid, rid },
         };
-        self.append(&record)?;
-        Ok(record)
+        self.prepare(record)
     }
 
-    pub fn append(&mut self, record: &PageWalRecord) -> Result<()> {
+    fn prepare(&self, record: PageWalRecord) -> Result<PreparedPageWalRecord> {
+        validate_identity(&record, Path::new("page-wal-input"))?;
         let encoded = record.encode();
-        self.file.seek(SeekFrom::End(0))?;
-        self.file.write_all(&encoded)?;
-        self.bytes_written = self.bytes_written.saturating_add(encoded.len() as u64);
-        if matches!(self.sync_policy, WalSyncPolicy::EveryBatch) {
-            self.file.sync_data()?;
-        }
-        Ok(())
+        u32::try_from(encoded.len().saturating_sub(PAGE_WAL_RECORD_HEADER_LEN)).map_err(|_| {
+            PraxisError::InvalidConfig("page WAL record exceeds v1 range".to_string())
+        })?;
+        let next_bytes = self
+            .bytes_written
+            .checked_add(encoded.len() as u64)
+            .ok_or_else(|| PraxisError::WriteStalled {
+                reason: "page WAL byte counter exhausted".to_string(),
+            })?;
+        Ok(PreparedPageWalRecord {
+            record,
+            encoded,
+            next_bytes,
+        })
     }
 
-    pub fn sync(&mut self) -> Result<()> {
+    pub(crate) fn append_prepared(
+        &mut self,
+        prepared: PreparedPageWalRecord,
+    ) -> Result<PageWalRecord> {
+        self.file.seek(SeekFrom::End(0))?;
+        #[cfg(test)]
+        if let Some(PageWalFailure::AppendAfterPrefix(len)) = self.failure {
+            self.failure = None;
+            self.file
+                .write_all(&prepared.encoded[..len.min(prepared.encoded.len())])?;
+            return Err(std::io::Error::other("injected partial page WAL append").into());
+        }
+        self.file.write_all(&prepared.encoded)?;
+        if matches!(
+            self.sync_policy,
+            WalSyncPolicy::EveryBatch | WalSyncPolicy::GroupCommit
+        ) {
+            self.sync()?;
+        }
+        self.bytes_written = prepared.next_bytes;
+        self.next_sequence = prepared.record.sequence.saturating_add(1);
+        Ok(prepared.record)
+    }
+
+    pub(crate) fn sync(&mut self) -> Result<()> {
+        #[cfg(test)]
+        if matches!(self.failure, Some(PageWalFailure::Sync)) {
+            self.failure = None;
+            return Err(std::io::Error::other("injected page WAL sync failure").into());
+        }
         self.file.sync_data()?;
         Ok(())
     }
 
-    pub fn replay(path: &Path) -> Result<Vec<PageWalRecord>> {
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        let mut file = File::open(path)?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        let mut offset = file_payload_offset(&bytes, path)?;
-        let mut records = Vec::new();
-        while offset + PAGE_WAL_RECORD_HEADER_LEN <= bytes.len() {
-            let len = u32::from_le_bytes([
-                bytes[offset + 5],
-                bytes[offset + 6],
-                bytes[offset + 7],
-                bytes[offset + 8],
-            ]) as usize;
-            if offset + PAGE_WAL_RECORD_HEADER_LEN + len > bytes.len() {
-                break;
-            }
-            let record_bytes = &bytes[offset..offset + PAGE_WAL_RECORD_HEADER_LEN + len];
-            match PageWalRecord::decode(record_bytes, path) {
-                Ok(record) => records.push(record),
-                Err(_) => break,
-            }
-            offset += PAGE_WAL_RECORD_HEADER_LEN + len;
-        }
-        Ok(records)
+    #[cfg(test)]
+    pub(crate) fn fail_next(&mut self, failure: PageWalFailure) {
+        self.failure = Some(failure);
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn bytes_written(&self) -> u64 {
+    pub(crate) fn bytes_written(&self) -> u64 {
         self.bytes_written
     }
 
-    fn claim_sequence(&mut self) -> u64 {
-        let sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.saturating_add(1);
-        sequence
+    pub(crate) fn policy(&self) -> WalSyncPolicy {
+        self.sync_policy
     }
+
+    fn claim_sequence(&self) -> Result<u64> {
+        if self.next_sequence == 0 || self.next_sequence == u64::MAX {
+            return Err(PraxisError::WriteStalled {
+                reason: "page WAL sequence space is exhausted".to_string(),
+            });
+        }
+        Ok(self.next_sequence)
+    }
+}
+
+fn replay_prefix(path: &Path) -> Result<Vec<PageWalRecord>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let mut file = File::open(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let mut offset = file_payload_offset(&bytes, path)?;
+    let mut records = Vec::new();
+    while offset + PAGE_WAL_RECORD_HEADER_LEN <= bytes.len() {
+        let len = u32::from_le_bytes([
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
+            bytes[offset + 8],
+        ]) as usize;
+        if offset + PAGE_WAL_RECORD_HEADER_LEN + len > bytes.len() {
+            break;
+        }
+        let record_bytes = &bytes[offset..offset + PAGE_WAL_RECORD_HEADER_LEN + len];
+        match PageWalRecord::decode(record_bytes, path) {
+            Ok(record) => records.push(record),
+            Err(_) => break,
+        }
+        offset += PAGE_WAL_RECORD_HEADER_LEN + len;
+    }
+    Ok(records)
+}
+
+pub(crate) fn read_records_strict(path: &Path) -> Result<Vec<PageWalRecord>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut offset = file_payload_offset(&bytes, path)?;
+    let mut records = Vec::new();
+    let mut previous = 0;
+    while offset < bytes.len() {
+        let header_end = offset
+            .checked_add(PAGE_WAL_RECORD_HEADER_LEN)
+            .ok_or_else(|| PraxisError::Corrupt {
+                path: path.to_path_buf(),
+                reason: "page WAL header length overflow".to_string(),
+            })?;
+        let header = bytes
+            .get(offset..header_end)
+            .ok_or_else(|| PraxisError::Corrupt {
+                path: path.to_path_buf(),
+                reason: "incomplete page WAL suffix".to_string(),
+            })?;
+        let len =
+            u32::from_le_bytes(header[5..9].try_into().expect("four-byte header length")) as usize;
+        let end = header_end
+            .checked_add(len)
+            .ok_or_else(|| PraxisError::Corrupt {
+                path: path.to_path_buf(),
+                reason: "page WAL payload length overflow".to_string(),
+            })?;
+        let encoded = bytes.get(offset..end).ok_or_else(|| PraxisError::Corrupt {
+            path: path.to_path_buf(),
+            reason: "incomplete page WAL suffix".to_string(),
+        })?;
+        let record = PageWalRecord::decode(encoded, path)?;
+        validate_identity(&record, path)?;
+        if record.sequence <= previous {
+            return corrupt(path, "page WAL sequences must strictly increase");
+        }
+        previous = record.sequence;
+        records.push(record);
+        offset = end;
+    }
+    Ok(records)
+}
+
+pub(crate) fn validate_identity(record: &PageWalRecord, path: &Path) -> Result<()> {
+    let (cid, eid, rid) = match &record.mutation {
+        PageWalMutation::Put { cid, eid, rid, .. } | PageWalMutation::Delete { cid, eid, rid } => {
+            (*cid, *eid, *rid)
+        }
+    };
+    if record.sequence == 0 || cid.is_null() || eid.is_null() || rid.is_null() {
+        return corrupt(path, "reserved zero identity in page WAL record");
+    }
+    Ok(())
 }
 
 fn write_field(writer: &mut BinaryWriter, field: FieldId) {
@@ -285,7 +451,10 @@ fn write_field(writer: &mut BinaryWriter, field: FieldId) {
 
 fn read_field(reader: &mut BinaryReader<'_>, source: &Path) -> Result<FieldId> {
     let tag = reader.read_u8()?;
-    let raw = reader.read_u32()? as u16;
+    let raw = u16::try_from(reader.read_u32()?).map_err(|_| PraxisError::Corrupt {
+        path: source.to_path_buf(),
+        reason: "page WAL field ID exceeds its v1 range".to_string(),
+    })?;
     match tag {
         1 => Ok(FieldId::Fixed(Aid(raw))),
         2 => Ok(FieldId::Dynamic(Did(raw))),

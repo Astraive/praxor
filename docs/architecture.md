@@ -1,5 +1,7 @@
 # Praxis Storage Kernel Architecture
 
+Page primitive ownership and v1 compatibility are documented in [Page database ownership](page-record-ownership.md).
+
 Praxis is a universal storage kernel for building databases. It is not a database, query engine, SQL parser, graph query layer, vector query language, distributed coordinator, ORM, or API gateway.
 
 The core design is:

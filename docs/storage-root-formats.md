@@ -85,9 +85,14 @@ empty directories without claiming them. Namespace aliases, foreign core/pointer
 record artifacts, and reserved markers are refused without following aliases.
 `PageNamespace` inspection never appends a second `.praxis`.
 
-The shared helper is available in this phase. Its writable `PageDatabase` hook
-and page wrong-open matrix remain part of #36/#40; existing page constructors
-must not be described as guarded until that integration is merged.
+`PageDatabase::open` invokes the helper with the admission profile under its base
+lease before any WAL read or page initialization. Entity, page service, local SDK,
+and explicit recovery constructors delegate to that owner. A complete empty
+scaffold may additionally contain the exact regular 16-byte v1 page-WAL header;
+malformed headers and logs-only partial namespaces remain refused. Catalog
+constructors remain a separate ownership/admission task in
+[#48](https://github.com/Astraive/praxor/issues/48), so
+[#40](https://github.com/Astraive/praxor/issues/40) stays open.
 
 ## Refusal and compatibility limits
 
