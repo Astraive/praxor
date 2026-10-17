@@ -279,7 +279,7 @@ fn a_client_cannot_reuse_stale_or_foreign_compiled_selects() {
     let foreign = tokens();
     let bad_row = Record::new("other", "bad");
     assert!(matches!(
-        execute_in_memory(&foreign, &select, &[bad_row.clone()]),
+        execute_in_memory(&foreign, &select, std::slice::from_ref(&bad_row)),
         Err(QueryCompileError::ForeignCatalog)
     ));
     authority
@@ -307,7 +307,8 @@ fn every_required_legacy_feature_is_refused_before_unbound_fallback() {
         ),
         Err(QueryCompileError::LegacyPlanUnbound)
     ));
-    let cases: [(&str, fn(&mut LogicalPlan)); 20] = [
+    type LegacyFeatureCase = (&'static str, fn(&mut LogicalPlan));
+    let cases: [LegacyFeatureCase; 20] = [
         ("operation", |plan| plan.operation = QueryOperation::Watch),
         ("join", |plan| {
             plan.joins.push(JoinClause {
