@@ -10,6 +10,8 @@ use std::path::Path;
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     pub format_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_authority: Option<crate::core_records::RecordAuthority>,
     #[serde(default)]
     pub effective_config: PersistedEngineConfig,
     #[serde(default = "default_active_wal_id")]
@@ -41,6 +43,7 @@ impl Manifest {
     pub fn fresh(config: &PraxisConfig) -> Self {
         Self {
             format_version: 2,
+            record_authority: None,
             effective_config: config.persisted(),
             active_wal_id: 1,
             next_wal_id: 2,
@@ -72,6 +75,7 @@ impl Manifest {
         #[derive(Deserialize)]
         struct Header {
             format_version: u32,
+            record_authority: Option<serde::de::IgnoredAny>,
             column_family_generations: Option<serde::de::IgnoredAny>,
             next_column_family_generation: Option<serde::de::IgnoredAny>,
         }
@@ -83,11 +87,19 @@ impl Manifest {
             path: source.to_path_buf(),
             reason: reason.to_string(),
         };
-        if !matches!(header.format_version, 1 | 2) {
+        if !matches!(header.format_version, 1..=3) {
             return Err(corrupt("unsupported manifest format version"));
         }
-        // Defaults exist solely for v1; every v2 file carries complete metadata.
-        if header.format_version == 2
+        if header.format_version < 3 && header.record_authority.is_some() {
+            return Err(corrupt(
+                "legacy manifest contains record authority metadata",
+            ));
+        }
+        if header.format_version == 3 && header.record_authority.is_none() {
+            return Err(corrupt("v3 manifest is missing record authority metadata"));
+        }
+        // Defaults exist solely for v1; later files carry complete metadata.
+        if header.format_version >= 2
             && (header.column_family_generations.is_none()
                 || header.next_column_family_generation.is_none())
         {
@@ -105,8 +117,17 @@ impl Manifest {
             path: source.to_path_buf(),
             reason: reason.to_string(),
         };
-        if !matches!(self.format_version, 1 | 2) {
+        if !matches!(self.format_version, 1..=3) {
             return Err(corrupt("unsupported manifest format version"));
+        }
+        match (self.format_version, &self.record_authority) {
+            (1 | 2, Some(_)) => {
+                return Err(corrupt(
+                    "legacy manifest contains record authority metadata",
+                ));
+            }
+            (3, None) => return Err(corrupt("v3 manifest is missing record authority metadata")),
+            _ => {}
         }
         if self.format_version == 1 {
             if !self.column_family_generations.is_empty() || self.next_column_family_generation != 1
@@ -172,7 +193,33 @@ impl Manifest {
         if self.next_column_family_generation == 0 {
             return Err(corrupt("column-family generation counter must be positive"));
         }
+        if let Some(authority) = &self.record_authority {
+            authority.validate(self, source)?;
+        }
         Ok(())
+    }
+
+    pub(crate) fn fresh_records(
+        config: &PraxisConfig,
+        authority: crate::core_records::RecordAuthority,
+    ) -> Self {
+        let mut manifest = Self::fresh(config);
+        manifest.format_version = 3;
+        manifest.last_sequence = 1;
+        manifest.next_column_family_generation = 5;
+        for index in 0..4 {
+            let descriptor = authority.descriptor(index, &manifest);
+            manifest.column_family_generations.insert(
+                descriptor.name.clone(),
+                ColumnFamilyGeneration {
+                    id: index as u64 + 1,
+                    visible_after_sequence: 0,
+                },
+            );
+            manifest.column_families.push(descriptor);
+        }
+        manifest.record_authority = Some(authority);
+        manifest
     }
 }
 
@@ -288,3 +335,7 @@ impl Default for ColumnFamilyOptions {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "record_authority_tests.rs"]
+mod record_authority_tests;

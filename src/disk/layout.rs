@@ -8,6 +8,9 @@ pub struct DiskLayout {
 }
 
 impl DiskLayout {
+    pub(crate) fn at(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
     pub fn create(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         for dir in [
