@@ -1,3 +1,5 @@
+#[path = "support/page_wal_legacy.rs"]
+mod legacy;
 use praxis::config::WalSyncPolicy;
 use praxis::identity::{Aid, Cid, Eid, FieldId, Rid};
 use praxis::record::PageDatabase;
@@ -26,7 +28,7 @@ fn file_bytes(records: &[PageWalRecord]) -> Vec<u8> {
     bytes.extend_from_slice(&1_u32.to_le_bytes());
     bytes.extend_from_slice(&0_u64.to_le_bytes());
     for record in records {
-        bytes.extend_from_slice(&record.encode());
+        bytes.extend_from_slice(&legacy::encode(record));
     }
     bytes
 }
@@ -37,7 +39,7 @@ fn writable_page_wal_refuses_a_torn_suffix_without_changing_it() {
     let database = PageDatabase::open(dir.path()).unwrap();
     let path = log_path(dir.path());
     let mut bytes = file_bytes(&[record(1, 1)]);
-    bytes.extend_from_slice(&record(2, 2).encode()[..7]);
+    bytes.extend_from_slice(&legacy::encode(&record(2, 2))[..7]);
     std::fs::write(&path, &bytes).unwrap();
 
     let result = database.page_wal(WalSyncPolicy::EveryBatch);
@@ -54,16 +56,18 @@ fn writable_page_wal_refuses_bad_middle_crc_even_with_a_later_valid_record() {
     let database = PageDatabase::open(dir.path()).unwrap();
     let path = log_path(dir.path());
     let mut bytes = file_bytes(&[record(1, 1)]);
-    let mut bad = record(2, 2).encode();
+    let mut bad = legacy::encode(&record(2, 2));
     bad[9] ^= 1;
     bytes.extend_from_slice(&bad);
-    bytes.extend_from_slice(&record(3, 3).encode());
+    bytes.extend_from_slice(&legacy::encode(&record(3, 3)));
     std::fs::write(&path, &bytes).unwrap();
-    assert_eq!(
-        PageWal::replay(&path).unwrap().len(),
-        1,
-        "forensic prefix control"
-    );
+    assert!(PageWal::replay(&path).is_err());
+    let report = PageWal::replay_prefix(&path).unwrap();
+    assert_eq!(report.records.len(), 1);
+    assert!(matches!(
+        report.stop,
+        praxis::wal::page::PageWalScanStop::Corrupt { .. }
+    ));
 
     assert!(
         database.page_wal(WalSyncPolicy::EveryBatch).is_err(),

@@ -743,15 +743,12 @@ impl Inspector {
                 if is_alias(&meta) || !meta.is_file() || meta.len() != 16 {
                     return Err(damaged(
                         &page_wal,
-                        "empty page WAL must be an exact v1 header",
+                        "empty page WAL must be an exact v1 or v2 header",
                     ));
                 }
                 let bytes = self.control(&page_wal)?;
-                let mut header = [0_u8; 16];
-                header[..4].copy_from_slice(&0x5450_5746_u32.to_le_bytes());
-                header[4..8].copy_from_slice(&1_u32.to_le_bytes());
-                if bytes != header {
-                    return Err(damaged(&page_wal, "invalid empty page WAL v1 header"));
+                if !crate::wal::page::is_empty_header(&bytes) {
+                    return Err(damaged(&page_wal, "invalid empty page WAL header"));
                 }
                 expected.insert(page_wal.clone(), false);
                 Some(page_wal)
