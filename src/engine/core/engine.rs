@@ -451,12 +451,6 @@ impl PraxisEngine {
         }
     }
 
-    // This complete private primitive is wired into the record facade in the
-    // next F1b checkpoint; it is not a public placeholder writer or a no-op.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "F1b facade wiring follows the queue checkpoint")
-    )]
     pub(crate) fn durable_barrier(&self) -> Result<u64> {
         self.inner.group_commit.ensure_writable()?;
         let request = self.inner.group_commit.admit_barrier(&self.inner.metrics)?;
@@ -471,13 +465,6 @@ impl PraxisEngine {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "private planner checkpoint; public facade follows"
-        )
-    )]
     pub(crate) fn commit_record(
         &self,
         intent: crate::core_records::intent::RecordIntent,
@@ -1670,6 +1657,26 @@ impl PraxisEngine {
     }
 
     pub fn verify(&self) -> Result<crate::recovery::VerificationReport> {
+        // V3 validates one stable in-memory authority and exact WAL prefixes.
+        // Clone writes may continue after capture; maintenance retains files.
+        let _maintenance = self.inner.maintenance_serialization.lock();
+        let capture = {
+            let _writer = self.inner.write_serialization.lock();
+            let manifest = self.inner.manifest.lock().clone();
+            if manifest.record_authority.is_some() {
+                self.inner.group_commit.ensure_writable()?;
+                Some(super::backup::Capture::from_live(
+                    self.inner.layout.root(),
+                    manifest,
+                )?)
+            } else {
+                None
+            }
+        };
+        if let Some(capture) = capture {
+            super::backup::phase(super::backup::Phase::Captured)?;
+            return capture.validate(self.inner.accelerator.as_ref());
+        }
         let manifest = self.inner.manifest.lock().clone();
         let mut report = crate::recovery::VerificationReport {
             manifest_generation: manifest.next_segment_id,

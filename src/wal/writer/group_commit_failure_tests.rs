@@ -5,6 +5,91 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 #[test]
+fn public_record_batches_and_flush_share_real_io_failure_poison() {
+    use crate::core_records::{CoreDatabase, RecordAuthorityOptions};
+    use crate::store::BatchRecord;
+    for fail_sync in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = PraxisConfig::new(dir.path());
+        config.wal_sync_policy = WalSyncPolicy::GroupCommit;
+        let db =
+            CoreDatabase::create_fresh(config.clone(), RecordAuthorityOptions { indexes: vec![] })
+                .unwrap();
+        let records = db.records();
+        assert_eq!(records.put(b"prior", &[]).unwrap(), crate::RecordId(1));
+        let engine = db.kv();
+        let writer = engine.inner.write_serialization.lock();
+        let wal_path = engine.inner.wal.lock().path().to_path_buf();
+        engine.inner.wal.lock().file = if fail_sync {
+            #[cfg(windows)]
+            let device = "NUL";
+            #[cfg(not(windows))]
+            let device = "/dev/null";
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(device)
+                .unwrap()
+        } else {
+            File::open(wal_path).unwrap()
+        };
+        let mut joins = Vec::new();
+        for _ in 0..4 {
+            let records = records.clone();
+            joins.push(std::thread::spawn(move || {
+                records.put_batch(&[BatchRecord::new(b"a", &[]), BatchRecord::new(b"b", &[])])
+            }));
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while engine
+            .inner
+            .metrics
+            .write_admissions
+            .load(Ordering::Relaxed)
+            != 5
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        drop(writer);
+        for join in joins {
+            assert!(matches!(
+                join.join().unwrap(),
+                Err(PraxisError::RecoveryRequired)
+            ));
+        }
+        assert!(matches!(
+            records.put_batch(&[]),
+            Err(PraxisError::RecoveryRequired)
+        ));
+        assert!(matches!(
+            records.fetch(crate::RecordId(1)),
+            Err(PraxisError::RecoveryRequired)
+        ));
+        assert!(matches!(
+            records.flush(),
+            Err(PraxisError::RecoveryRequired)
+        ));
+        assert!(matches!(
+            engine.garbage_collect(),
+            Err(PraxisError::RecoveryRequired)
+        ));
+        drop(records);
+        drop(engine);
+        drop(db);
+        let reopened = CoreDatabase::open(config).unwrap();
+        assert_eq!(
+            reopened.records().fetch(crate::RecordId(1)).unwrap(),
+            b"prior"
+        );
+        assert_eq!(
+            reopened.records().put(b"next", &[]).unwrap(),
+            crate::RecordId(2)
+        );
+    }
+}
+
+#[test]
 fn failed_core_append_wakes_group_and_poison_blocks_maintenance() {
     failed_core_io(false);
 }
