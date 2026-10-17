@@ -1,5 +1,6 @@
 use crate::errors::{PraxisError, Result};
 use crate::index::IndexStorageLayout;
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,7 +43,7 @@ impl CanonicalValuePolicy {
 pub struct DurableFormatDescriptor {
     pub structure: &'static str,
     pub format_version: u16,
-    pub checksum: &'static str,
+    pub checksum: Cow<'static, str>,
     pub forward_compatible: bool,
     pub independently_recoverable: bool,
 }
