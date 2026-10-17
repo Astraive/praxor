@@ -75,3 +75,7 @@ state. This cooperative lock protocol cannot protect against older binaries,
 raw utilities or external programs that ignore it. A live database is shared
 through engine clones or an explicitly shared engine handle, rather than by
 independently reopening its files.
+
+After acquiring ownership, supported core/pointer/record opens apply the
+[storage root format contract](storage-root-formats.md) before mutable initialization.
+The page admission helper is ready for the separate #36 coordinator integration.
