@@ -15,6 +15,7 @@ pub mod bitmap;
 pub mod bm25;
 pub mod btree;
 pub mod graph;
+pub(crate) mod history;
 pub mod hnsw;
 pub mod hybrid;
 pub mod inverted;
@@ -48,6 +49,15 @@ use serde::{Deserialize, Serialize};
 pub struct IndexStats {
     pub live_keys: u64,
     pub versions: u64,
+}
+
+/// Snapshot contract declared by an index plugin. Opting in requires preserving
+/// every raw ceiling through compaction, not merely implementing a read method.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum IndexSnapshotCapability {
+    #[default]
+    Unsupported,
+    RawSequenceCeilings,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -108,9 +118,27 @@ pub trait IndexPlugin: Send + Sync {
 
     /// Snapshot read: return the value visible at `sequence`.
     ///
-    /// Default behavior returns the latest value from [`Self::get`].
-    fn get_at(&self, key: &[u8], _sequence: u64) -> Option<RecordId> {
-        self.get(key)
+    /// The legacy default fails closed. Use [`Self::get_at_checked`] to
+    /// distinguish an unsupported plugin from an absent mapping.
+    fn get_at(&self, _key: &[u8], _sequence: u64) -> Option<RecordId> {
+        None
+    }
+
+    fn snapshot_read_capability(&self) -> IndexSnapshotCapability {
+        IndexSnapshotCapability::Unsupported
+    }
+
+    /// Read an index mapping at a raw sequence ceiling. Custom plugins must
+    /// explicitly opt in and implement sequence-aware mutation/retention.
+    fn get_at_checked(&self, key: &[u8], sequence: u64) -> Result<Option<RecordId>> {
+        match self.snapshot_read_capability() {
+            IndexSnapshotCapability::RawSequenceCeilings => Ok(self.get_at(key, sequence)),
+            IndexSnapshotCapability::Unsupported => {
+                Err(crate::errors::PraxisError::UnsupportedIndexSnapshotRead {
+                    index: self.name().to_string(),
+                })
+            }
+        }
     }
 
     /// Remove the mapping for `key` (insert a tombstone).
@@ -134,6 +162,12 @@ pub trait IndexPlugin: Send + Sync {
     /// Return plugin-level key/version counters.
     fn stats(&self) -> IndexStats {
         IndexStats::default()
+    }
+
+    /// Versions the next compaction may discard without breaking this plugin's
+    /// snapshot contract. Required historical versions are not reclaimable.
+    fn reclaimable_version_count(&self) -> u64 {
+        0
     }
 
     /// Durable storage layout declaration used to enforce praxis's

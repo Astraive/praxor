@@ -14,7 +14,8 @@ pub use pipeline::{
 };
 
 use crate::errors::{PraxisError, Result};
-use crate::index::{IndexPlugin, IndexStats};
+use crate::index::history::{reclaimable_versions, retain_snapshot_versions};
+use crate::index::{IndexPlugin, IndexSnapshotCapability, IndexStats};
 use crate::io::{BinaryReader, BinaryWriter, crc32c};
 use crate::store::RecordId;
 use serde::{Deserialize, Serialize};
@@ -277,6 +278,10 @@ impl IndexPlugin for LsmIndex {
             .and_then(|versions| latest_visible(versions, sequence))
     }
 
+    fn snapshot_read_capability(&self) -> IndexSnapshotCapability {
+        IndexSnapshotCapability::RawSequenceCeilings
+    }
+
     fn delete(&mut self, key: &[u8]) -> Result<()> {
         let sequence = self.next_seq();
         self.delete_with_sequence(key, sequence)
@@ -310,12 +315,9 @@ impl IndexPlugin for LsmIndex {
 
     fn compact(&mut self) -> Result<()> {
         for versions in self.history.values_mut() {
-            if let Some(last) = versions.last().copied() {
-                versions.clear();
-                versions.push(last);
-            }
+            retain_snapshot_versions(versions, |version| version.sequence);
         }
-        self.history.retain(|_, versions| versions[0].rid.is_some());
+        self.history.retain(|_, versions| !versions.is_empty());
         self.rebuild_metadata();
         Ok(())
     }
@@ -325,6 +327,13 @@ impl IndexPlugin for LsmIndex {
             live_keys: self.live_keys.len() as u64,
             versions: self.version_count,
         }
+    }
+
+    fn reclaimable_version_count(&self) -> u64 {
+        self.history
+            .values()
+            .map(|versions| reclaimable_versions(versions, |version| version.sequence))
+            .sum()
     }
 }
 

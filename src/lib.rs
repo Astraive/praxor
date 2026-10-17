@@ -60,7 +60,6 @@ pub use engine::r#async::AsyncPraxisEngine;
 pub use errors::{PraxisError, Result};
 pub use execution::Executor;
 pub use identity::{Aid, Cid, Did, Eid, Fid, FieldId, Pid, RelativeVid, Rid, Sid, Vid, VidContext};
-pub use index::IndexPlugin;
 pub use index::{
     AdjacencyIndex, BTreeIndex, BitmapIndex, BoundingBox, HnswIndex, InvertedIndex, IvfFlatIndex,
     PackedRTreeIndex, TimePartition,
@@ -68,6 +67,7 @@ pub use index::{
 pub use index::{
     Bm25Index, GraphIndex, HybridWeights, RetrievalEngine, ScalarIndex, VectorIndex, VectorStrategy,
 };
+pub use index::{IndexPlugin, IndexSnapshotCapability};
 pub use maintenance::{JobPriority, MaintenanceRuntimeConfig, RuntimeLaneConfig};
 pub use planner::{PhysicalOperator, PhysicalPlan, Planner, PlannerStats};
 pub use query::{

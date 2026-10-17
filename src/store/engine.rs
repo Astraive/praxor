@@ -595,6 +595,8 @@ impl StorageEngine {
         Ok(plugin.get(key))
     }
 
+    /// Resolve an index mapping at a raw sequence ceiling. This does not make
+    /// `fetch(rid)` a historical payload read; primary liveness is independent.
     pub fn lookup_rid_at(
         &self,
         index_type: &str,
@@ -605,7 +607,7 @@ impl StorageEngine {
         let plugin = self.indexes.get(index_type).ok_or_else(|| {
             PraxisError::InvalidConfig(format!("unknown index plugin: {index_type}"))
         })?;
-        Ok(plugin.get_at(key, sequence))
+        plugin.get_at_checked(key, sequence)
     }
 
     pub fn fetch(&self, rid: RecordId) -> Result<Vec<u8>> {
@@ -935,8 +937,8 @@ impl StorageEngine {
 
     /// Heuristic maintenance planner for plugin-local compaction.
     ///
-    /// A suggestion is emitted when a plugin has significantly more total
-    /// versions than live keys.
+    /// Suggestions count only versions the plugin can safely discard under
+    /// its declared snapshot-retention contract.
     pub fn suggest_index_compactions(
         &self,
         stale_version_threshold: u64,
@@ -945,15 +947,13 @@ impl StorageEngine {
             .indexes
             .iter()
             .filter_map(|(index_type, plugin)| {
-                let stats = plugin.stats();
-                let stale_versions = stats.versions.saturating_sub(stats.live_keys);
-                (stale_versions >= stale_version_threshold).then(|| SuggestedMaintenanceJob {
-                    index_type: index_type.clone(),
-                    reason: format!(
-                        "stale version pressure: stale_versions={stale_versions}, live_keys={}",
-                        stats.live_keys
-                    ),
-                    estimated_versions_pruned: stale_versions,
+                let stale_versions = plugin.reclaimable_version_count();
+                (stale_versions > 0 && stale_versions >= stale_version_threshold).then(|| {
+                    SuggestedMaintenanceJob {
+                        index_type: index_type.clone(),
+                        reason: format!("safely reclaimable index versions={stale_versions}"),
+                        estimated_versions_pruned: stale_versions,
+                    }
                 })
             })
             .collect();
