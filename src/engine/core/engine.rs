@@ -1,3 +1,4 @@
+use super::group_commit::{CommitLeader, CommitTurn, GroupCommitCoordinator, WriteCondition};
 use super::state::{CacheKey, EngineInner};
 use crate::accel::gpu::GpuBackendKind;
 use crate::accel::{Accelerator, CpuAccelerator, GpuAccelerator};
@@ -31,7 +32,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct PraxisEngine {
@@ -146,10 +146,10 @@ impl PraxisEngine {
                     config.maintenance_retry_limit,
                 )),
                 runtime: Mutex::new(crate::maintenance::MaintenanceRuntimeController::default()),
+                group_commit: GroupCommitCoordinator::new(config.wal_segment_size),
                 config,
                 layout,
                 manifest_store,
-                cas_serialization: Mutex::new(()),
                 write_serialization: Mutex::new(()),
                 maintenance_serialization: parking_lot::ReentrantMutex::new(()),
                 topology: RwLock::new(()),
@@ -159,7 +159,6 @@ impl PraxisEngine {
                 segment_index: RwLock::new(segment_index),
                 immutable_memtables: Mutex::new(Vec::new()),
                 snapshots,
-                group_commit: crate::engine::core::state::GroupCommitCoordinator::default(),
                 metrics,
                 accelerator,
             }),
@@ -223,21 +222,16 @@ impl PraxisEngine {
         expected: Option<&[u8]>,
         value: impl Into<Value>,
     ) -> Result<SequenceNumber> {
-        let _write_guard = self.inner.cas_serialization.lock();
         let key = key.into();
         let mut batch = WriteBatch::new();
         batch.put_default(key.clone(), value);
-        self.write_batch_validated(batch, || {
-            let current = self.resolve_value_at_snapshot(
-                &ColumnFamily::default(),
-                &key,
-                self.snapshot().sequence,
-            )?;
-            if current.as_deref() != expected {
-                return Err(PraxisError::CompareAndSwapFailed);
-            }
-            Ok(())
-        })
+        self.write_batch_conditioned(
+            batch,
+            WriteCondition::CompareAndSwap {
+                key,
+                expected: expected.map(<[u8]>::to_vec),
+            },
+        )
     }
 
     pub fn begin_transaction(&self) -> OptimisticTransaction {
@@ -249,72 +243,72 @@ impl PraxisEngine {
         snapshot: ReadSnapshot,
         batch: WriteBatch,
     ) -> Result<SequenceNumber> {
-        self.write_batch_validated(batch.clone(), || {
-            self.validate_transaction_conflicts(snapshot, &batch)
-        })
+        self.write_batch_conditioned(batch, WriteCondition::Optimistic { snapshot })
     }
 
     pub fn write_batch(&self, batch: WriteBatch) -> Result<SequenceNumber> {
-        self.write_batch_inner(batch)
+        self.write_batch_conditioned(batch, WriteCondition::Unconditional)
     }
 
-    fn write_batch_inner(&self, batch: WriteBatch) -> Result<SequenceNumber> {
-        self.write_batch_validated(batch, || Ok(()))
+    fn validate_write_condition(
+        &self,
+        condition: &WriteCondition,
+        batch: &WriteBatch,
+    ) -> Result<()> {
+        self.validate_batch_column_families(batch)?;
+        match condition {
+            WriteCondition::Unconditional => Ok(()),
+            WriteCondition::CompareAndSwap { key, expected } => {
+                let current = self.resolve_value_at_snapshot(
+                    &ColumnFamily::default(),
+                    key,
+                    self.snapshot().sequence,
+                )?;
+                if current.as_deref() == expected.as_deref() {
+                    Ok(())
+                } else {
+                    Err(PraxisError::CompareAndSwapFailed)
+                }
+            }
+            WriteCondition::Optimistic { snapshot } => {
+                self.validate_transaction_conflicts(*snapshot, batch)
+            }
+        }
     }
 
-    fn write_batch_validated(
+    fn write_batch_conditioned(
         &self,
         batch: WriteBatch,
-        validate: impl FnOnce() -> Result<()>,
+        condition: WriteCondition,
     ) -> Result<SequenceNumber> {
         let started = std::time::Instant::now();
+        self.inner.group_commit.ensure_writable()?;
         if batch.is_empty() {
-            validate()?;
+            let _writer = self.inner.write_serialization.lock();
+            self.inner.group_commit.ensure_writable()?;
+            self.validate_write_condition(&condition, &batch)?;
             return Ok(self.snapshot().sequence);
         }
         self.validate_batch_column_families(&batch)?;
         let batch = self.normalize_batch_with_cf_policies(batch)?;
         self.relieve_l0_pressure_before_write()?;
-        let write_guard = self.inner.write_serialization.lock();
-        validate()?;
-        let sequence = self.inner.snapshots.next_sequence();
-        let record = WalRecord {
-            sequence,
-            batch: batch.clone(),
-        };
-        self.rotate_wal_if_needed(record.encoded_len())?;
-        self.inner.wal.lock().append(&record)?;
-        self.maybe_group_commit_wal()?;
-        {
-            let mut memtable = self.inner.memtable.write();
-            for op in batch.ops() {
-                memtable.apply(sequence, op);
-                match op {
-                    BatchOp::Put { .. } | BatchOp::PutWithExpiry { .. } | BatchOp::Merge { .. } => {
-                        self.inner.metrics.writes.fetch_add(1, Ordering::Relaxed);
-                    }
-                    BatchOp::Delete { .. } => {
-                        self.inner.metrics.deletes.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
+        let ops = batch.len();
+        let encoded_len = WalRecord::encoded_batch_len(&batch);
+        let request =
+            self.inner
+                .group_commit
+                .admit(batch, condition, encoded_len, &self.inner.metrics)?;
+        let sequence = loop {
+            match self.inner.group_commit.wait(&request) {
+                CommitTurn::Complete(result) => break result?,
+                CommitTurn::Lead(leader) => self.commit_closed_group(leader),
             }
-        }
-        self.inner.snapshots.observe(sequence);
-        self.inner
-            .metrics
-            .wal_records
-            .fetch_add(1, Ordering::Relaxed);
-        self.inner.manifest.lock().last_sequence = sequence;
-        // The synced WAL is authoritative between structural checkpoints.
-        // Flush/rotation persist the in-memory sequence with their manifest edit;
-        // ordinary batches need no second file rewrite, fsync or rename.
-        let memtable_bytes = self.inner.memtable.read().approximate_bytes();
-        self.inner
-            .metrics
-            .memtable_bytes
-            .store(memtable_bytes as u64, Ordering::Relaxed);
-        drop(write_guard);
-        if memtable_bytes >= self.inner.config.memtable_flush_threshold_bytes {
+        };
+        // Leadership was handed off before automatic maintenance. Preserve the
+        // existing contract: a postcommit flush failure can return an error.
+        if self.inner.memtable.read().approximate_bytes()
+            >= self.inner.config.memtable_flush_threshold_bytes
+        {
             self.flush()?;
             self.inner
                 .metrics
@@ -325,44 +319,157 @@ impl PraxisEngine {
             "write_batch",
             slog::context()
                 .with_u64("seq", sequence)
-                .with_u64("ops", batch.len() as u64)
+                .with_u64("ops", ops as u64)
                 .with_u64("duration_ms", started.elapsed().as_millis() as u64)
                 .with_str("outcome", "success"),
         );
         Ok(sequence)
     }
 
-    fn maybe_group_commit_wal(&self) -> Result<()> {
-        if !matches!(
-            self.inner.config.wal_sync_policy,
-            crate::config::WalSyncPolicy::GroupCommit
-        ) {
-            return Ok(());
+    fn commit_closed_group(&self, leader: CommitLeader<'_>) {
+        let writer = self.inner.write_serialization.lock();
+        // Rebind after the writer guard so unwind poisoning runs before the
+        // writer mutex can be handed to flush/GC or another leader.
+        let leader = leader;
+        if self.inner.group_commit.ensure_writable().is_err() {
+            leader.fail("core storage handle already requires recovery".to_string());
+            return;
         }
-
-        let mut state = self.inner.group_commit.state.lock();
-        state.enqueued_batch = state.enqueued_batch.saturating_add(1);
-        let target_batch = state.enqueued_batch;
-        if !state.leader_active {
-            state.leader_active = true;
-            drop(state);
-
-            std::thread::sleep(Duration::from_millis(1));
-            let sync_result = self.inner.wal.lock().sync();
-
-            let mut state = self.inner.group_commit.state.lock();
-            if sync_result.is_ok() {
-                state.synced_batch = state.enqueued_batch;
+        let group = leader.drain(self.inner.config.wal_sync_policy, &self.inner.metrics);
+        let mut results = Vec::with_capacity(group.len());
+        let mut valid = Vec::new();
+        for request in &group {
+            match self.validate_write_condition(&request.condition, &request.batch) {
+                Ok(()) => {
+                    results.push(Ok(0));
+                    valid.push(request);
+                }
+                Err(error) => results.push(Err(error)),
             }
-            state.leader_active = false;
-            self.inner.group_commit.ready.notify_all();
-            return sync_result;
         }
-
-        while state.synced_batch < target_batch {
-            self.inner.group_commit.ready.wait(&mut state);
+        if valid.is_empty() {
+            leader.finish(results);
+            drop(writer);
+            return;
         }
-        Ok(())
+        let Some(last_sequence) = self.snapshot().sequence.checked_add(valid.len() as u64) else {
+            for result in &mut results {
+                if result.is_ok() {
+                    *result = Err(PraxisError::WriteStalled {
+                        reason: "sequence space exhausted".to_string(),
+                    });
+                }
+            }
+            leader.finish(results);
+            drop(writer);
+            return;
+        };
+        let bytes = valid.iter().map(|request| request.encoded_len).sum();
+        if let Err(error) = self.rotate_wal_if_needed(bytes) {
+            if self.inner.group_commit.ensure_writable().is_err() {
+                leader.fail(error.to_string());
+            } else {
+                // A failure opening the prospective WAL leaves the original
+                // WAL/manifest authoritative and is safe to retry.
+                for result in &mut results {
+                    if result.is_ok() {
+                        *result = Err(PraxisError::Io(std::io::Error::other(error.to_string())));
+                    }
+                }
+                leader.finish(results);
+                drop(writer);
+            }
+            return;
+        }
+        let first_sequence = last_sequence - valid.len() as u64 + 1;
+        let write_result = (|| -> Result<()> {
+            let mut wal = self.inner.wal.lock();
+            for (index, request) in valid.iter().enumerate() {
+                wal.append_unsynced(&WalRecord {
+                    sequence: first_sequence + index as u64,
+                    batch: request.batch.clone(),
+                })?;
+            }
+            if !matches!(
+                self.inner.config.wal_sync_policy,
+                crate::config::WalSyncPolicy::Never
+            ) {
+                let started = std::time::Instant::now();
+                self.inner
+                    .metrics
+                    .commit_sync_attempts
+                    .fetch_add(1, Ordering::Relaxed);
+                let sync_result = wal.sync();
+                self.inner.metrics.commit_sync_ns.fetch_add(
+                    started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                    Ordering::Relaxed,
+                );
+                sync_result?;
+                self.inner
+                    .metrics
+                    .commit_syncs
+                    .fetch_add(1, Ordering::Release);
+            }
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            self.inner
+                .metrics
+                .write_errors
+                .fetch_add(valid.len() as u64, Ordering::Relaxed);
+            slog::error(
+                "core_commit_failed",
+                slog::context()
+                    .with_str("reason", error.to_string())
+                    .with_str("outcome", "recovery_required"),
+            );
+            leader.fail(error.to_string());
+            return;
+        }
+        {
+            let mut memtable = self.inner.memtable.write();
+            for (index, request) in valid.iter().enumerate() {
+                let sequence = first_sequence + index as u64;
+                for op in request.batch.ops() {
+                    memtable.apply(sequence, op);
+                    match op {
+                        BatchOp::Delete { .. } => {
+                            self.inner.metrics.deletes.fetch_add(1, Ordering::Relaxed);
+                        }
+                        _ => {
+                            self.inner.metrics.writes.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+            self.inner.snapshots.observe(last_sequence);
+            self.inner
+                .metrics
+                .memtable_bytes
+                .store(memtable.approximate_bytes() as u64, Ordering::Relaxed);
+        }
+        self.inner.manifest.lock().last_sequence = last_sequence;
+        self.inner
+            .metrics
+            .wal_records
+            .fetch_add(valid.len() as u64, Ordering::Relaxed);
+        self.inner
+            .metrics
+            .commit_groups
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .metrics
+            .commit_batches
+            .fetch_add(valid.len() as u64, Ordering::Relaxed);
+        let mut sequence = first_sequence;
+        for result in &mut results {
+            if result.is_ok() {
+                *result = Ok(sequence);
+                sequence = sequence.saturating_add(1);
+            }
+        }
+        leader.finish(results);
+        drop(writer);
     }
 
     fn normalize_batch_with_cf_policies(&self, batch: WriteBatch) -> Result<WriteBatch> {
@@ -428,7 +535,10 @@ impl PraxisEngine {
     }
 
     fn install_new_active_wal(&self) -> Result<()> {
-        self.inner.wal.lock().sync()?;
+        if let Err(error) = self.inner.wal.lock().sync() {
+            self.inner.group_commit.poison(error.to_string());
+            return Err(PraxisError::RecoveryRequired);
+        }
         let mut manifest = self.inner.manifest.lock();
         let new_wal_id = manifest.next_wal_id;
         let new_wal = Wal::open(
@@ -439,9 +549,14 @@ impl PraxisEngine {
         let mut installed = manifest.clone();
         installed.active_wal_id = new_wal_id;
         installed.next_wal_id += 1;
-        self.inner
+        if let Err(error) = self
+            .inner
             .manifest_store
-            .save_with_policy(&installed, self.inner.config.direct_io)?;
+            .save_with_policy(&installed, self.inner.config.direct_io)
+        {
+            self.inner.group_commit.poison(error.to_string());
+            return Err(PraxisError::RecoveryRequired);
+        }
         *self.inner.wal.lock() = new_wal;
         *manifest = installed;
         Ok(())
@@ -509,6 +624,9 @@ impl PraxisEngine {
     }
 
     pub fn create_column_family(&self, mut descriptor: ColumnFamilyDescriptor) -> Result<()> {
+        let _maintenance = self.inner.maintenance_serialization.lock();
+        let _writer = self.inner.write_serialization.lock();
+        self.inner.group_commit.ensure_writable()?;
         if descriptor.name == ColumnFamily::default().0 {
             return Ok(());
         }
@@ -524,29 +642,65 @@ impl PraxisEngine {
         {
             return Err(PraxisError::ColumnFamilyExists(descriptor.name));
         }
-        manifest.column_families.push(descriptor);
-        self.inner
+        let name = descriptor.name.clone();
+        let mut installed = manifest.clone();
+        installed.column_families.push(descriptor);
+        if let Err(error) = self
+            .inner
             .manifest_store
-            .save_with_policy(&manifest, self.inner.config.direct_io)
+            .save_with_policy(&installed, self.inner.config.direct_io)
+        {
+            self.inner.group_commit.poison(error.to_string());
+            slog::error(
+                "core_cf_transition_failed",
+                slog::context()
+                    .with_str("cf", name)
+                    .with_str("operation", "create")
+                    .with_str("reason", error.to_string())
+                    .with_str("outcome", "recovery_required"),
+            );
+            return Err(PraxisError::RecoveryRequired);
+        }
+        *manifest = installed;
+        Ok(())
     }
 
     pub fn drop_column_family(&self, name: &str) -> Result<()> {
+        let _maintenance = self.inner.maintenance_serialization.lock();
+        let _writer = self.inner.write_serialization.lock();
+        self.inner.group_commit.ensure_writable()?;
+        let _topology = self.inner.topology.write();
         if name == ColumnFamily::default().0 {
             return Err(PraxisError::CannotDropDefaultColumnFamily);
         }
         // Check CF exists and remove from manifest
         {
             let mut manifest = self.inner.manifest.lock();
-            let original_len = manifest.column_families.len();
-            manifest
+            let mut installed = manifest.clone();
+            let original_len = installed.column_families.len();
+            installed
                 .column_families
                 .retain(|family| family.name != name);
-            if manifest.column_families.len() == original_len {
+            if installed.column_families.len() == original_len {
                 return Err(PraxisError::UnknownColumnFamily(name.to_string()));
             }
-            self.inner
+            if let Err(error) = self
+                .inner
                 .manifest_store
-                .save_with_policy(&manifest, self.inner.config.direct_io)?;
+                .save_with_policy(&installed, self.inner.config.direct_io)
+            {
+                self.inner.group_commit.poison(error.to_string());
+                slog::error(
+                    "core_cf_transition_failed",
+                    slog::context()
+                        .with_str("cf", name)
+                        .with_str("operation", "drop")
+                        .with_str("reason", error.to_string())
+                        .with_str("outcome", "recovery_required"),
+                );
+                return Err(PraxisError::RecoveryRequired);
+            }
+            *manifest = installed;
         }
 
         let cf = ColumnFamily(name.to_string());
@@ -683,6 +837,7 @@ impl PraxisEngine {
         // writes use a fresh WAL while the frozen tables remain readable.
         let (flushed_wal_id, flushed_sequence) = {
             let _writer = self.inner.write_serialization.lock();
+            self.inner.group_commit.ensure_writable()?;
             let _topology = self.inner.topology.write();
             let mut mt = self.inner.memtable.write();
             let mut immutables = self.inner.immutable_memtables.lock();
@@ -738,6 +893,8 @@ impl PraxisEngine {
             segment_entries.clone(),
         )?;
         let flushed_entries = metadata.entries;
+        let _writer = self.inner.write_serialization.lock();
+        self.inner.group_commit.ensure_writable()?;
         {
             // Readers hold the topology guard through value resolution. Install
             // disk state and retire its immutable sources as one transition.
@@ -828,6 +985,8 @@ impl PraxisEngine {
             ));
         }
         if compacted.is_empty() {
+            let _writer = self.inner.write_serialization.lock();
+            self.inner.group_commit.ensure_writable()?;
             let _topology = self.inner.topology.write();
             let mut manifest = self.inner.manifest.lock();
             let mut installed = manifest.clone();
@@ -879,6 +1038,8 @@ impl PraxisEngine {
                 .or_insert_with(Vec::new)
                 .push(entry.version);
         }
+        let _writer = self.inner.write_serialization.lock();
+        self.inner.group_commit.ensure_writable()?;
         let _topology = self.inner.topology.write();
         {
             let mut manifest = self.inner.manifest.lock();
@@ -1055,8 +1216,11 @@ impl PraxisEngine {
     }
 
     pub fn checkpoint(&self) -> Result<CheckpointMetadata> {
+        let _maintenance = self.inner.maintenance_serialization.lock();
         let started = std::time::Instant::now();
         self.flush()?;
+        let _writer = self.inner.write_serialization.lock();
+        self.inner.group_commit.ensure_writable()?;
         let checkpoint_id = self.snapshot().sequence;
         let path = self.inner.layout.checkpoint_path(checkpoint_id);
         let checkpoint = {
@@ -1093,6 +1257,7 @@ impl PraxisEngine {
     pub fn garbage_collect(&self) -> Result<GcReport> {
         let _maintenance = self.inner.maintenance_serialization.lock();
         let _writer = self.inner.write_serialization.lock();
+        self.inner.group_commit.ensure_writable()?;
         let _topology = self.inner.topology.write();
         let started = std::time::Instant::now();
         let manifest = self.inner.manifest.lock().clone();
@@ -1301,6 +1466,7 @@ impl PraxisEngine {
             "accelerator": self.inner.accelerator.name(),
             "effective_config": self.effective_config(),
             "metrics": self.inner.metrics.snapshot(),
+            "write_state": { "recovery_required": self.inner.group_commit.ensure_writable().is_err() },
             "manifest": &*self.inner.manifest.lock(),
             "active_wal": self.active_wal_stats(),
             "snapshots": {
