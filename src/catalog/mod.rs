@@ -1,3 +1,6 @@
+mod prepare;
+#[cfg(test)]
+mod publication_tests;
 pub mod schema;
 
 pub use schema::{
@@ -12,6 +15,7 @@ use crate::errors::{PraxisError, Result};
 use crate::identity::{Aid, Cid, Did, Eid};
 use crate::io::{BinaryReader, BinaryWriter, crc32c};
 use crate::layout::PraxisLayout;
+use crate::record::PageDatabase;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -122,117 +126,73 @@ pub struct CatalogSnapshot {
     pub users: Vec<UserCatalogEntry>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct CatalogStore {
-    layout: PraxisLayout,
+    database: PageDatabase,
 }
 
 impl CatalogStore {
     pub fn open(base: impl Into<PathBuf>) -> Result<Self> {
-        let layout = PraxisLayout::new(base);
-        layout.create_all()?;
-        Ok(Self { layout })
+        Ok(Self::new(PageDatabase::open(base)?))
+    }
+
+    /// Share the supplied page owner without opening or initializing storage.
+    pub fn new(database: PageDatabase) -> Self {
+        Self { database }
     }
 
     pub fn layout(&self) -> &PraxisLayout {
-        &self.layout
+        self.database.layout()
     }
 
     pub fn save(&self, snapshot: &CatalogSnapshot) -> Result<()> {
-        write_catalog(
-            &self.layout.catalog_root().join("collections.cat"),
-            &encode_collections(&snapshot.collections),
-        )?;
-        write_catalog(
-            &self.layout.catalog_root().join("entities.cat"),
-            &encode_entities(&snapshot.entities),
-        )?;
-        write_catalog(
-            &self.layout.catalog_root().join("fixed_attrs.cat"),
-            &encode_fixed_attrs(&snapshot.fixed_attributes),
-        )?;
-        write_catalog(
-            &self.layout.catalog_root().join("dynamic_attrs.cat"),
-            &encode_dynamic_attrs(&snapshot.dynamic_attributes),
-        )?;
-        write_catalog(
-            &self.layout.catalog_root().join("indexes.cat"),
-            &encode_indexes(&snapshot.indexes),
-        )?;
-        write_catalog(
-            &self.layout.catalog_root().join("vector_models.cat"),
-            &encode_vector_models(&snapshot.vector_models),
-        )?;
-        write_catalog(
-            &self.layout.catalog_root().join("fulltext.cat"),
-            &encode_fulltext(&snapshot.fulltext),
-        )?;
-        write_catalog(
-            &self.layout.catalog_root().join("graph.cat"),
-            &encode_graph(&snapshot.graph),
-        )?;
-        write_catalog(
-            &self.layout.catalog_root().join("shards.cat"),
-            &encode_shards(&snapshot.shards),
-        )?;
-        write_catalog(
-            &self.layout.catalog_root().join("users.cat"),
-            &encode_users(&snapshot.users),
+        self.save_prepared(snapshot, prepare::PreparedCatalogSave::publish)
+    }
+
+    fn save_prepared(
+        &self,
+        snapshot: &CatalogSnapshot,
+        publish: impl FnOnce(prepare::PreparedCatalogSave) -> Result<()>,
+    ) -> Result<()> {
+        self.database.with_root_mutation(
+            |layout| prepare::prepare_catalog(snapshot, layout),
+            |_, prepared| publish(prepared),
         )
     }
-
     pub fn load(&self) -> Result<CatalogSnapshot> {
-        Ok(CatalogSnapshot {
-            collections: read_if_exists(
-                &self.layout.catalog_root().join("collections.cat"),
-                decode_collections,
-            )?,
-            entities: read_if_exists(
-                &self.layout.catalog_root().join("entities.cat"),
-                decode_entities,
-            )?,
-            fixed_attributes: read_if_exists(
-                &self.layout.catalog_root().join("fixed_attrs.cat"),
-                decode_fixed_attrs,
-            )?,
-            dynamic_attributes: read_if_exists(
-                &self.layout.catalog_root().join("dynamic_attrs.cat"),
-                decode_dynamic_attrs,
-            )?,
-            indexes: read_if_exists(
-                &self.layout.catalog_root().join("indexes.cat"),
-                decode_indexes,
-            )?,
-            vector_models: read_if_exists(
-                &self.layout.catalog_root().join("vector_models.cat"),
-                decode_vector_models,
-            )?,
-            fulltext: read_if_exists(
-                &self.layout.catalog_root().join("fulltext.cat"),
-                decode_fulltext,
-            )?,
-            graph: read_if_exists(&self.layout.catalog_root().join("graph.cat"), decode_graph)?,
-            shards: read_if_exists(
-                &self.layout.catalog_root().join("shards.cat"),
-                decode_shards,
-            )?,
-            users: read_if_exists(&self.layout.catalog_root().join("users.cat"), decode_users)?,
-        })
+        self.database.with_root_read(load_snapshot)
     }
 }
+fn load_snapshot(layout: &PraxisLayout) -> Result<CatalogSnapshot> {
+    Ok(CatalogSnapshot {
+        collections: read_if_exists(
+            &layout.catalog_root().join("collections.cat"),
+            decode_collections,
+        )?,
+        entities: read_if_exists(&layout.catalog_root().join("entities.cat"), decode_entities)?,
+        fixed_attributes: read_if_exists(
+            &layout.catalog_root().join("fixed_attrs.cat"),
+            decode_fixed_attrs,
+        )?,
+        dynamic_attributes: read_if_exists(
+            &layout.catalog_root().join("dynamic_attrs.cat"),
+            decode_dynamic_attrs,
+        )?,
+        indexes: read_if_exists(&layout.catalog_root().join("indexes.cat"), decode_indexes)?,
+        vector_models: read_if_exists(
+            &layout.catalog_root().join("vector_models.cat"),
+            decode_vector_models,
+        )?,
+        fulltext: read_if_exists(&layout.catalog_root().join("fulltext.cat"), decode_fulltext)?,
+        graph: read_if_exists(&layout.catalog_root().join("graph.cat"), decode_graph)?,
+        shards: read_if_exists(&layout.catalog_root().join("shards.cat"), decode_shards)?,
+        users: read_if_exists(&layout.catalog_root().join("users.cat"), decode_users)?,
+    })
+}
 
-fn write_catalog(path: &Path, payload: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut out = BinaryWriter::new();
-    out.write_u32(CATALOG_MAGIC);
-    out.write_u8(CATALOG_VERSION);
-    out.write_u32(payload.len() as u32);
-    out.write_u32(crc32c(payload));
-    out.write_bytes(payload);
+fn write_catalog(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp_path = path.with_extension("tmp");
-    std::fs::write(&tmp_path, out.into_inner())?;
+    std::fs::write(&tmp_path, bytes)?;
     #[cfg(windows)]
     if path.exists() {
         std::fs::remove_file(path)?;
@@ -240,7 +200,6 @@ fn write_catalog(path: &Path, payload: &[u8]) -> Result<()> {
     std::fs::rename(tmp_path, path)?;
     Ok(())
 }
-
 fn read_catalog(path: &Path) -> Result<Vec<u8>> {
     let bytes = std::fs::read(path)?;
     if bytes.len() < 13 {

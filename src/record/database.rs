@@ -66,6 +66,35 @@ impl fmt::Debug for PageDatabase {
 }
 
 impl PageDatabase {
+    pub(crate) fn layout(&self) -> &PraxisLayout {
+        &self.inner.layout
+    }
+
+    /// Hold the existing root guard through a read-only, non-reentrant action.
+    pub(crate) fn with_root_read<T>(
+        &self,
+        read: impl FnOnce(&PraxisLayout) -> Result<T>,
+    ) -> Result<T> {
+        let _state = self.lock()?;
+        read(&self.inner.layout)
+    }
+
+    /// Preparation may read but must not mutate or reenter a locking API.
+    /// Publication crosses the uncertain-IO boundary while retaining the guard.
+    pub(crate) fn with_root_mutation<P, T>(
+        &self,
+        prepare: impl FnOnce(&PraxisLayout) -> Result<P>,
+        publish: impl FnOnce(&PraxisLayout, P) -> Result<T>,
+    ) -> Result<T> {
+        let mut state = self.lock()?;
+        let prepared = prepare(&self.inner.layout)?;
+        let result = publish(&self.inner.layout, prepared);
+        if let Err(error) = &result {
+            state.recovery_required = Some(error.to_string());
+        }
+        result
+    }
+
     pub fn open(base: impl Into<PathBuf>) -> Result<Self> {
         let writer_lease = WriterLease::acquire(base.into())?;
         require_page_base_compatible(writer_lease.root(), InspectionOptions::for_admission())?;
@@ -550,6 +579,47 @@ mod tests {
         ));
         assert!(matches!(
             wal.sync(),
+            Err(PraxisError::PageRecoveryRequired { .. })
+        ));
+    }
+}
+
+#[cfg(test)]
+mod catalog_health_tests {
+    use super::*;
+    use crate::catalog::{CatalogSnapshot, CatalogStore};
+    use crate::identity::{Aid, FieldId};
+    use crate::wal::page::PageWalFailure;
+
+    #[test]
+    fn wal_sync_uncertainty_poison_reaches_existing_catalog_views() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = PageDatabase::open(dir.path()).unwrap();
+        let catalog = CatalogStore::new(database.clone());
+        let clone = catalog.clone();
+        let mut page = database.entity(Cid(1), Eid(2)).unwrap();
+        page.put(&[(FieldId::Fixed(Aid(1)), b"old")]).unwrap();
+        catalog.save(&CatalogSnapshot::default()).unwrap();
+        let mut wal = database.page_wal(WalSyncPolicy::EveryBatch).unwrap();
+        database
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .wal
+            .as_mut()
+            .unwrap()
+            .fail_next(PageWalFailure::Sync);
+        assert!(matches!(
+            page.put_durable(&mut wal, &[(FieldId::Fixed(Aid(1)), b"uncertain")]),
+            Err(PraxisError::Io(_))
+        ));
+        assert!(matches!(
+            catalog.load(),
+            Err(PraxisError::PageRecoveryRequired { .. })
+        ));
+        assert!(matches!(
+            clone.save(&CatalogSnapshot::default()),
             Err(PraxisError::PageRecoveryRequired { .. })
         ));
     }
