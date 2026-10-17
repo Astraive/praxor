@@ -43,6 +43,13 @@ pub struct PraxisEngine {
     pub(crate) inner: Arc<EngineInner>,
 }
 
+struct CompleteSourceRewriteReservation {
+    source_segment_ids: Vec<u64>,
+    job_id: u64,
+    segment_id: u64,
+    target_level: u32,
+}
+
 #[cfg(test)]
 #[path = "engine/cf_generation_tests.rs"]
 mod cf_generation_tests;
@@ -1429,10 +1436,12 @@ impl PraxisEngine {
             ));
         }
         self.install_complete_source_rewrite(
-            &source_segment_ids,
-            job_id,
-            segment_id,
-            target_level,
+            CompleteSourceRewriteReservation {
+                source_segment_ids,
+                job_id,
+                segment_id,
+                target_level,
+            },
             compacted,
             &cf_options,
             started,
@@ -1542,10 +1551,12 @@ impl PraxisEngine {
         #[cfg(test)]
         reclaim_hooks::try_phase(reclaim_hooks::Phase::AfterRunning)?;
         let rewritten = self.install_complete_source_rewrite(
-            &source_segment_ids,
-            job_id,
-            segment_id,
-            target_level,
+            CompleteSourceRewriteReservation {
+                source_segment_ids,
+                job_id,
+                segment_id,
+                target_level,
+            },
             compacted,
             &cf_options,
             started,
@@ -1572,15 +1583,18 @@ impl PraxisEngine {
     /// Call only while the reentrant maintenance guard is held.
     fn install_complete_source_rewrite(
         &self,
-        source_segment_ids: &[u64],
-        job_id: u64,
-        segment_id: u64,
-        target_level: u32,
+        reservation: CompleteSourceRewriteReservation,
         compacted: Vec<crate::segments::block::SegmentEntry>,
         cf_options: &BTreeMap<String, ColumnFamilyOptions>,
         started: std::time::Instant,
         protected_expectation: Option<(&BTreeSet<String>, usize)>,
     ) -> Result<u64> {
+        let CompleteSourceRewriteReservation {
+            source_segment_ids,
+            job_id,
+            segment_id,
+            target_level,
+        } = reservation;
         if compacted.is_empty() {
             let _writer = self.inner.write_serialization.lock();
             self.inner.group_commit.ensure_writable()?;
