@@ -117,6 +117,7 @@ pub struct StorageEngine {
     compaction_latency: LatencyTracker,
     opened_at: Instant,
     recovery_required: bool,
+    _writer_lease: crate::writer_lease::WriterLease,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -265,12 +266,13 @@ impl StorageEngine {
         cache_capacity_bytes: usize,
         options: StorageEngineOptions,
     ) -> Result<Self> {
-        let root = root.into();
-        create_dir_all_durable(&root)?;
+        let writer_lease = crate::writer_lease::WriterLease::acquire(root.into())?;
+        let root = writer_lease.root().to_path_buf();
+        let primary_lease = writer_lease.acquire_primary()?;
         create_dir_all_durable(&root.join(Self::INDEX_DIR))?;
         create_dir_all_durable(&root.join(Self::WAL_DIR))?;
 
-        let mut store = RecordStore::open(root.join(Self::PRIMARY_DIR))?;
+        let mut store = RecordStore::open_with_lease(primary_lease)?;
         let wal_path = root.join(Self::WAL_DIR).join(Self::WAL_FILE);
         let wal = StorageWal::open_with_options(&wal_path, options.wal)?;
         let replay_entries = StorageWal::replay(&wal_path)?;
@@ -310,6 +312,7 @@ impl StorageEngine {
             compaction_latency: LatencyTracker::new(1024),
             opened_at: Instant::now(),
             recovery_required: false,
+            _writer_lease: writer_lease,
         })
     }
 

@@ -35,6 +35,7 @@ pub use wal::{StorageWal, StorageWalEntry, StorageWalOperation, StorageWalOption
 
 use crate::errors::Result;
 use crate::io::create_dir_all_durable;
+use crate::writer_lease::WriterLease;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
@@ -95,6 +96,7 @@ pub struct RecordStore {
     dir: PathBuf,
     active_segment: RecordSegment,
     indirection: IndirectionTable,
+    _writer_lease: WriterLease,
 }
 
 pub(crate) struct PreparedPrimaryPut {
@@ -108,7 +110,11 @@ impl RecordStore {
 
     /// Open or create a record store rooted at `dir`.
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self> {
-        let dir = dir.into();
+        Self::open_with_lease(WriterLease::acquire_record_root(dir.into())?)
+    }
+
+    pub(crate) fn open_with_lease(writer_lease: WriterLease) -> Result<Self> {
+        let dir = writer_lease.root().to_path_buf();
         create_dir_all_durable(&dir.join(Self::SEGMENT_SUBDIR))?;
 
         let ind_path = dir.join(Self::INDIRECTION_FILE);
@@ -126,6 +132,7 @@ impl RecordStore {
             dir,
             active_segment,
             indirection,
+            _writer_lease: writer_lease,
         })
     }
 
