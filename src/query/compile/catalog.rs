@@ -3,33 +3,58 @@ use super::QueryCompileError;
 use crate::catalog::schema::{Catalog, CollectionSchema};
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::Arc;
 
-#[derive(Debug)]
 struct CatalogState {
     revision: u64,
     schemas: Arc<BTreeMap<String, CollectionSchema>>,
 }
 
-#[derive(Debug)]
 pub(super) struct CatalogOwner {
     state: RwLock<CatalogState>,
 }
 
-#[derive(Debug)]
-pub(super) struct QueryCatalogAuthority {
+/// Sole detached, process-local schema authority for Q1 compilation. Mutations
+/// change only this owned snapshot and invalidate earlier views/bound selects.
+pub struct QueryCatalogAuthority {
     pub(super) owner: Arc<CatalogOwner>,
 }
 
-#[derive(Clone, Debug)]
-pub(super) struct QueryCatalogView {
+impl fmt::Debug for QueryCatalogAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = self.owner.state.read();
+        formatter
+            .debug_struct("QueryCatalogAuthority")
+            .field("catalog_scope", &"process")
+            .field("revision", &state.revision)
+            .field("schema_count", &state.schemas.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Immutable schema snapshot tied to one Q1 authority and revision. Its fields
+/// are private; it is not a persisted catalog or storage read token.
+#[derive(Clone)]
+pub struct QueryCatalogView {
     pub(super) owner: Arc<CatalogOwner>,
     pub(super) schemas: Arc<BTreeMap<String, CollectionSchema>>,
     pub(super) revision: u64,
 }
 
+impl fmt::Debug for QueryCatalogView {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QueryCatalogView")
+            .field("catalog_scope", &"process")
+            .field("revision", &self.revision)
+            .field("schema_count", &self.schemas.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl QueryCatalogAuthority {
-    pub(super) fn new(catalog: Catalog) -> Self {
+    pub fn new(catalog: Catalog) -> Self {
         let schemas = catalog
             .collections()
             .map(|schema| (schema.name.clone(), schema.clone()))
@@ -44,7 +69,7 @@ impl QueryCatalogAuthority {
         }
     }
 
-    pub(super) fn view(&self) -> QueryCatalogView {
+    pub fn view(&self) -> QueryCatalogView {
         let state = self.owner.state.read();
         QueryCatalogView {
             owner: Arc::clone(&self.owner),
@@ -53,10 +78,7 @@ impl QueryCatalogAuthority {
         }
     }
 
-    pub(super) fn replace_collection(
-        &self,
-        schema: CollectionSchema,
-    ) -> Result<(), QueryCompileError> {
+    pub fn replace_collection(&self, schema: CollectionSchema) -> Result<(), QueryCompileError> {
         let mut state = self.owner.state.write();
         let next_revision =
             state
@@ -71,7 +93,7 @@ impl QueryCatalogAuthority {
         Ok(())
     }
 
-    pub(super) fn drop_collection(&self, name: &str) -> Result<(), QueryCompileError> {
+    pub fn drop_collection(&self, name: &str) -> Result<(), QueryCompileError> {
         let mut state = self.owner.state.write();
         if !state.schemas.contains_key(name) {
             return Err(QueryCompileError::UnknownCollection {
@@ -92,7 +114,7 @@ impl QueryCatalogAuthority {
         Ok(())
     }
 
-    pub(super) fn validate_view(&self, view: &QueryCatalogView) -> Result<(), QueryCompileError> {
+    pub fn validate_view(&self, view: &QueryCatalogView) -> Result<(), QueryCompileError> {
         self.validate_handle(&view.owner, view.revision)
     }
 
@@ -112,7 +134,7 @@ impl QueryCatalogAuthority {
 }
 
 impl QueryCatalogView {
-    pub(super) fn revision(&self) -> u64 {
+    pub fn revision(&self) -> u64 {
         self.revision
     }
 

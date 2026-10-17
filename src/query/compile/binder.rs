@@ -1,24 +1,52 @@
 //! Typed binding over the detached catalog view. No storage provider is involved.
 use super::catalog::{CatalogOwner, QueryCatalogAuthority, QueryCatalogView};
-use super::syntax::{CompareOp, PredicateExpr, Projection, ValueExpr, ValueSyntax, parse_sql};
+#[cfg(test)]
+use super::syntax::parse_sql;
+use super::syntax::{CompareOp, PredicateExpr, Projection, SyntaxSelect, ValueExpr, ValueSyntax};
 use super::{ByteSpan, QueryCompileError};
 use crate::catalog::schema::{AttributeType, CollectionSchema, IntegerType, ScalarType};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::sync::Arc;
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(super) struct TypedParameters {
+/// Exact typed bindings for `$1..$256`, `:name`, and `@name`; values are never
+/// rewritten into SQL source. Named placeholders share one case-sensitive map.
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct TypedParameters {
     pub positional: Vec<ParameterValue>,
     pub named: BTreeMap<String, ParameterValue>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum ParameterValue {
+/// A Q1 scalar parameter; signed and unsigned integer domains do not coerce.
+impl fmt::Debug for TypedParameters {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TypedParameters")
+            .field("positional_count", &self.positional.len())
+            .field("named_count", &self.named.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub enum ParameterValue {
     Null,
     Bool(bool),
     I64(i64),
     U64(u64),
     Text(String),
+}
+
+impl fmt::Debug for ParameterValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Null => "Null",
+            Self::Bool(_) => "Bool(<redacted>)",
+            Self::I64(_) => "I64(<redacted>)",
+            Self::U64(_) => "U64(<redacted>)",
+            Self::Text(_) => "Text(<redacted>)",
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,22 +106,34 @@ pub(super) enum BoundPredicateOp {
     Or,
 }
 
-#[derive(Debug)]
-pub(super) struct BoundSelect {
-    pub collection: String,
-    pub projection: Vec<BoundField>,
-    pub predicate: Option<Vec<BoundPredicateOp>>,
-    pub explain: bool,
+/// Opaque executable SELECT produced only by `compile`. Fields are private and
+/// there is no `Deserialize` implementation to forge one from a legacy plan.
+pub struct BoundSelect {
+    pub(super) collection: String,
+    pub(super) projection: Vec<BoundField>,
+    pub(super) predicate: Option<Vec<BoundPredicateOp>>,
     pub(super) owner: Arc<CatalogOwner>,
     pub(super) revision: u64,
 }
 
+impl fmt::Debug for BoundSelect {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BoundSelect")
+            .field("collection", &self.collection)
+            .field("projection", &self.projection_names())
+            .field("predicate_ops", &self.predicate.as_ref().map(Vec::len))
+            .field("revision", &self.revision)
+            .finish_non_exhaustive()
+    }
+}
+
 impl BoundSelect {
-    pub(super) fn collection(&self) -> &str {
+    pub fn collection(&self) -> &str {
         &self.collection
     }
 
-    pub(super) fn projection_names(&self) -> Vec<&str> {
+    pub fn projection_names(&self) -> Vec<&str> {
         self.projection
             .iter()
             .map(|field| field.name.as_str())
@@ -395,12 +435,27 @@ fn bind_predicate(
     Ok(output)
 }
 
+#[cfg(test)]
 pub(super) fn bind_sql(
     sql: &str,
     params: &TypedParameters,
     view: &QueryCatalogView,
 ) -> Result<BoundSelect, QueryCompileError> {
     let syntax = parse_sql(sql)?;
+    if syntax.explain {
+        return Err(QueryCompileError::UnsupportedFeature {
+            feature: "explain_requires_compile",
+            span: None,
+        });
+    }
+    bind_syntax(syntax, params, view)
+}
+
+pub(super) fn bind_syntax(
+    syntax: SyntaxSelect,
+    params: &TypedParameters,
+    view: &QueryCatalogView,
+) -> Result<BoundSelect, QueryCompileError> {
     view.validate_current()?;
     let schema = view.schemas.get(&syntax.collection.name).ok_or_else(|| {
         QueryCompileError::UnknownCollection {
@@ -421,7 +476,6 @@ pub(super) fn bind_sql(
         collection: schema.name.clone(),
         projection,
         predicate,
-        explain: syntax.explain,
         owner: Arc::clone(&view.owner),
         revision: view.revision,
     })
