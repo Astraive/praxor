@@ -3,6 +3,7 @@ use crate::kernel::{
     DurableArtifactDescriptor, DurableArtifactKind, DurableArtifactState, DurableFormatDescriptor,
 };
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -111,7 +112,7 @@ impl DurableFileRecord {
             format: DurableFormatDescriptor {
                 structure: self.kind.structure_name(),
                 format_version: self.format_version,
-                checksum: Box::leak(self.checksum.clone().into_boxed_str()),
+                checksum: Cow::Owned(self.checksum.clone()),
                 forward_compatible: self.forward_compatible,
                 independently_recoverable: self.independently_recoverable,
             },
