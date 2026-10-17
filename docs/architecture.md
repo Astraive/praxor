@@ -1,18 +1,27 @@
-# Praxis Storage Kernel Architecture
+# Praxis Engine and Storage Kernel Architecture
 
 Page primitive ownership and v1 compatibility are documented in [Page database ownership](page-record-ownership.md).
 
-Praxis is a universal storage kernel for building databases. It is not a database, query engine, SQL parser, graph query layer, vector query language, distributed coordinator, ORM, or API gateway.
+Astraive/praxor (package `praxis`) owns the canonical query semantic pipeline
+and the low-level storage kernel beneath it. Query/parser, binding/type rules,
+planner, executor and semantic catalog responsibilities stay in the engine;
+their current public modules remain experimental. Ownership does not imply
+complete language execution or durable catalog/query integration. See
+[query readiness](query-readiness.md) for executed observations, known gaps and
+the bounded follow-on gates in [#60](https://github.com/Astraive/praxor/issues/60).
 
 The core design is:
 
 ```text
-Praxis = shared durability + shared recovery + shared canonical storage
+Storage kernel = shared durability + shared recovery + shared canonical storage
         + shared MVCC/snapshots + shared cache/memory/IO
         + composable specialized physical engines
 ```
 
-Poiesis owns database semantics above Praxis. Praxis owns storage primitives below Poiesis.
+Poiesis owns product/session/authorization/protocol context and consumes engine
+contracts. Optional PQL tooling also consumes those contracts; the engine
+depends on neither. The engine's semantic modules use its storage primitives,
+without moving parser/planner logic into WAL, cache or physical storage paths.
 
 See [storage source ownership](storage-source-ownership.md) for the compiled
 owners, module-graph evidence and the boundary between dead-source cleanup and
@@ -20,11 +29,14 @@ the separate migration of the two live engine/WAL protocols.
 
 ```text
 +--------------------------------------------------+
-|                 POIESIS DB                       |
-| SQL / Graph / Vector / Document / Query Layer    |
-| Optimizer / Planner / Coordinator / APIs         |
+|                 POIESIS PRODUCT                  |
+| Sessions / Authorization / Protocols / Runtime   |
 +--------------------------------------------------+
-|              TRIDENT STORAGE ENGINE              |
+|         PRAXOR ENGINE (package praxis)            |
+| Query Syntax / Binding / Planning / Execution     |
+| Semantic Catalog (experimental; readiness gates) |
++--------------------------------------------------+
+|              LOW-LEVEL STORAGE KERNEL            |
 | WAL / MVCC / Recovery / Cache / Indexes          |
 | BTree / LSM / Graph / Vector / Columnar          |
 | Unified Record Store + Replication Primitives    |
@@ -78,7 +90,7 @@ The central innovation is not one physical engine. It is a composable storage ke
 
 ## Storage Responsibilities
 
-Praxis owns:
+The low-level storage kernel owns:
 
 - WAL, redo logging, checkpoints, crash recovery, snapshots.
 - Pages, SSTables, segments, blocks, compression, checksums, file layouts.
@@ -89,15 +101,22 @@ Praxis owns:
 - Direct IO, async IO, SIMD, GPU acceleration, NUMA awareness.
 - `RecordId`, single-copy value storage, pointer-only indexes.
 
-Praxis does not own:
+Above that kernel, the engine owns query syntax, binding/type rules, planning,
+execution and semantic catalog rules. Current implementation limits are
+documented in [query readiness](query-readiness.md); there is one semantic
+authority, without a second compiler or catalog writer in optional tooling.
+
+The low-level storage kernel does not own:
 
 - SQL parser, Cypher parser, GraphQL parser, vector query language.
 - Query optimizer, planner, or cost-based query semantics.
 - Cluster topology, routing, coordinator behavior, distributed transactions.
-- Schemas, roles, permissions, stored procedures, triggers.
+- Product sessions, authorization and user-facing policy.
 - REST, gRPC, SQL wire protocol, or user-facing database APIs.
 
-The kernel exposes primitives such as `put_record`, `open_snapshot`, `create_index`, `scan_range`, `append_log`, and `open_cursor`. Higher-level APIs belong in Poiesis.
+The kernel supplies storage primitives to engine semantics. Product-facing
+protocol/session context belongs in Poiesis. A clean engine checkout requires
+no sibling repository or absolute-path product/tooling dependency.
 
 ## Performance Targets
 
@@ -367,8 +386,7 @@ Production storage paths must use `slog` only.
 
 ## Non-Goals
 
-- No query planner in the kernel.
-- No SQL parser in the storage layer.
+- No parser/planner logic inside low-level storage paths; engine semantic modules own that pipeline.
 - No distributed coordinator in Praxis.
 - No duplicated full-value secondary indexes by default.
 - No blocking global locks on normal paths.
