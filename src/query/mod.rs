@@ -4,6 +4,7 @@
 //! - SQL: SELECT, INSERT, UPDATE, DELETE, CREATE/ALTER/DROP COLLECTION, EXPLAIN
 //! - PQL: FIND, WATCH, SIMILAR TO, TRAVERSE, RANK BY, AS OF
 
+mod compile;
 pub mod graph;
 pub mod hybrid;
 pub mod kv;
