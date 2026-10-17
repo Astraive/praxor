@@ -248,7 +248,7 @@ fn referenced_fields_are_validated_even_when_predicate_would_skip_a_row() {
             &owner,
             "SELECT name FROM users",
             &TypedParameters::default(),
-            &[unreferenced_bad_age.clone()]
+            std::slice::from_ref(&unreferenced_bad_age)
         )
         .unwrap(),
         vec![projected("users", "fine", &[("name", json!("Ada"))])]
@@ -292,7 +292,7 @@ fn stale_and_foreign_plans_are_refused_before_row_validation() {
     .unwrap();
     let foreign = users_owner();
     assert!(matches!(
-        execute_in_memory(&foreign, &select, &[malformed.clone()]),
+        execute_in_memory(&foreign, &select, std::slice::from_ref(&malformed)),
         Err(QueryCompileError::ForeignCatalog)
     ));
     owner
@@ -302,7 +302,7 @@ fn stale_and_foreign_plans_are_refused_before_row_validation() {
         )
         .unwrap();
     assert!(matches!(
-        execute_in_memory(&owner, &select, &[malformed.clone()]),
+        execute_in_memory(&owner, &select, std::slice::from_ref(&malformed)),
         Err(QueryCompileError::StaleCatalog)
     ));
     assert!(matches!(
