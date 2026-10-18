@@ -10,9 +10,13 @@ mod control;
 mod database;
 #[allow(dead_code)] // The pure relation is wired into admission in the B2 slice.
 mod frame;
+#[allow(dead_code)] // Private read-only physical proof is not yet a public owner.
+mod physical;
 
 #[cfg(test)]
 mod frame_tests;
+#[cfg(test)]
+mod physical_tests;
 
 pub(crate) use control::CatalogControl;
 
