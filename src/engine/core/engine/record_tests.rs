@@ -37,6 +37,69 @@ fn mapping() -> Mapping {
 }
 
 #[test]
+fn record_tokens_capture_only_published_endpoints_of_a_mixed_eight_request_group() {
+    let (_dir, _config, db) = database(crate::WalSyncPolicy::GroupCommit, 1);
+    let engine = db.kv();
+    let records = db.records();
+    let before = records.pin_snapshot().unwrap();
+    let requests = (0..4)
+        .flat_map(|index| {
+            [
+                user(&engine, &format!("u{index}")),
+                queue(&engine, create(b"v", 1)),
+            ]
+        })
+        .collect::<Vec<_>>();
+    // Block the existing publication endpoint after its actual WAL sync.
+    let table = engine.inner.memtable.read();
+    let writer_engine = engine.clone();
+    let first = requests[0].clone();
+    let writer = std::thread::spawn(move || writer_engine.wait_for_commit(&first));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while engine.inner.metrics.commit_syncs.load(Ordering::Acquire) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "group did not reach synced prepublication endpoint"
+        );
+        std::thread::yield_now();
+    }
+    let during = records.pin_snapshot().unwrap();
+    assert_eq!(before.core_sequence(), 1);
+    assert_eq!(during.core_sequence(), 1);
+    drop(table);
+    writer.join().unwrap().unwrap();
+    // The spawned waiter consumed the first one-shot completion.
+    for request in requests.iter().skip(1) {
+        engine.wait_for_commit(request).unwrap();
+    }
+    let after = records.pin_snapshot().unwrap();
+    assert_eq!(after.core_sequence(), 9);
+    assert_eq!(
+        engine.inner.metrics.commit_groups.load(Ordering::Relaxed),
+        1
+    );
+    for rid in (1..=4).map(RecordId) {
+        assert!(matches!(
+            records.fetch_at_snapshot(rid, &before),
+            Err(PraxisError::KeyNotFound)
+        ));
+        assert!(matches!(
+            records.fetch_at_snapshot(rid, &during),
+            Err(PraxisError::KeyNotFound)
+        ));
+        assert_eq!(records.fetch_at_snapshot(rid, &after).unwrap(), b"v");
+    }
+    assert_eq!(
+        records.lookup_rid_at_snapshot("kv", b"k", &during).unwrap(),
+        None
+    );
+    assert_eq!(
+        records.lookup_rid_at_snapshot("kv", b"k", &after).unwrap(),
+        Some(RecordId(4))
+    );
+}
+
+#[test]
 fn public_semantic_verify_uses_one_capture_while_never_writes_continue() {
     use crate::engine::core::backup::{Phase, hooks};
     let (dir, _config, db) = database(crate::WalSyncPolicy::Never, usize::MAX);
