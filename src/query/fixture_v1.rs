@@ -64,6 +64,27 @@ pub(super) enum FixtureEncodeError {
     Limit { code: &'static str },
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum FixtureBudgetDecodeError {
+    Document(FixtureDecodeReason),
+    AttributeBudget,
+}
+
+impl From<FixtureDecodeReason> for FixtureBudgetDecodeError {
+    fn from(reason: FixtureDecodeReason) -> Self {
+        Self::Document(reason)
+    }
+}
+
+/// Decode with a caller-owned cumulative allowance. The parsed count is
+/// checked before any attribute entry or value is allocated.
+pub(super) fn decode_document_with_attribute_budget(
+    bytes: &[u8],
+    remaining_attributes: usize,
+) -> Result<(Record, usize), FixtureBudgetDecodeError> {
+    decode_document_inner(bytes, remaining_attributes)
+}
+
 struct Cursor<'a> {
     bytes: &'a [u8],
     offset: usize,
@@ -112,61 +133,79 @@ fn utf8(bytes: &[u8]) -> Result<&str, FixtureDecodeReason> {
 /// Decode one complete, bounded fixture frame. No delimiter splitting or
 /// extension skipping is permitted, even for attributes a query will not read.
 pub(super) fn decode_document(bytes: &[u8]) -> Result<Record, FixtureDecodeReason> {
+    match decode_document_inner(bytes, usize::MAX) {
+        Ok((record, _)) => Ok(record),
+        Err(FixtureBudgetDecodeError::Document(reason)) => Err(reason),
+        Err(FixtureBudgetDecodeError::AttributeBudget) => {
+            unreachable!("a v1 attribute count cannot exceed usize::MAX")
+        }
+    }
+}
+
+fn decode_document_inner(
+    bytes: &[u8],
+    remaining_attributes: usize,
+) -> Result<(Record, usize), FixtureBudgetDecodeError> {
     use FixtureDecodeReason as Reason;
 
     if bytes.len() > MAX_FRAME_BYTES {
-        return Err(Reason::FrameTooLarge);
+        return Err(Reason::FrameTooLarge.into());
     }
     if bytes.len() < 16 {
-        return Err(Reason::Truncated);
+        return Err(Reason::Truncated.into());
     }
     let declared = u32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize;
     if declared > MAX_FRAME_BYTES {
-        return Err(Reason::FrameTooLarge);
+        return Err(Reason::FrameTooLarge.into());
     }
     if declared != bytes.len() || declared < MIN_FRAME_BYTES {
-        return Err(Reason::FrameLength);
+        return Err(Reason::FrameLength.into());
     }
     if &bytes[..8] != MAGIC {
-        return Err(Reason::InvalidMagic);
+        return Err(Reason::InvalidMagic.into());
     }
     if bytes[8..10] != [0, 1] {
-        return Err(Reason::UnsupportedVersion);
+        return Err(Reason::UnsupportedVersion.into());
     }
     if bytes[10..12] != [0, 0] {
-        return Err(Reason::UnsupportedFlags);
+        return Err(Reason::UnsupportedFlags.into());
     }
 
     let mut cursor = Cursor { bytes, offset: 16 };
     let collection_len = usize::from(cursor.u16()?);
     if !(1..=MAX_COLLECTION_BYTES).contains(&collection_len) {
-        return Err(Reason::InvalidCollectionLength);
+        return Err(Reason::InvalidCollectionLength.into());
     }
     let collection = utf8(cursor.take(collection_len)?)?.to_owned();
 
     let key_len = usize::from(cursor.u16()?);
     if key_len > MAX_KEY_BYTES {
-        return Err(Reason::InvalidKeyLength);
+        return Err(Reason::InvalidKeyLength.into());
     }
     let key = utf8(cursor.take(key_len)?)?.to_owned();
 
     let attribute_count = usize::from(cursor.u16()?);
     if attribute_count > MAX_ATTRIBUTE_COUNT {
-        return Err(Reason::InvalidAttributeCount);
+        return Err(Reason::InvalidAttributeCount.into());
+    }
+    if attribute_count > remaining_attributes {
+        return Err(FixtureBudgetDecodeError::AttributeBudget);
     }
     let mut attributes = BTreeMap::new();
     let mut previous_name: Option<&[u8]> = None;
     for _ in 0..attribute_count {
         let name_len = usize::from(cursor.u16()?);
         if !(1..=MAX_ATTRIBUTE_NAME_BYTES).contains(&name_len) {
-            return Err(Reason::InvalidAttributeNameLength);
+            return Err(Reason::InvalidAttributeNameLength.into());
         }
         let name_bytes = cursor.take(name_len)?;
         let name = utf8(name_bytes)?;
         if let Some(previous) = previous_name {
             match previous.cmp(name_bytes) {
-                std::cmp::Ordering::Equal => return Err(Reason::DuplicateAttribute),
-                std::cmp::Ordering::Greater => return Err(Reason::NonCanonicalAttributeOrder),
+                std::cmp::Ordering::Equal => return Err(Reason::DuplicateAttribute.into()),
+                std::cmp::Ordering::Greater => {
+                    return Err(Reason::NonCanonicalAttributeOrder.into());
+                }
                 std::cmp::Ordering::Less => {}
             }
         }
@@ -179,7 +218,7 @@ pub(super) fn decode_document(bytes: &[u8]) -> Result<Record, FixtureDecodeReaso
             3 => {
                 let signed = i64::from_be_bytes(cursor.u64()?.to_be_bytes());
                 if signed >= 0 {
-                    return Err(Reason::NonCanonicalInteger);
+                    return Err(Reason::NonCanonicalInteger.into());
                 }
                 Value::Number(Number::from(signed))
             }
@@ -187,27 +226,30 @@ pub(super) fn decode_document(bytes: &[u8]) -> Result<Record, FixtureDecodeReaso
             5 => {
                 let text_len = cursor.u32()? as usize;
                 if text_len > MAX_TEXT_BYTES {
-                    return Err(Reason::TextTooLong);
+                    return Err(Reason::TextTooLong.into());
                 }
                 Value::String(utf8(cursor.take(text_len)?)?.to_owned())
             }
-            _ => return Err(Reason::UnknownValueTag),
+            _ => return Err(Reason::UnknownValueTag.into()),
         };
         attributes.insert(name.to_owned(), value);
     }
     if cursor.offset != bytes.len() {
-        return Err(Reason::TrailingBytes);
+        return Err(Reason::TrailingBytes.into());
     }
 
-    Ok(Record {
-        id: RecordId::new(collection, key),
-        attributes,
-        labels: Vec::new(),
-        vectors: BTreeMap::new(),
-        edges: Vec::new(),
-        created_at_ms: 0,
-        updated_at_ms: 0,
-    })
+    Ok((
+        Record {
+            id: RecordId::new(collection, key),
+            attributes,
+            labels: Vec::new(),
+            vectors: BTreeMap::new(),
+            edges: Vec::new(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        },
+        attribute_count,
+    ))
 }
 
 enum Scalar<'a> {

@@ -1,4 +1,7 @@
-use super::{FixtureDecodeReason as Reason, FixtureEncodeError, decode_document, encode_document};
+use super::{
+    FixtureBudgetDecodeError as BudgetError, FixtureDecodeReason as Reason, FixtureEncodeError,
+    decode_document, decode_document_with_attribute_budget, encode_document,
+};
 use serde_json::{Number, Value};
 use std::collections::BTreeMap;
 
@@ -14,6 +17,66 @@ fn attributes() -> BTreeMap<String, Value> {
         ("n".into(), Value::Null),
         ("v".into(), Value::Number(Number::from(7_u64))),
     ])
+}
+
+#[test]
+fn budget_decoder_accepts_exact_allowance_and_zero_attribute_frames() {
+    for (wire, collection, key, allowance, count) in [
+        (A, "a:b", "c", 2, 2),
+        (B, "a", "b:c", 2, 2),
+        (C, "u", "é", 0, 0),
+        (D, "u", "", 0, 0),
+    ] {
+        let (record, used) = decode_document_with_attribute_budget(wire, allowance).unwrap();
+        assert_eq!(used, count);
+        assert_eq!(record.attributes.len(), count);
+        assert_eq!(
+            (record.id.collection.as_str(), record.id.key.as_str()),
+            (collection, key)
+        );
+    }
+    for wire in [A, B] {
+        assert_eq!(
+            decode_document_with_attribute_budget(wire, 1),
+            Err(BudgetError::AttributeBudget)
+        );
+        assert_eq!(
+            decode_document_with_attribute_budget(wire, 0),
+            Err(BudgetError::AttributeBudget)
+        );
+    }
+    // The unbudgeted codec's behavior remains unchanged.
+    assert_eq!(decode_document(A).unwrap().attributes, attributes());
+}
+
+#[test]
+fn budget_decoder_retains_outer_count_and_later_entry_precedence() {
+    let mut wrong_declared_length = A.to_vec();
+    wrong_declared_length[15] = 43;
+    assert_eq!(
+        decode_document_with_attribute_budget(&wrong_declared_length, 0),
+        Err(BudgetError::Document(Reason::FrameLength))
+    );
+    let mut excessive_count = A.to_vec();
+    excessive_count[24..26].copy_from_slice(&257_u16.to_be_bytes());
+    assert_eq!(
+        decode_document_with_attribute_budget(&excessive_count, 0),
+        Err(BudgetError::Document(Reason::InvalidAttributeCount))
+    );
+    let mut malformed_entry = A.to_vec();
+    malformed_entry[33] = 6;
+    assert_eq!(
+        decode_document_with_attribute_budget(&malformed_entry, 1),
+        Err(BudgetError::AttributeBudget)
+    );
+    assert_eq!(
+        decode_document_with_attribute_budget(&malformed_entry, 2),
+        Err(BudgetError::Document(Reason::UnknownValueTag))
+    );
+    assert_eq!(
+        decode_document_with_attribute_budget(&A[..15], 0),
+        Err(BudgetError::Document(Reason::Truncated))
+    );
 }
 
 #[test]
@@ -328,6 +391,13 @@ fn text_count_and_total_frame_caps_accept_maxima_and_refuse_one_over() {
     count_frame[12..16].copy_from_slice(&(1815_u32).to_be_bytes());
     assert_eq!(count_frame.len(), 1815);
     assert_eq!(decode_document(&count_frame).unwrap().attributes.len(), 256);
+    let (budgeted, used) = decode_document_with_attribute_budget(&count_frame, 256).unwrap();
+    assert_eq!(used, 256);
+    assert_eq!(budgeted.attributes.len(), 256);
+    assert_eq!(
+        decode_document_with_attribute_budget(&count_frame, 255),
+        Err(BudgetError::AttributeBudget)
+    );
     assert_eq!(
         encode_document("u", "", &count_fields).unwrap(),
         count_frame
