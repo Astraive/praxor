@@ -12,6 +12,7 @@
 //! previously ignored AS OF and GROUP BY operators have targeted preflight refusal.
 
 mod compile;
+mod fixture_v1;
 pub mod graph;
 pub mod hybrid;
 pub mod kv;
