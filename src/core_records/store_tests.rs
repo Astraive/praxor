@@ -1,4 +1,5 @@
 use super::*;
+use crate::core_records::{CoreRecordScanError, RecordScanLimits};
 use crate::{CoreDatabase, MappingDescriptor, PraxisConfig, RecordAuthorityOptions};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -50,6 +51,23 @@ fn disk_versions(db: &CoreDatabase, role: Role, key: Key<'_>) -> Vec<crate::type
         ))
         .cloned()
         .unwrap_or_default()
+}
+
+fn inject_raw_at(
+    db: &CoreDatabase,
+    sequence: u64,
+    role: Role,
+    key: Vec<u8>,
+    value: Option<Vec<u8>>,
+) {
+    let mut batch = crate::WriteBatch::new();
+    match value {
+        Some(value) => batch.put(role.cf(), key, value),
+        None => batch.delete(role.cf(), key),
+    };
+    for op in batch.ops() {
+        db.kv().inner.memtable.write().apply(sequence, op);
+    }
 }
 
 #[test]
@@ -827,6 +845,635 @@ fn raw_range_skips_future_fact_keys_added_after_the_one_current_pin() {
         records.lookup_rid_at("kv", b"k", u64::MAX).unwrap(),
         Some(new)
     );
+}
+
+#[test]
+fn scan_rejects_a_visible_malformed_physical_state_key() {
+    let (_dir, _config, db) = database();
+    let records = db.records();
+    records.put(b"v", &[]).unwrap();
+    let held = records.pin_snapshot().unwrap();
+    let engine = db.kv();
+    // A tag below the first canonical RID is physically present and visible at
+    // this pin, but cannot be decoded as any State key.
+    let malformed = vec![0];
+    assert!(Key::decode(Role::State, &malformed, engine.inner.layout.root()).is_err());
+    let mut batch = crate::WriteBatch::new();
+    batch.put(
+        Role::State.cf(),
+        malformed.clone(),
+        Row::State {
+            live: false,
+            payload_length: 0,
+        }
+        .encode()
+        .unwrap(),
+    );
+    for op in batch.ops() {
+        engine
+            .inner
+            .memtable
+            .write()
+            .apply(held.core_sequence(), op);
+    }
+    assert!(
+        engine
+            .resolve_value_at_snapshot(
+                &ColumnFamily(Role::State.cf().into()),
+                &malformed,
+                held.core_sequence(),
+            )
+            .unwrap()
+            .is_some(),
+        "the malformed physical State key is visible at the retained pin"
+    );
+
+    assert!(matches!(
+        records.scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1()),
+        Err(CoreRecordScanError::Storage(PraxisError::Corrupt { .. }))
+    ));
+}
+
+#[test]
+fn scan_rejects_a_missing_live_state_even_when_the_candidate_set_is_empty() {
+    let (_dir, _config, db) = database();
+    let records = db.records();
+    let rid = records.put(b"v", &[]).unwrap();
+    let held = records.pin_snapshot().unwrap();
+    let allocator_key = Key::Allocator;
+    let allocator_bytes = records
+        .value(
+            Role::Meta,
+            &allocator_key,
+            held.pin_for(&records.engine).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    let Row::Allocator(allocator) = Row::decode(
+        &allocator_key,
+        &allocator_bytes,
+        db.kv().inner.layout.root(),
+    )
+    .unwrap() else {
+        panic!("the retained view must have an allocator row");
+    };
+    assert_eq!(allocator.live_count, 1);
+    assert_eq!(allocator.live_payload_bytes, 1);
+
+    // Remove the only physical State key without changing the allocator. This
+    // simulates a missing physical live row rather than a logical tombstone.
+    let engine = db.kv();
+    let state_cf = ColumnFamily(Role::State.cf().into());
+    engine.inner.memtable.write().remove_cf(&state_cf);
+    assert!(
+        engine
+            .resolve_value_at_snapshot(
+                &state_cf,
+                &Key::State(rid.0).encode().unwrap(),
+                held.core_sequence(),
+            )
+            .unwrap()
+            .is_none(),
+        "the live State key must really be physically absent at the retained pin"
+    );
+
+    assert!(matches!(
+        records.scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1()),
+        Err(CoreRecordScanError::Storage(PraxisError::Corrupt { .. }))
+    ));
+}
+
+#[test]
+fn scan_returns_only_live_rows_in_rid_order_and_skips_post_pin_keys() {
+    let (_dir, _config, db) = database();
+    let records = db.records();
+    let empty = records.pin_snapshot().unwrap();
+    assert!(
+        records
+            .scan_live_at_snapshot(&empty, RecordScanLimits::fixture_v1())
+            .unwrap()
+            .is_empty()
+    );
+    drop(empty);
+
+    let first = records.put(b"first", &[]).unwrap();
+    let second = records.put(b"second", &[]).unwrap();
+    let old = records.pin_snapshot().unwrap();
+    let old_clone = old.clone();
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 1);
+    records.delete_record(second).unwrap();
+    let third = records.put(b"third", &[]).unwrap();
+    let latest = records.pin_snapshot().unwrap();
+    assert_eq!(
+        records
+            .scan_live_at_snapshot(&old, RecordScanLimits::fixture_v1())
+            .unwrap(),
+        vec![(first, b"first".to_vec()), (second, b"second".to_vec())]
+    );
+    assert_eq!(
+        records
+            .scan_live_at_snapshot(&latest, RecordScanLimits::fixture_v1())
+            .unwrap(),
+        vec![(first, b"first".to_vec()), (third, b"third".to_vec())]
+    );
+    drop(old);
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 2);
+    drop(old_clone);
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 1);
+    drop(latest);
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 0);
+}
+
+#[test]
+fn scan_resolves_raw_visibility_before_decoding_a_future_malformed_key() {
+    let (_dir, _config, db) = database();
+    let records = db.records();
+    let rid = records.put(b"old", &[]).unwrap();
+    let held = records.pin_snapshot().unwrap();
+    inject_raw_at(
+        &db,
+        held.core_sequence() + 1,
+        Role::State,
+        vec![0],
+        Some(
+            Row::State {
+                live: false,
+                payload_length: 0,
+            }
+            .encode()
+            .unwrap(),
+        ),
+    );
+    assert_eq!(
+        records
+            .scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1())
+            .unwrap(),
+        vec![(rid, b"old".to_vec())]
+    );
+}
+
+#[test]
+fn scan_rejects_missing_dead_state_and_extra_live_or_dead_rid() {
+    {
+        let (_dir, _config, db) = database();
+        let records = db.records();
+        records.put(b"live", &[]).unwrap();
+        let dead = records.put(b"dead", &[]).unwrap();
+        records.delete_record(dead).unwrap();
+        records.flush().unwrap();
+        let held = records.pin_snapshot().unwrap();
+        let removed = db.kv().inner.segment_index.write().remove(&(
+            ColumnFamily(Role::State.cf().into()),
+            Bytes::from(Key::State(dead.0).encode().unwrap()),
+        ));
+        assert!(removed.is_some());
+        assert!(matches!(
+            records.scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1()),
+            Err(CoreRecordScanError::Storage(PraxisError::Corrupt { .. }))
+        ));
+    }
+    for live in [false, true] {
+        let (_dir, _config, db) = database();
+        let records = db.records();
+        records.put(b"one", &[]).unwrap();
+        let held = records.pin_snapshot().unwrap();
+        inject_raw_at(
+            &db,
+            held.core_sequence(),
+            Role::State,
+            Key::State(2).encode().unwrap(),
+            Some(
+                Row::State {
+                    live,
+                    payload_length: if live { 1 } else { 0 },
+                }
+                .encode()
+                .unwrap(),
+            ),
+        );
+        assert!(matches!(
+            records.scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1()),
+            Err(CoreRecordScanError::Storage(PraxisError::Corrupt { .. }))
+        ));
+    }
+}
+
+#[test]
+fn scan_rejects_first_middle_and_last_missing_payload_without_partial_success() {
+    for failed_index in 0..3 {
+        let (_dir, _config, db) = database();
+        let records = db.records();
+        let ids: Vec<_> = [b"one".as_slice(), b"two".as_slice(), b"three".as_slice()]
+            .iter()
+            .map(|payload| records.put(payload, &[]).unwrap())
+            .collect();
+        let held = records.pin_snapshot().unwrap();
+        inject_raw_at(
+            &db,
+            held.core_sequence(),
+            Role::Payload,
+            Key::Payload(ids[failed_index].0).encode().unwrap(),
+            None,
+        );
+        assert!(matches!(
+            records.scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1()),
+            Err(CoreRecordScanError::Storage(PraxisError::Corrupt { .. }))
+        ));
+    }
+}
+
+#[test]
+fn scan_refuses_raw_key_and_allocator_limits_with_typed_errors() {
+    let (_dir, _config, db) = database();
+    let records = db.records();
+    records.put(b"one", &[]).unwrap();
+    let held = records.pin_snapshot().unwrap();
+    let mut limits = RecordScanLimits::fixture_v1();
+    limits.max_candidate_keys = 0;
+    assert!(matches!(
+        records.scan_live_at_snapshot(&held, limits),
+        Err(CoreRecordScanError::ResourceLimit {
+            code: "state_candidates"
+        })
+    ));
+    let mut limits = RecordScanLimits::fixture_v1();
+    limits.max_live_rows = 0;
+    assert!(matches!(
+        records.scan_live_at_snapshot(&held, limits),
+        Err(CoreRecordScanError::ResourceLimit { code: "live_rows" })
+    ));
+    let mut limits = RecordScanLimits::fixture_v1();
+    limits.max_payload_bytes = 2;
+    assert!(matches!(
+        records.scan_live_at_snapshot(&held, limits),
+        Err(CoreRecordScanError::ResourceLimit {
+            code: "payload_bytes"
+        })
+    ));
+    let mut limits = RecordScanLimits::fixture_v1();
+    limits.max_candidate_key_bytes = 8;
+    assert!(matches!(
+        records.scan_live_at_snapshot(&held, limits),
+        Err(CoreRecordScanError::ResourceLimit {
+            code: "candidate_key_bytes"
+        })
+    ));
+    // Even a key first written after the pin must pass the raw-key admission
+    // limit before it can be cloned into the candidate set.
+    inject_raw_at(
+        &db,
+        held.core_sequence() + 1,
+        Role::State,
+        vec![2; 4_097],
+        Some(vec![0]),
+    );
+    assert!(matches!(
+        records.scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1()),
+        Err(CoreRecordScanError::ResourceLimit {
+            code: "raw_state_key_bytes"
+        })
+    ));
+}
+
+#[test]
+fn scan_refuses_a_second_distinct_candidate_before_its_raw_key_clone() {
+    let (_dir, _config, db) = database();
+    let records = db.records();
+    records.put(b"one", &[]).unwrap();
+    let held = records.pin_snapshot().unwrap();
+    inject_raw_at(
+        &db,
+        held.core_sequence() + 1,
+        Role::State,
+        Key::State(2).encode().unwrap(),
+        Some(
+            Row::State {
+                live: false,
+                payload_length: 0,
+            }
+            .encode()
+            .unwrap(),
+        ),
+    );
+    let mut limits = RecordScanLimits::fixture_v1();
+    limits.max_candidate_keys = 1;
+    assert!(matches!(
+        records.scan_live_at_snapshot(&held, limits),
+        Err(CoreRecordScanError::ResourceLimit {
+            code: "state_candidates"
+        })
+    ));
+}
+
+#[test]
+fn scan_adds_distinct_raw_key_lengths_before_the_cumulative_byte_limit() {
+    let (_dir, _config, db) = database();
+    let records = db.records();
+    let first = records.put(b"one", &[]).unwrap();
+    let second = records.put(b"two", &[]).unwrap();
+    let held = records.pin_snapshot().unwrap();
+    assert_eq!(Key::State(first.0).encode().unwrap().len(), 9);
+    assert_eq!(Key::State(second.0).encode().unwrap().len(), 9);
+
+    let mut admitted = RecordScanLimits::fixture_v1();
+    admitted.max_candidate_key_bytes = 18;
+    assert_eq!(
+        records.scan_live_at_snapshot(&held, admitted).unwrap(),
+        vec![(first, b"one".to_vec()), (second, b"two".to_vec())]
+    );
+    let mut refused = RecordScanLimits::fixture_v1();
+    refused.max_candidate_key_bytes = 17;
+    assert!(matches!(
+        records.scan_live_at_snapshot(&held, refused),
+        Err(CoreRecordScanError::ResourceLimit {
+            code: "candidate_key_bytes"
+        })
+    ));
+}
+
+#[test]
+fn scan_rejects_foreign_owner_and_poison_after_materialization() {
+    let (_dir, _config, db) = database();
+    let records = db.records();
+    records.put(b"one", &[]).unwrap();
+    let held = records.pin_snapshot().unwrap();
+    let (_other_dir, _other_config, other) = database();
+    assert!(matches!(
+        other
+            .records()
+            .scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1()),
+        Err(CoreRecordScanError::Storage(
+            PraxisError::ForeignRecordSnapshot { .. }
+        ))
+    ));
+    let engine = db.kv().clone();
+    READ_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |phase| {
+            if phase == ReadPhase::ScanBeforeReturn {
+                engine.inner.group_commit.poison("scan final guard".into());
+            }
+        }))
+    });
+    let late = records.scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1());
+    READ_HOOK.with(|hook| *hook.borrow_mut() = None);
+    assert!(matches!(
+        late,
+        Err(CoreRecordScanError::Storage(PraxisError::RecoveryRequired))
+    ));
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 1);
+}
+
+#[test]
+fn scan_rejects_a_poisoned_owner_before_any_scan_hook_fires() {
+    let (_dir, _config, db) = database();
+    let records = db.records();
+    records.put(b"one", &[]).unwrap();
+    let held = records.pin_snapshot().unwrap();
+    let hook_calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let observed = hook_calls.clone();
+    READ_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |_| {
+            observed.set(observed.get() + 1);
+        }))
+    });
+    db.kv().inner.group_commit.poison("scan entry guard".into());
+    let result = records.scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1());
+    READ_HOOK.with(|hook| *hook.borrow_mut() = None);
+    assert!(matches!(
+        result,
+        Err(CoreRecordScanError::Storage(PraxisError::RecoveryRequired))
+    ));
+    assert_eq!(hook_calls.get(), 0);
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 1);
+}
+
+#[test]
+fn scan_preserves_old_and_new_rows_through_flush_compaction_and_reclaim() {
+    for strategy in [
+        crate::CompactionStrategy::Leveled,
+        crate::CompactionStrategy::Tiered,
+        crate::CompactionStrategy::Universal,
+    ] {
+        let (_dir, _config, db) = database();
+        let records = db.records();
+        let old_rid = records.put(b"old", &[]).unwrap();
+        records.flush().unwrap();
+        let old = records.pin_snapshot().unwrap();
+        records.delete_record(old_rid).unwrap();
+        let new_rid = records.put(b"new", &[]).unwrap();
+        records.flush().unwrap();
+        assert!(db.kv().compact_with_strategy(strategy).unwrap() > 0);
+        records.reclaim_snapshot_history().unwrap();
+        db.kv().garbage_collect().unwrap();
+        assert_eq!(
+            records
+                .scan_live_at_snapshot(&old, RecordScanLimits::fixture_v1())
+                .unwrap(),
+            vec![(old_rid, b"old".to_vec())]
+        );
+        let latest = records.pin_snapshot().unwrap();
+        assert_eq!(
+            records
+                .scan_live_at_snapshot(&latest, RecordScanLimits::fixture_v1())
+                .unwrap(),
+            vec![(new_rid, b"new".to_vec())]
+        );
+        assert_eq!(db.kv().inner.snapshots.pinned_count(), 2);
+        drop(old);
+        drop(latest);
+        assert_eq!(db.kv().inner.snapshots.pinned_count(), 0);
+    }
+}
+
+#[test]
+fn scan_counts_a_key_in_segment_and_mutable_tiers_only_once() {
+    let (_dir, _config, db) = database();
+    let records = db.records();
+    let rid = records.put(b"old", &[]).unwrap();
+    records.flush().unwrap();
+    let held = records.pin_snapshot().unwrap();
+    records.delete_record(rid).unwrap();
+    let mut limits = RecordScanLimits::fixture_v1();
+    limits.max_candidate_keys = 1;
+    assert_eq!(
+        records.scan_live_at_snapshot(&held, limits).unwrap(),
+        vec![(rid, b"old".to_vec())]
+    );
+}
+
+#[test]
+fn scan_rejects_a_physically_missing_allocator_at_the_held_pin() {
+    let (_dir, _config, db) = database();
+    let records = db.records();
+    records.put(b"one", &[]).unwrap();
+    records.flush().unwrap();
+    let held = records.pin_snapshot().unwrap();
+    let allocator_key = Key::Allocator.encode().unwrap();
+    let meta_cf = ColumnFamily(Role::Meta.cf().into());
+    let removed = db
+        .kv()
+        .inner
+        .segment_index
+        .write()
+        .remove(&(meta_cf.clone(), Bytes::from(allocator_key.clone())));
+    assert!(removed.is_some());
+    assert!(
+        db.kv()
+            .resolve_value_at_snapshot(&meta_cf, &allocator_key, held.core_sequence())
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        db.kv()
+            .resolve_value_at_snapshot(
+                &meta_cf,
+                &Key::Binding.encode().unwrap(),
+                held.core_sequence(),
+            )
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 1);
+    assert!(matches!(
+        records.scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1()),
+        Err(CoreRecordScanError::Storage(PraxisError::Corrupt { .. }))
+    ));
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 1);
+}
+
+#[test]
+fn scan_rejects_malformed_allocator_and_state_rows() {
+    for role in [Role::Meta, Role::State] {
+        let (_dir, _config, db) = database();
+        let records = db.records();
+        let rid = records.put(b"one", &[]).unwrap();
+        let held = records.pin_snapshot().unwrap();
+        let key = match role {
+            Role::Meta => Key::Allocator,
+            Role::State => Key::State(rid.0),
+            _ => unreachable!(),
+        };
+        inject_raw_at(
+            &db,
+            held.core_sequence(),
+            role,
+            key.encode().unwrap(),
+            Some(vec![0]),
+        );
+        assert!(matches!(
+            records.scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1()),
+            Err(CoreRecordScanError::Storage(PraxisError::Corrupt { .. }))
+        ));
+    }
+}
+
+#[test]
+fn scan_preserves_external_payload_io_error_and_the_retained_pin() {
+    let (_dir, config, db) = database();
+    let records = db.records();
+    let first = records.put(b"first", &[]).unwrap();
+    let second = records.put(b"second", &[]).unwrap();
+    records.flush().unwrap();
+    drop(records);
+    drop(db);
+    let db = CoreDatabase::open(config).unwrap();
+    let records = db.records();
+    let held = records.pin_snapshot().unwrap();
+    let engine = db.kv();
+    let path = {
+        let index = engine.inner.segment_index.read();
+        let versions = &index[&(
+            ColumnFamily(Role::Payload.cf().into()),
+            Bytes::from(Key::Payload(second.0).encode().unwrap()),
+        )];
+        let crate::types::StoredValue::BlobPointer(pointer) = &versions.last().unwrap().value
+        else {
+            panic!("persisted external payload pointer required")
+        };
+        std::path::PathBuf::from(&pointer.path)
+    };
+    let held_path = path.with_extension("held");
+    std::fs::rename(&path, &held_path).unwrap();
+    assert!(matches!(
+        records.scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1()),
+        Err(CoreRecordScanError::Storage(PraxisError::Io(_)))
+    ));
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 1);
+    std::fs::rename(&held_path, &path).unwrap();
+    assert_eq!(
+        records
+            .scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1())
+            .unwrap(),
+        vec![(first, b"first".to_vec()), (second, b"second".to_vec())]
+    );
+}
+
+#[test]
+fn scan_rejects_payload_length_mismatch_after_an_earlier_live_row() {
+    let (_dir, _config, db) = database();
+    let records = db.records();
+    records.put(b"first", &[]).unwrap();
+    let second = records.put(b"second", &[]).unwrap();
+    let held = records.pin_snapshot().unwrap();
+    inject_raw_at(
+        &db,
+        held.core_sequence(),
+        Role::Payload,
+        Key::Payload(second.0).encode().unwrap(),
+        Some(Row::Payload(b"short").encode().unwrap()),
+    );
+    assert!(matches!(
+        records.scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1()),
+        Err(CoreRecordScanError::Storage(PraxisError::Corrupt { .. }))
+    ));
+}
+
+#[test]
+fn scan_releases_topology_before_a_barrier_and_returns_one_retained_view() {
+    let (_dir, _config, db) = database();
+    let records = db.records();
+    let first = records.put(b"first", &[]).unwrap();
+    records.flush().unwrap();
+    let old = records.pin_snapshot().unwrap();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let reader = records.clone();
+    let held = old.clone();
+    let join = std::thread::spawn(move || {
+        READ_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |phase| {
+                if phase == ReadPhase::ScanCaptured {
+                    ready_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                }
+            }))
+        });
+        let result = reader.scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1());
+        READ_HOOK.with(|hook| *hook.borrow_mut() = None);
+        result
+    });
+    ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 1);
+    let second = records.put(b"second", &[]).unwrap();
+    records.flush().unwrap();
+    db.kv()
+        .compact_with_strategy(crate::CompactionStrategy::Leveled)
+        .unwrap();
+    resume_tx.send(()).unwrap();
+    assert_eq!(
+        join.join().unwrap().unwrap(),
+        vec![(first, b"first".to_vec())]
+    );
+    let latest = records.pin_snapshot().unwrap();
+    assert_eq!(
+        records
+            .scan_live_at_snapshot(&latest, RecordScanLimits::fixture_v1())
+            .unwrap(),
+        vec![(first, b"first".to_vec()), (second, b"second".to_vec())]
+    );
+    drop(old);
+    drop(latest);
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 0);
 }
 
 #[test]
