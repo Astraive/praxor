@@ -4,6 +4,8 @@
 //! cut remains unsupported until its installed and replay relations are
 //! proven. No public database owner is constructed from this evidence.
 use super::codec::{Anchor, CatalogKey, CatalogValue, Head, anchor_digest, canonical_head_at_1};
+use super::control::CatalogControl;
+use super::frame::{self, FrameContext, PriorCatalog, ValidatedCatalogFrame};
 use crate::accel::Accelerator;
 use crate::config::{Compression, PraxisConfig};
 use crate::core_records::codec::{Allocator, Key as RecordKey, Role, Row as RecordRow};
@@ -11,8 +13,10 @@ use crate::errors::{PraxisError, Result};
 use crate::manifest::Manifest;
 use crate::segments::codec::decode_segment;
 use crate::segments::{BloomFilter, bloom_key};
+use crate::transactions::BatchOp;
 use crate::types::StoredValue;
 use crate::wal::catalog_witness::{WalCut, WalFileWitness, recheck_v4_wals, scan_v4_wals};
+use crate::wal::record::CoreWalRecord;
 use crate::writer_lease::WriterLease;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
@@ -93,6 +97,255 @@ struct FileWitness {
     digest: blake3::Hash,
 }
 
+/// One discardable, owned endpoint. It never borrows from the scanner's
+/// temporary `CoreWalRecord` or publishes effects to the live engine.
+#[derive(Debug)]
+pub(crate) struct CatalogReplayState {
+    source: PathBuf,
+    database_id: [u8; 16],
+    anchor: Anchor,
+    pub(crate) head: Head,
+    pub(crate) rows: CatalogReplayRows,
+}
+
+#[derive(Debug)]
+struct OwnedCatalogRow {
+    key: Vec<u8>,
+    value: Vec<u8>,
+}
+
+impl OwnedCatalogRow {
+    fn new(
+        key: &[u8],
+        value: &[u8],
+        key_cap: usize,
+        value_cap: usize,
+        source: &Path,
+    ) -> Result<Self> {
+        fn copy(bytes: &[u8], cap: usize, source: &Path) -> Result<Vec<u8>> {
+            if bytes.len() > cap {
+                return Err(corrupt(source, "v4 CREATE owned row exceeds catalog cap"));
+            }
+            let mut owned = Vec::new();
+            owned
+                .try_reserve_exact(bytes.len())
+                .map_err(|_| corrupt(source, "cannot reserve v4 CREATE row"))?;
+            owned.extend_from_slice(bytes);
+            Ok(owned)
+        }
+        Ok(Self {
+            key: copy(key, key_cap, source)?,
+            value: copy(value, value_cap, source)?,
+        })
+    }
+}
+
+/// The admitted cut has two installed rows and, at most, three new keys.
+/// Fixed slots make staging fallible only at explicit bounded byte copies.
+#[derive(Debug)]
+pub(crate) struct CatalogReplayRows {
+    head: OwnedCatalogRow,
+    anchor: OwnedCatalogRow,
+    name: Option<OwnedCatalogRow>,
+    schema: Option<OwnedCatalogRow>,
+    namespace: Option<OwnedCatalogRow>,
+}
+
+impl CatalogReplayRows {
+    pub(crate) fn len(&self) -> usize {
+        2 + usize::from(self.name.is_some())
+            + usize::from(self.schema.is_some())
+            + usize::from(self.namespace.is_some())
+    }
+
+    pub(crate) fn get(&self, key: &[u8]) -> Option<&Vec<u8>> {
+        [
+            Some(&self.head),
+            Some(&self.anchor),
+            self.name.as_ref(),
+            self.schema.as_ref(),
+            self.namespace.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|row| row.key == key)
+        .map(|row| &row.value)
+    }
+}
+
+impl CatalogReplayState {
+    fn from_installed(head: Head, anchor: Anchor, source: &Path) -> Result<Self> {
+        let rows = CatalogReplayRows {
+            head: OwnedCatalogRow {
+                key: CatalogKey::Head.encode()?,
+                value: CatalogValue::Head(head).encode()?,
+            },
+            anchor: OwnedCatalogRow {
+                key: CatalogKey::Anchor.encode()?,
+                value: CatalogValue::Anchor(anchor).encode()?,
+            },
+            name: None,
+            schema: None,
+            namespace: None,
+        };
+        Ok(Self {
+            source: source.to_path_buf(),
+            database_id: head.database_id,
+            anchor,
+            head,
+            rows,
+        })
+    }
+
+    fn apply_create(&mut self, frame: ValidatedCatalogFrame<'_>) -> Result<()> {
+        if frame.sequence() != 2 || self.head.revision != 1 || frame.ops().len() != 4 {
+            return Err(corrupt(&self.source, "unsupported v4 CREATE replay cut"));
+        }
+        if self.rows.len() != 2 {
+            return Err(corrupt(
+                &self.source,
+                "v4 CREATE endpoint is already extended",
+            ));
+        }
+        // The validated frame's ordered effects are Head, Name, Schema,
+        // Namespace. All four owned copies finish before publication.
+        let caps = [(1, 48), (258, 12), (9, 33_947), (9, 16)];
+        let mut staged = Vec::new();
+        staged
+            .try_reserve_exact(4)
+            .map_err(|_| corrupt(&self.source, "cannot reserve v4 CREATE effects"))?;
+        for (op, (key_cap, value_cap)) in frame.ops().iter().zip(caps) {
+            let BatchOp::Put { cf, key, value } = op else {
+                return Err(corrupt(&self.source, "v4 CREATE replay requires plain Put"));
+            };
+            if cf.0 != super::authority::CATALOG_CF {
+                return Err(corrupt(&self.source, "v4 CREATE replay family mismatch"));
+            }
+            staged.push(OwnedCatalogRow::new(
+                key,
+                value,
+                key_cap,
+                value_cap,
+                &self.source,
+            )?);
+        }
+        let [new_head, name, schema, namespace]: [OwnedCatalogRow; 4] = staged
+            .try_into()
+            .map_err(|_| corrupt(&self.source, "v4 CREATE effect count mismatch"))?;
+        let new_head_value =
+            self.validate_created_relation(&new_head, &name, &schema, &namespace)?;
+        self.rows.head = new_head;
+        self.rows.name = Some(name);
+        self.rows.schema = Some(schema);
+        self.rows.namespace = Some(namespace);
+        self.head = new_head_value;
+        Ok(())
+    }
+
+    fn validate_created_relation(
+        &self,
+        new_head: &OwnedCatalogRow,
+        name: &OwnedCatalogRow,
+        schema: &OwnedCatalogRow,
+        namespace: &OwnedCatalogRow,
+    ) -> Result<Head> {
+        let key = CatalogKey::decode(&new_head.key, &self.source)?;
+        let CatalogValue::Head(head) = CatalogValue::decode(&key, &new_head.value, &self.source)?
+        else {
+            return Err(corrupt(&self.source, "v4 CREATE effective Head mismatch"));
+        };
+        if key != CatalogKey::Head {
+            return Err(corrupt(
+                &self.source,
+                "v4 CREATE effective Head key mismatch",
+            ));
+        }
+        let CatalogKey::Name(label) = CatalogKey::decode(&name.key, &self.source)? else {
+            return Err(corrupt(
+                &self.source,
+                "v4 CREATE effective Name key mismatch",
+            ));
+        };
+        let CatalogValue::Name(name_id) =
+            CatalogValue::decode(&CatalogKey::Name(label), &name.value, &self.source)?
+        else {
+            return Err(corrupt(
+                &self.source,
+                "v4 CREATE effective Name row mismatch",
+            ));
+        };
+        let CatalogKey::Schema(schema_id) = CatalogKey::decode(&schema.key, &self.source)? else {
+            return Err(corrupt(
+                &self.source,
+                "v4 CREATE effective Schema key mismatch",
+            ));
+        };
+        let CatalogValue::Schema(schema_row) =
+            CatalogValue::decode(&CatalogKey::Schema(schema_id), &schema.value, &self.source)?
+        else {
+            return Err(corrupt(
+                &self.source,
+                "v4 CREATE effective Schema row mismatch",
+            ));
+        };
+        let CatalogKey::Namespace(namespace_id) = CatalogKey::decode(&namespace.key, &self.source)?
+        else {
+            return Err(corrupt(
+                &self.source,
+                "v4 CREATE effective Namespace key mismatch",
+            ));
+        };
+        let CatalogValue::Namespace(namespace_collection) = CatalogValue::decode(
+            &CatalogKey::Namespace(namespace_id),
+            &namespace.value,
+            &self.source,
+        )?
+        else {
+            return Err(corrupt(
+                &self.source,
+                "v4 CREATE effective Namespace row mismatch",
+            ));
+        };
+        let CatalogValue::Anchor(anchor) =
+            CatalogValue::decode(&CatalogKey::Anchor, &self.rows.anchor.value, &self.source)?
+        else {
+            return Err(corrupt(&self.source, "v4 CREATE effective Anchor mismatch"));
+        };
+        let expected_head = Head {
+            database_id: self.database_id,
+            revision: 2,
+            collection_count: 1,
+        };
+        if head != expected_head
+            || anchor != self.anchor
+            || name_id.get() != 2
+            || schema_id.get() != 2
+            || schema_row.namespace_id.get() != 2
+            || namespace_id.get() != 2
+            || namespace_collection.get() != 2
+            || label != schema_row.name
+        {
+            return Err(corrupt(&self.source, "v4 CREATE effective triple mismatch"));
+        }
+        Ok(expected_head)
+    }
+}
+
+impl PriorCatalog for CatalogReplayState {
+    fn head_and_name_presence(&mut self, exact_key: &[u8]) -> Result<(Head, bool)> {
+        if !matches!(
+            CatalogKey::decode(exact_key, &self.source)?,
+            CatalogKey::Name(_)
+        ) {
+            return Err(corrupt(
+                &self.source,
+                "v4 prior endpoint queried a non-Name key",
+            ));
+        }
+        Ok((self.head, self.rows.get(exact_key).is_some()))
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct CatalogOwnerProof {
     root: PathBuf,
@@ -104,6 +357,7 @@ pub(crate) struct CatalogOwnerProof {
     pub(crate) allocator: Allocator,
     pub(crate) head: Head,
     pub(crate) anchor: Anchor,
+    pub(crate) effective: CatalogReplayState,
     pub(crate) wal_witnesses: Vec<WalFileWitness>,
 }
 
@@ -471,33 +725,73 @@ pub(crate) fn inspect_v4_owner(
         active_wal_id: manifest.active_wal_id,
         next_wal_id: manifest.next_wal_id,
     };
-    let wal_witnesses = scan_v4_wals(root, cut, |_, _, _, _| {
-        Err(corrupt(
-            root,
-            "retired bootstrap cut has an unexpected WAL frame",
-        ))
+    let wal_path = root.join("wal/00000000000000000002.wal");
+    let mut effective = CatalogReplayState::from_installed(head, anchor, &wal_path)?;
+    let context = FrameContext::new(
+        manifest
+            .record_authority
+            .as_ref()
+            .expect("validated v4 record authority"),
+        manifest
+            .catalog_authority
+            .as_ref()
+            .expect("validated v4 catalog authority"),
+        &wal_path,
+    )?;
+    let mut saw_create = false;
+    let wal_witnesses = scan_v4_wals(root, cut, |wal_id, start, _, record| {
+        if saw_create || wal_id != 2 || start != 16 || record.sequence() != 2 {
+            return Err(corrupt(
+                &wal_path,
+                "unexpected v4 WAL frame in retired bootstrap cut",
+            ));
+        }
+        if !matches!(
+            record,
+            CoreWalRecord::Catalog {
+                control: CatalogControl::Create { .. },
+                ..
+            }
+        ) {
+            return Err(corrupt(&wal_path, "unexpected v4 WAL frame kind"));
+        }
+        let validated = frame::validate_create(record, &context, &mut effective)?;
+        effective.apply_create(validated)?;
+        saw_create = true;
+        Ok(())
     })?;
     if wal_witnesses.len() != 1
         || wal_witnesses[0].id != 2
-        || wal_witnesses[0].record_count != 0
         || wal_witnesses[0].torn_start.is_some()
-        || wal_witnesses[0].full_len != 16
+        || wal_witnesses[0].full_len != wal_witnesses[0].prefix_len
+        || (saw_create
+            && (wal_witnesses[0].record_count != 1
+                || wal_witnesses[0].catalog_creates != 1
+                || wal_witnesses[0].first_sequence != Some(2)
+                || wal_witnesses[0].last_sequence != Some(2)
+                || wal_witnesses[0].full_len <= 16))
+        || (!saw_create && (wal_witnesses[0].record_count != 0 || wal_witnesses[0].full_len != 16))
     {
         return Err(corrupt(
             root,
-            "retired bootstrap requires header-only active WAL",
+            "retired bootstrap WAL has an incomplete or extra tail",
         ));
+    }
+    let recovered_sequence = if saw_create { 2 } else { 1 };
+    if recovered_sequence < cut.last_sequence {
+        return Err(corrupt(root, "v4 replay ends below manifest last sequence"));
     }
     let proof = CatalogOwnerProof {
         root: root.to_path_buf(),
         manifest: manifest_witness,
         segment: segment_witness,
         cut,
-        recovered_sequence: 1,
+        recovered_sequence,
         binding,
         allocator,
         head,
         anchor,
+        effective,
         wal_witnesses,
     };
     proof.recheck(lease)?;

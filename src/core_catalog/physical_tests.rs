@@ -7,8 +7,10 @@ use crate::disk::DiskLayout;
 use crate::manifest::{CheckpointMetadata, ColumnFamilyGeneration, Manifest, ManifestStore};
 use crate::segments::block::SegmentEntry;
 use crate::segments::{SegmentWriteOptions, SegmentWriter};
+use crate::transactions::WriteBatch;
 use crate::types::{ColumnFamily, StoredValue, VersionedValue};
 use crate::values::ValueLog;
+use crate::wal::record::WalRecord;
 use crate::writer_lease::{LOCK_FILE_NAME, WriterLease};
 use std::collections::BTreeMap;
 use std::fs;
@@ -17,6 +19,7 @@ use std::path::{Path, PathBuf};
 const ORACLE: &str = include_str!("../../tests/fixtures/catalog_v4_wal_oracle.json");
 const BOOTSTRAP_FRAME: &[u8; 563] =
     include_bytes!("../../tests/fixtures/catalog_tag6_bootstrap_s1.bin");
+const CREATE_FRAME: &[u8; 424] = include_bytes!("../../tests/fixtures/catalog_tag7_create_s2.bin");
 const ID: [u8; 16] = [0x11; 16];
 
 fn bytes(hex: &str) -> Vec<u8> {
@@ -27,6 +30,24 @@ fn bytes(hex: &str) -> Vec<u8> {
         .iter()
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect()
+}
+
+fn oracle_mutation(name: &str) -> Vec<u8> {
+    let oracle: serde_json::Value = serde_json::from_str(ORACLE).unwrap();
+    let row = oracle["semantic_mutations_rechecksummed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"].as_str() == Some(name))
+        .unwrap();
+    bytes(row["frame_hex"].as_str().unwrap())
+}
+
+fn append_to_active_wal(root: &Path, suffix: &[u8]) {
+    let path = root.join("wal/00000000000000000002.wal");
+    let mut wal = fs::read(&path).unwrap();
+    wal.extend_from_slice(suffix);
+    fs::write(path, wal).unwrap();
 }
 
 fn installed_rows(include_anchor: bool) -> Vec<SegmentEntry> {
@@ -191,6 +212,144 @@ fn retired_bootstrap_has_four_physical_rows_and_header_only_active_wal() {
 }
 
 #[test]
+fn complete_unreceipted_create_s2_replays_read_only_from_installed_f1() {
+    let (dir, config, lease) = fixture(true);
+    append_to_active_wal(lease.root(), CREATE_FRAME);
+    let before = snapshot(dir.path());
+    let proof = inspect_v4_owner(&lease, &config, &CpuAccelerator).unwrap();
+    assert_eq!(proof.cut.flushed_sequence, 1);
+    assert_eq!(proof.cut.last_sequence, 1);
+    assert_eq!(proof.recovered_sequence, 2);
+    assert_eq!(proof.wal_witnesses.len(), 1);
+    assert_eq!(proof.wal_witnesses[0].id, 2);
+    assert_eq!(proof.wal_witnesses[0].record_count, 1);
+    assert_eq!(proof.wal_witnesses[0].catalog_creates, 1);
+    assert_eq!(proof.wal_witnesses[0].full_len, 440);
+    assert_eq!(proof.binding, (ID, 0));
+    assert_eq!(proof.allocator, Default::default());
+    assert_eq!(proof.head.revision, 1); // installed Head remains separate
+    assert_eq!(proof.anchor.database_id, ID);
+    assert_eq!(proof.effective.head.database_id, ID);
+    assert_eq!(proof.effective.head.revision, 2);
+    assert_eq!(proof.effective.head.collection_count, 1);
+    assert_eq!(proof.effective.rows.len(), 5);
+    let oracle: serde_json::Value = serde_json::from_str(ORACLE).unwrap();
+    for row in oracle["create_tag7"]["operations"].as_array().unwrap() {
+        let key = bytes(row["key_hex"].as_str().unwrap());
+        let value = bytes(row["value_hex"].as_str().unwrap());
+        assert_eq!(proof.effective.rows.get(&key), Some(&value));
+    }
+    assert_eq!(
+        proof.effective.rows.get(&[4]),
+        Some(&bytes(oracle["anchor_at_1_value_hex"].as_str().unwrap()))
+    );
+    proof.recheck(&lease).unwrap();
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn rechecksummed_create_mutations_are_refused_against_installed_head() {
+    for (name, expected) in [
+        (
+            "create_prior_revision_only",
+            "catalog CREATE frame relation mismatch",
+        ),
+        (
+            "create_schema_collection_id_only",
+            "catalog schema key/namespace ID mismatch",
+        ),
+    ] {
+        let (dir, config, lease) = fixture(true);
+        append_to_active_wal(lease.root(), &oracle_mutation(name));
+        let before = snapshot(dir.path());
+        let error = inspect_v4_owner(&lease, &config, &CpuAccelerator).unwrap_err();
+        assert!(format!("{error}").contains(expected), "{name}: {error}");
+        assert_eq!(snapshot(dir.path()), before);
+    }
+}
+
+#[test]
+fn second_complete_s2_or_user_frame_discards_staged_create() {
+    for second in [
+        CREATE_FRAME.to_vec(),
+        WalRecord {
+            sequence: 3,
+            batch: WriteBatch::new(),
+        }
+        .encode(),
+    ] {
+        let (dir, config, lease) = fixture(true);
+        append_to_active_wal(lease.root(), CREATE_FRAME);
+        append_to_active_wal(lease.root(), &second);
+        let before = snapshot(dir.path());
+        assert!(inspect_v4_owner(&lease, &config, &CpuAccelerator).is_err());
+        assert_eq!(snapshot(dir.path()), before);
+    }
+}
+
+#[test]
+fn standalone_valid_user_s2_is_not_a_catalog_owner() {
+    let (dir, config, lease) = fixture(true);
+    let user = WalRecord {
+        sequence: 2,
+        batch: WriteBatch::new(),
+    }
+    .encode();
+    append_to_active_wal(lease.root(), &user);
+    let before = snapshot(dir.path());
+    let error = inspect_v4_owner(&lease, &config, &CpuAccelerator).unwrap_err();
+    assert!(
+        format!("{error}").contains("unexpected v4 WAL frame kind"),
+        "{error}"
+    );
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn valid_s2_followed_by_any_short_active_frame_prefix_is_not_an_owner() {
+    for tail_len in 1..=15 {
+        let (dir, config, lease) = fixture(true);
+        append_to_active_wal(lease.root(), CREATE_FRAME);
+        append_to_active_wal(lease.root(), &CREATE_FRAME[..tail_len]);
+        let before = snapshot(dir.path());
+        let error = inspect_v4_owner(&lease, &config, &CpuAccelerator).unwrap_err();
+        assert!(
+            format!("{error}").contains("incomplete or extra tail"),
+            "tail length {tail_len}: {error}"
+        );
+        assert_eq!(snapshot(dir.path()), before);
+    }
+}
+
+#[test]
+fn private_recheck_rejects_same_length_rechecksummed_wal_replacement() {
+    let (dir, config, lease) = fixture(true);
+    append_to_active_wal(lease.root(), CREATE_FRAME);
+    let proof = inspect_v4_owner(&lease, &config, &CpuAccelerator).unwrap();
+    let path = lease.root().join("wal/00000000000000000002.wal");
+    let original_len = fs::metadata(&path).unwrap().len();
+    let mut replacement = fs::read(&path).unwrap()[..16].to_vec();
+    replacement.extend(oracle_mutation("create_prior_revision_only"));
+    assert_eq!(replacement.len() as u64, original_len);
+    fs::write(path, replacement).unwrap();
+    let before = snapshot(dir.path());
+    assert!(proof.recheck(&lease).is_err());
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn manifest_l2_without_complete_s2_fails_closed() {
+    let (dir, config, lease) = fixture(true);
+    let path = lease.root().join("MANIFEST");
+    let mut manifest = Manifest::decode(&fs::read(&path).unwrap(), &path).unwrap();
+    manifest.last_sequence = 2;
+    ManifestStore::new(&path).save(&manifest).unwrap();
+    let before = snapshot(dir.path());
+    assert!(inspect_v4_owner(&lease, &config, &CpuAccelerator).is_err());
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
 fn missing_anchor_in_valid_redigested_segment_is_refused_without_mutation() {
     let (dir, config, lease) = fixture(false);
     let before = snapshot(dir.path());
@@ -344,7 +503,7 @@ fn retired_cut_refuses_unexpected_active_wal_frame_without_mutation() {
     let before = snapshot(dir.path());
     let error = inspect_v4_owner(&lease, &config, &CpuAccelerator).unwrap_err();
     assert!(
-        format!("{error}").contains("unexpected WAL frame"),
+        format!("{error}").contains("unexpected v4 WAL frame"),
         "{error}"
     );
     assert_eq!(snapshot(dir.path()), before);
