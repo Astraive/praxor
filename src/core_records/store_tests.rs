@@ -2018,6 +2018,388 @@ gateway_corrupt_case!(gateway_public_corrupt_payload_first, Role::Payload, 0);
 gateway_corrupt_case!(gateway_public_corrupt_payload_middle, Role::Payload, 1);
 gateway_corrupt_case!(gateway_public_corrupt_payload_last, Role::Payload, 2);
 
+// Independent, fixed PRXQDOC-NUL v1 frames for the retained-view race. The
+// expected rows below are written separately from these physical bytes.
+const GATEWAY_RACE_OLD: &[u8] = b"PRXQDOC\0\x00\x01\x00\x00\x00\x00\x00\x27\x00\x04docs\x00\x02u1\x00\x01\x00\x01n\x05\x00\x00\x00\x03old";
+const GATEWAY_RACE_STEADY: &[u8] = b"PRXQDOC\0\x00\x01\x00\x00\x00\x00\x00\x2e\x00\x04docs\x00\x06steady\x00\x01\x00\x01n\x05\x00\x00\x00\x06steady";
+const GATEWAY_RACE_NEW: &[u8] = b"PRXQDOC\0\x00\x01\x00\x00\x00\x00\x00\x27\x00\x04docs\x00\x02u1\x00\x01\x00\x01n\x05\x00\x00\x00\x03new";
+
+fn gateway_race_catalog() -> crate::Catalog {
+    use crate::{AttributeSchema, AttributeType, CollectionSchema};
+
+    let mut catalog = crate::Catalog::new();
+    catalog
+        .create_collection(
+            CollectionSchema::new("docs")
+                .with_attribute(AttributeSchema::new("n", AttributeType::Text)),
+        )
+        .unwrap();
+    catalog
+}
+
+fn gateway_race_old_rows() -> Vec<GatewayLiteralRow> {
+    vec![
+        (
+            "docs".into(),
+            "u1".into(),
+            vec![("n".into(), serde_json::json!("old"))],
+        ),
+        (
+            "docs".into(),
+            "steady".into(),
+            vec![("n".into(), serde_json::json!("steady"))],
+        ),
+    ]
+}
+
+fn gateway_race_new_rows() -> Vec<GatewayLiteralRow> {
+    vec![
+        (
+            "docs".into(),
+            "steady".into(),
+            vec![("n".into(), serde_json::json!("steady"))],
+        ),
+        (
+            "docs".into(),
+            "u1".into(),
+            vec![("n".into(), serde_json::json!("new"))],
+        ),
+    ]
+}
+
+#[derive(Clone, Copy, Debug)]
+enum GatewayRaceBarrier {
+    Captured,
+    FirstPayload,
+}
+
+// The bounded resume sender is owned by the main test thread. An unwind after
+// the worker pauses must release the hook rather than strand its scan.
+struct GatewayRaceResume(Option<mpsc::SyncSender<()>>);
+
+impl GatewayRaceResume {
+    fn resume(&mut self) -> std::result::Result<(), mpsc::SendError<()>> {
+        self.0
+            .take()
+            .expect("gateway race already resumed")
+            .send(())
+    }
+}
+
+impl Drop for GatewayRaceResume {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+fn gateway_public_retained_race_cell(
+    barrier: GatewayRaceBarrier,
+    strategy: crate::CompactionStrategy,
+) {
+    fn assert_send<T: Send>() {}
+    assert_send::<QueryGateway>();
+    assert_send::<QueryReadView>();
+
+    assert_eq!(GATEWAY_RACE_OLD.len(), 39);
+    assert_eq!(GATEWAY_RACE_STEADY.len(), 46);
+    assert_eq!(GATEWAY_RACE_NEW.len(), 39);
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = PraxisConfig::new(dir.path());
+    config.memtable_flush_threshold_bytes = usize::MAX;
+    config.large_value_threshold = 1;
+    config.default_compaction_strategy = strategy;
+    let db = CoreDatabase::create_fresh(config, RecordAuthorityOptions::default()).unwrap();
+    let options = db.kv().cf_options_map();
+    for role in [Role::State, Role::Payload] {
+        assert_eq!(
+            options.get(role.cf()).unwrap().compaction_strategy,
+            strategy,
+            "{role:?}: fixture CF policy must match this compaction cell"
+        );
+    }
+    let records = db.records();
+    let old_rid = records.put(GATEWAY_RACE_OLD, &[]).unwrap();
+    let steady_rid = records.put(GATEWAY_RACE_STEADY, &[]).unwrap();
+    assert_eq!((old_rid, steady_rid), (RecordId(1), RecordId(2)));
+    records.flush().unwrap();
+    let gateway = QueryGateway::attach_fixture_v1(&db, gateway_race_catalog()).unwrap();
+    let old_view = gateway.begin_read().unwrap();
+    assert_eq!(
+        gateway_fault_rows(
+            gateway
+                .query(&old_view, "SELECT n FROM docs", &TypedParameters::default())
+                .unwrap()
+        ),
+        gateway_race_old_rows()
+    );
+    let worker_view = old_view.clone();
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 1);
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<GatewayScanHits>(1);
+    let (resume_tx, resume_rx) = mpsc::sync_channel::<()>(1);
+    let worker = std::thread::spawn(move || {
+        // Rc/Cell belongs entirely to this thread; the gateway and held view
+        // alone cross the thread boundary.
+        let hits = Rc::new(Cell::new(GatewayScanHits::default()));
+        let hook_hits = Rc::clone(&hits);
+        let paused = Rc::new(Cell::new(false));
+        let hook_paused = Rc::clone(&paused);
+        READ_HOOK.with(|slot| {
+            assert!(slot.borrow().is_none(), "previous worker hook leaked");
+            *slot.borrow_mut() = Some(Box::new(move |phase| {
+                let mut current = hook_hits.get();
+                current.record(phase);
+                hook_hits.set(current);
+                let reached = match barrier {
+                    GatewayRaceBarrier::Captured => phase == ReadPhase::ScanCaptured,
+                    GatewayRaceBarrier::FirstPayload => {
+                        phase == ReadPhase::ScanPayload && current.payload == 1
+                    }
+                };
+                if reached && !hook_paused.replace(true) {
+                    ready_tx.send(current).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                }
+            }));
+        });
+        let mut reset = GatewayHookReset { installed: true };
+        let result = gateway.query(
+            &worker_view,
+            "SELECT n FROM docs",
+            &TypedParameters::default(),
+        );
+        let completed_hits = hits.get();
+        reset.clear().expect("gateway race hook did not clear");
+        (gateway, result, completed_hits, paused.get())
+    });
+    let mut resume = GatewayRaceResume(Some(resume_tx));
+    let at_pause = ready_rx.recv_timeout(Duration::from_secs(30));
+    if at_pause.is_err() {
+        let _ = resume.resume();
+        let _ = worker.join();
+        panic!("gateway worker did not reach {barrier:?} barrier: {at_pause:?}");
+    }
+
+    // Keep every maintenance result until the worker has been resumed and
+    // joined, so even a setup failure cannot strand the paused scanner.
+    let removed = records.delete_record(old_rid);
+    let replacement = records.put(GATEWAY_RACE_NEW, &[]);
+    let flushed = records.flush();
+    let compacted = db.kv().compact_with_strategy(strategy);
+    let reclaimed = records.reclaim_snapshot_history();
+    let collected = db.kv().garbage_collect();
+    let resume_result = resume.resume();
+    let joined = worker.join();
+
+    resume_result.expect("gateway worker resume channel closed");
+    let (gateway, result, completed_hits, did_pause) = joined.unwrap();
+    removed.unwrap();
+    let new_rid = replacement.unwrap();
+    assert_eq!(new_rid, RecordId(3));
+    flushed.unwrap();
+    let compaction_count = compacted.unwrap();
+    eprintln!(
+        "gateway retained race barrier={barrier:?} strategy={strategy:?} compaction_count={compaction_count}"
+    );
+    assert!(
+        compaction_count > 0,
+        "{barrier:?}/{strategy:?}: compaction must do real work"
+    );
+    reclaimed.unwrap();
+    collected.unwrap();
+    assert!(did_pause, "{barrier:?}/{strategy:?}: hook did not pause");
+    let expected_pause = match barrier {
+        GatewayRaceBarrier::Captured => GatewayScanHits {
+            captured: 1,
+            ..GatewayScanHits::default()
+        },
+        GatewayRaceBarrier::FirstPayload => GatewayScanHits {
+            captured: 1,
+            state: 1,
+            payload: 1,
+            before_return: 0,
+        },
+    };
+    assert_eq!(at_pause.unwrap(), expected_pause);
+    assert_eq!(
+        completed_hits,
+        GatewayScanHits {
+            captured: 1,
+            state: 2,
+            payload: 2,
+            before_return: 1,
+        },
+        "{barrier:?}/{strategy:?}: worker must complete one held scan"
+    );
+    assert_eq!(gateway_fault_rows(result.unwrap()), gateway_race_old_rows());
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 1);
+    assert_eq!(
+        gateway_fault_rows(
+            gateway
+                .query(&old_view, "SELECT n FROM docs", &TypedParameters::default())
+                .unwrap()
+        ),
+        gateway_race_old_rows(),
+        "{barrier:?}/{strategy:?}: same retained view changed"
+    );
+    let fresh = gateway.begin_read().unwrap();
+    assert_eq!(
+        gateway_fault_rows(
+            gateway
+                .query(&fresh, "SELECT n FROM docs", &TypedParameters::default())
+                .unwrap()
+        ),
+        gateway_race_new_rows(),
+        "{barrier:?}/{strategy:?}: fresh view mixed old and new"
+    );
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 2);
+    drop(fresh);
+    drop(old_view);
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 0);
+}
+
+macro_rules! gateway_retained_race_case {
+    ($name:ident, $barrier:expr, $strategy:expr) => {
+        #[test]
+        fn $name() {
+            gateway_public_retained_race_cell($barrier, $strategy);
+        }
+    };
+}
+
+gateway_retained_race_case!(
+    gateway_public_race_captured_leveled,
+    GatewayRaceBarrier::Captured,
+    crate::CompactionStrategy::Leveled
+);
+gateway_retained_race_case!(
+    gateway_public_race_captured_tiered,
+    GatewayRaceBarrier::Captured,
+    crate::CompactionStrategy::Tiered
+);
+gateway_retained_race_case!(
+    gateway_public_race_captured_universal,
+    GatewayRaceBarrier::Captured,
+    crate::CompactionStrategy::Universal
+);
+gateway_retained_race_case!(
+    gateway_public_race_first_payload_leveled,
+    GatewayRaceBarrier::FirstPayload,
+    crate::CompactionStrategy::Leveled
+);
+gateway_retained_race_case!(
+    gateway_public_race_first_payload_tiered,
+    GatewayRaceBarrier::FirstPayload,
+    crate::CompactionStrategy::Tiered
+);
+gateway_retained_race_case!(
+    gateway_public_race_first_payload_universal,
+    GatewayRaceBarrier::FirstPayload,
+    crate::CompactionStrategy::Universal
+);
+
+#[test]
+fn gateway_public_late_group_commit_poison_refuses_buffered_rows() {
+    let fixture = gateway_fault_fixture();
+    let hits = Rc::new(Cell::new(GatewayScanHits::default()));
+    let hook_hits = Rc::clone(&hits);
+    let engine = fixture.db.kv().clone();
+    READ_HOOK.with(|slot| {
+        assert!(slot.borrow().is_none(), "previous hook leaked");
+        *slot.borrow_mut() = Some(Box::new(move |phase| {
+            let mut current = hook_hits.get();
+            current.record(phase);
+            hook_hits.set(current);
+            if phase == ReadPhase::ScanBeforeReturn {
+                engine.inner.group_commit.poison("gateway late scan".into());
+            }
+        }));
+    });
+    let mut reset = GatewayHookReset { installed: true };
+    let result = fixture.query();
+    let terminal_hits = hits.get();
+    reset
+        .clear()
+        .expect("gateway late poison hook did not clear");
+    assert_eq!(
+        terminal_hits,
+        GatewayScanHits {
+            captured: 1,
+            state: 3,
+            payload: 3,
+            before_return: 1,
+        }
+    );
+    assert!(
+        matches!(
+            result,
+            Err(QueryReadError::Storage(PraxisError::RecoveryRequired))
+        ),
+        "late poison must discard buffered gateway rows"
+    );
+}
+
+#[test]
+fn gateway_public_prequery_group_commit_poison_hits_no_scan_hook() {
+    let fixture = gateway_fault_fixture();
+    let hits = Rc::new(Cell::new(GatewayScanHits::default()));
+    let hook_hits = Rc::clone(&hits);
+    READ_HOOK.with(|slot| {
+        assert!(slot.borrow().is_none(), "previous hook leaked");
+        *slot.borrow_mut() = Some(Box::new(move |phase| {
+            let mut current = hook_hits.get();
+            current.record(phase);
+            hook_hits.set(current);
+        }));
+    });
+    let mut reset = GatewayHookReset { installed: true };
+    fixture
+        .db
+        .kv()
+        .inner
+        .group_commit
+        .poison("gateway prequery scan".into());
+    let result = fixture.query();
+    let terminal_hits = hits.get();
+    reset
+        .clear()
+        .expect("gateway prequery poison hook did not clear");
+    assert_eq!(terminal_hits, GatewayScanHits::default());
+    assert!(matches!(
+        result,
+        Err(QueryReadError::Storage(PraxisError::RecoveryRequired))
+    ));
+}
+
+#[test]
+fn gateway_public_foreign_view_is_rejected_before_scan_capture() {
+    let fixture = gateway_fault_fixture();
+    let second = QueryGateway::attach_fixture_v1(&fixture.db, gateway_fault_catalog()).unwrap();
+    let hits = Rc::new(Cell::new(GatewayScanHits::default()));
+    let hook_hits = Rc::clone(&hits);
+    READ_HOOK.with(|slot| {
+        assert!(slot.borrow().is_none(), "previous hook leaked");
+        *slot.borrow_mut() = Some(Box::new(move |phase| {
+            let mut current = hook_hits.get();
+            current.record(phase);
+            hook_hits.set(current);
+        }));
+    });
+    let mut reset = GatewayHookReset { installed: true };
+    let result = second.query(
+        &fixture.view,
+        "SELECT n FROM docs",
+        &TypedParameters::default(),
+    );
+    let terminal_hits = hits.get();
+    reset
+        .clear()
+        .expect("gateway foreign-view hook did not clear");
+    assert_eq!(terminal_hits, GatewayScanHits::default());
+    assert!(matches!(result, Err(QueryReadError::ForeignGateway)));
+}
+
 #[test]
 fn combined_reads_hold_exactly_one_pin_through_delete_and_all_compactions() {
     for strategy in [
