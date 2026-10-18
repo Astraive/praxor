@@ -124,7 +124,9 @@ impl RecordAuthority {
         Ok(id)
     }
 
-    pub(crate) fn validate(&self, manifest: &Manifest, source: &Path) -> Result<()> {
+    /// Fixed identity/role contract; owner admission separately validates the
+    /// complete manifest inventory. Token capture need not scan user families.
+    pub(super) fn validate_binding(&self, source: &Path) -> Result<()> {
         self.identity(source)?;
         if self.kind != "core_records"
             || self.schema_version != 1
@@ -136,10 +138,7 @@ impl RecordAuthority {
                 "unsupported record authority kind/schema/epoch/bootstrap",
             ));
         }
-        if self.roles.len() != 4
-            || manifest.next_column_family_generation < 5
-            || manifest.last_sequence < 1
-        {
+        if self.roles.len() != 4 {
             return Err(corrupt(
                 source,
                 "incomplete record authority roles/counters",
@@ -156,6 +155,23 @@ impl RecordAuthority {
             {
                 return Err(corrupt(source, "duplicate or altered record role binding"));
             }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate(&self, manifest: &Manifest, source: &Path) -> Result<()> {
+        self.validate_binding(source)?;
+        if manifest.next_column_family_generation < 5 || manifest.last_sequence < 1 {
+            return Err(corrupt(
+                source,
+                "incomplete record authority roles/counters",
+            ));
+        }
+        for binding in &self.roles {
+            let index = ROLES
+                .iter()
+                .position(|(role, _)| *role == binding.role)
+                .expect("validated role binding");
             let expected = self.descriptor(index, manifest);
             if manifest
                 .column_families
