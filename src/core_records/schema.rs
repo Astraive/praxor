@@ -126,7 +126,7 @@ impl RecordAuthority {
 
     /// Fixed identity/role contract; owner admission separately validates the
     /// complete manifest inventory. Token capture need not scan user families.
-    pub(super) fn validate_binding(&self, source: &Path) -> Result<()> {
+    pub(crate) fn validate_binding(&self, source: &Path) -> Result<()> {
         self.identity(source)?;
         if self.kind != "core_records"
             || self.schema_version != 1

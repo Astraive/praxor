@@ -552,6 +552,7 @@ pub(super) fn require_destination(root: &Path) -> Result<()> {
         Err(error) => return Err(error.into()),
     };
     let report = inspect_storage_root(root, InspectionOptions::for_admission())?;
+    fence_v4_destination(root, &report)?;
     let neutral = neutral_primary(root)?;
     let only_neutral = neutral
         && fs::read_dir(root)?.all(|entry| {
@@ -584,7 +585,113 @@ pub(super) fn require_destination(root: &Path) -> Result<()> {
             );
         }
     }
-    core_shape(root, retry, false)
+    core_shape(root, retry, false, root)
+}
+
+/// A retry marker masks the inspected root kind, and a complete temporary
+/// control is not versioned by the root inspector. Check both exact control
+/// paths before either case can authorize copy publication.
+fn fence_v4_destination(
+    root: &Path,
+    report: &crate::storage::root_format::RootInspection,
+) -> Result<()> {
+    use crate::storage::root_format::{DiagnosticKind, InspectionOptions, RootKind, RootOwner};
+
+    if report.kind == RootKind::Mixed
+        || report
+            .evidence
+            .iter()
+            .any(|item| item.owner != RootOwner::Core)
+        || report.diagnostics.iter().any(|item| {
+            !matches!(
+                item.kind,
+                DiagnosticKind::MissingAuthority
+                    if item.path == root.join(INCOMPLETE)
+                        || item.path == root.join("MANIFEST")
+            ) && !matches!(
+                item.kind,
+                DiagnosticKind::UnsupportedVersion { version: 4, .. }
+                    if item.path == root.join("MANIFEST")
+            )
+        })
+    {
+        return Ok(());
+    }
+
+    let mut budget = InspectionOptions::for_admission().max_control_bytes;
+    let mut v4_path = None;
+    for name in ["MANIFEST", "MANIFEST.tmp"] {
+        let path = root.join(name);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        // Leave aliases and malformed roles to the existing inspector and
+        // copy-shape diagnostics; never open their targets while probing.
+        if control_alias(&metadata) || !metadata.is_file() {
+            return Ok(());
+        }
+        let bytes = read_destination_control(&path, &metadata, &mut budget)?;
+        if Manifest::decode(&bytes, &path).is_ok_and(|manifest| manifest.format_version == 4) {
+            v4_path.get_or_insert(path);
+        }
+    }
+    if let Some(path) = v4_path {
+        return Err(PraxisError::StorageFormatUnsupported {
+            path: root.to_path_buf(),
+            expected: RootOwner::Core,
+            reason: format!("format version 4 destination control at {}", path.display()),
+            evidence: vec![path],
+        });
+    }
+    Ok(())
+}
+
+fn read_destination_control(
+    path: &Path,
+    before: &fs::Metadata,
+    budget: &mut usize,
+) -> Result<Vec<u8>> {
+    let len = usize::try_from(before.len())
+        .map_err(|_| error(path, "control size exceeds address space"))?;
+    if len > *budget {
+        return corrupt(path, "control-file byte inspection budget exhausted");
+    }
+    let requested = len
+        .checked_add(1)
+        .ok_or_else(|| error(path, "control size exceeds address space"))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(requested)
+        .map_err(|_| error(path, "cannot reserve memory for control bytes"))?;
+    File::open(path)?
+        .take(requested as u64)
+        .read_to_end(&mut bytes)?;
+    let after = fs::symlink_metadata(path)?;
+    if control_alias(&after)
+        || before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+        || bytes.len() != len
+    {
+        return corrupt(path, "control changed during destination inspection");
+    }
+    *budget -= len;
+    Ok(bytes)
+}
+
+fn control_alias(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return true;
+        }
+    }
+    false
 }
 
 fn neutral_primary(root: &Path) -> Result<bool> {
@@ -607,7 +714,7 @@ fn neutral_primary(root: &Path) -> Result<bool> {
     }
 }
 
-fn core_shape(root: &Path, retry: bool, stage: bool) -> Result<()> {
+fn core_shape(root: &Path, retry: bool, stage: bool, destination: &Path) -> Result<()> {
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
@@ -630,12 +737,29 @@ fn core_shape(root: &Path, retry: bool, stage: bool) -> Result<()> {
             }
             "MANIFEST" | "MANIFEST.tmp" if kind.is_file() => {
                 let bytes = fs::read(&path)?;
-                if Manifest::decode(&bytes, &path).is_err() {
-                    let signature = b"format_version = 2";
-                    if !(stage || (retry && name == "MANIFEST.tmp"))
-                        || !(bytes.starts_with(signature) || signature.starts_with(&bytes))
-                    {
-                        return corrupt(&path, "copy control is not a recognized core manifest");
+                match Manifest::decode(&bytes, &path) {
+                    Ok(manifest) if manifest.format_version == 4 => {
+                        return Err(PraxisError::StorageFormatUnsupported {
+                            path: destination.to_path_buf(),
+                            expected: crate::storage::root_format::RootOwner::Core,
+                            reason: format!(
+                                "format version 4 destination control at {}",
+                                path.display()
+                            ),
+                            evidence: vec![path],
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        let signature = b"format_version = 2";
+                        if !(stage || (retry && name == "MANIFEST.tmp"))
+                            || !(bytes.starts_with(signature) || signature.starts_with(&bytes))
+                        {
+                            return corrupt(
+                                &path,
+                                "copy control is not a recognized core manifest",
+                            );
+                        }
                     }
                 }
             }
@@ -750,7 +874,7 @@ fn core_shape(root: &Path, retry: bool, stage: bool) -> Result<()> {
                     {
                         return corrupt(&child.path(), "unknown temporary copy role");
                     }
-                    core_shape(&child.path(), false, true)?;
+                    core_shape(&child.path(), false, true, destination)?;
                 }
             }
             _ => return corrupt(&path, "copy destination contains an unrelated role"),
