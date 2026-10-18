@@ -193,6 +193,18 @@ impl Parser {
         true
     }
 
+    fn refuse_function_call_at(&self, at: usize) -> Result<(), ParseError> {
+        if let Some(token) = self.tokens.get(at)
+            && token.kind == TokenKind::LParen
+        {
+            return Err(ParseError::UnsupportedFeature {
+                feature: "function",
+                span: token.span,
+            });
+        }
+        Ok(())
+    }
+
     fn identifier(&mut self) -> Result<Identifier, ParseError> {
         let token = self
             .peek()
@@ -227,15 +239,7 @@ impl Parser {
                 span: self.current_span(),
             });
         }
-        if self
-            .peek()
-            .is_some_and(|token| token.kind == TokenKind::LParen)
-        {
-            return Err(ParseError::UnsupportedFeature {
-                feature: "function",
-                span: self.current_span(),
-            });
-        }
+        self.refuse_function_call_at(self.at)?;
         while self.take_kind(TokenKind::Comma) {
             fields.push(self.identifier()?);
             if self.word("AS") {
@@ -244,12 +248,18 @@ impl Parser {
                     span: self.current_span(),
                 });
             }
+            self.refuse_function_call_at(self.at)?;
         }
         Ok(Projection::Fields(fields))
     }
 
     fn value(&mut self) -> Result<ValueExpr, ParseError> {
         let token = self.peek().ok_or_else(|| self.syntax("expected_value"))?;
+        if matches!(&token.kind, TokenKind::QuotedIdentifier(_))
+            || matches!(&token.kind, TokenKind::Word(word) if !reserved_word(word))
+        {
+            self.refuse_function_call_at(self.at + 1)?;
+        }
         let syntax = match &token.kind {
             TokenKind::Integer(digits) => ValueSyntax::Integer(digits.clone()),
             TokenKind::Text(text) => ValueSyntax::Text(text.clone()),
@@ -267,6 +277,7 @@ impl Parser {
 
     fn comparison(&mut self) -> Result<PredicateExpr, ParseError> {
         let field = self.identifier()?;
+        self.refuse_function_call_at(self.at)?;
         if self.take_word("IS") {
             let negated = self.take_word("NOT");
             self.expect_word("NULL", "expected_null")?;
@@ -373,6 +384,7 @@ impl Parser {
         let projection = self.projection()?;
         self.expect_word("FROM", "expected_from")?;
         let collection = self.identifier()?;
+        self.refuse_function_call_at(self.at)?;
         let predicate = if self.take_word("WHERE") {
             Some(self.or_expr(0)?)
         } else {

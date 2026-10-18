@@ -1,4 +1,5 @@
 //! Public Q1 compiler contract. Inputs and expected JSON are literal client fixtures.
+use praxis::catalog::IntegerType;
 use praxis::catalog::schema::ComputedField;
 use praxis::document::RecordId;
 use praxis::query::{
@@ -6,9 +7,9 @@ use praxis::query::{
     TraversalClause, VectorClause, WindowFunction,
 };
 use praxis::{
-    AttributeSchema, AttributeType, Catalog, CollectionSchema, CompileInput, CompiledStatement,
-    LogicalPlan, ParameterValue, QueryCatalogAuthority, QueryCompileError, QueryLanguage,
-    QueryOperation, Record, TypedParameters, compile, execute_in_memory,
+    AttributeSchema, AttributeType, ByteSpan, Catalog, CollectionSchema, CompileInput,
+    CompiledStatement, LogicalPlan, ParameterValue, QueryCatalogAuthority, QueryCompileError,
+    QueryLanguage, QueryOperation, Record, TypedParameters, compile, execute_in_memory,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -22,6 +23,87 @@ fn tokens() -> QueryCatalogAuthority {
         )
         .unwrap();
     QueryCatalogAuthority::new(catalog)
+}
+
+fn users() -> QueryCatalogAuthority {
+    let mut catalog = Catalog::new();
+    catalog
+        .create_collection(
+            CollectionSchema::new("users")
+                .with_attribute(AttributeSchema::new(
+                    "age",
+                    AttributeType::Integer(IntegerType::Int4),
+                ))
+                .with_attribute(AttributeSchema::new("name", AttributeType::Text)),
+        )
+        .unwrap();
+    QueryCatalogAuthority::new(catalog)
+}
+
+#[test]
+fn public_sql_function_calls_are_typed_refusals_at_the_open_parenthesis() {
+    let authority = users();
+    let view = authority.view();
+    let cases = [
+        ("SELECT age, COUNT(age) FROM users", 17),
+        ("SELECT age FROM users WHERE lower(name) = 'x'", 33),
+        ("SELECT age FROM users WHERE age = lower(name)", 39),
+        ("SELECT age FROM func(users)", 20),
+    ];
+    let actual = cases
+        .iter()
+        .map(|(sql, _)| {
+            compile(CompileInput::Sql(sql), &TypedParameters::default(), &view).unwrap_err()
+        })
+        .collect::<Vec<_>>();
+    let expected = cases
+        .iter()
+        .map(|(_, start)| QueryCompileError::UnsupportedFeature {
+            feature: "function",
+            span: Some(ByteSpan {
+                start: *start,
+                end: *start + 1,
+            }),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn public_sql_function_refusal_keeps_first_projection_and_non_call_controls() {
+    let authority = users();
+    let view = authority.view();
+    assert_eq!(
+        compile(
+            CompileInput::Sql("SELECT COUNT(age) FROM users"),
+            &TypedParameters::default(),
+            &view,
+        )
+        .unwrap_err(),
+        QueryCompileError::UnsupportedFeature {
+            feature: "function",
+            span: Some(ByteSpan { start: 12, end: 13 }),
+        }
+    );
+    assert!(matches!(
+        compile(
+            CompileInput::Sql("SELECT age FROM users WHERE age = lower"),
+            &TypedParameters::default(),
+            &view,
+        ),
+        Err(QueryCompileError::Syntax {
+            code: "expected_value",
+            ..
+        })
+    ));
+    assert!(matches!(
+        compile(
+            CompileInput::Sql("SELECT age, name FROM users WHERE age = 42"),
+            &TypedParameters::default(),
+            &view,
+        ),
+        Ok(CompiledStatement::Select(_))
+    ));
 }
 
 fn authority_with_value_bearing_schema() -> QueryCatalogAuthority {
