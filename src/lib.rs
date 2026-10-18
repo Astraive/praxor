@@ -80,6 +80,11 @@ pub use query::{
     AsOfClause, BooleanExpression, DdlPlan, FullTextClause, LogicalPlan, MutationPlan, Predicate,
     QueryLanguage, QueryOperation, QueryParser, TraversalClause, VectorClause,
 };
+pub use query::{
+    BoundSelect, ByteSpan, CompileInput, CompiledStatement, ExplainV1, ParameterValue,
+    PredicateShapeOp, ProjectedRow, QueryCatalogAuthority, QueryCatalogView, QueryCompileError,
+    TypedParameters, compile, execute_in_memory,
+};
 pub use storage::lsm::LsmIndex;
 pub use store::RecordId;
 pub use transactions::WriteBatch;

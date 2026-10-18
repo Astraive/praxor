@@ -1,13 +1,11 @@
-//! Current readiness observations. `known_gap_*` cases intentionally describe
-//! accepted-but-ignored behavior for #61 to replace in a reviewed behavior fix.
+//! Current readiness observations. `known_gap_*` cases describe behavior still
+//! awaiting a reviewed compiler; two formerly ignored operators now refuse.
 //! No storage provider, retained snapshot, DDL writer or runtime is supplied.
 use praxis::api::graphql::{GraphQLRequest, execute_graphql};
 use praxis::document::{Record, RecordId};
 use praxis::execution::RecordProvider;
 use praxis::query::{QueryParams, substitute_params, tokenize};
-use praxis::{
-    AsOfClause, Executor, PhysicalOperator, Planner, PraxisError, Predicate, QueryParser,
-};
+use praxis::{AsOfClause, Executor, Planner, PraxisError, Predicate, QueryParser};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -125,22 +123,15 @@ fn known_gap_projection_is_absent_and_is_null_is_not_sql_null_execution() {
 }
 
 #[test]
-fn known_gap_as_of_and_group_by_are_plan_metadata_without_execution() {
-    let provider = MemoryProvider::new(false);
-    let all = ["u16", "u21", "u34", "u55", "u_null", "u_missing"];
+fn legacy_as_of_and_group_by_refuse_instead_of_ignoring_semantics() {
     let logical = QueryParser::parse("FIND users AS OF COMMIT c1").unwrap();
     assert_eq!(logical.as_of, Some(AsOfClause::Commit("c1".into())));
-    assert_eq!(
-        Planner.plan(&logical).unwrap().operators,
-        [PhysicalOperator::AsOf]
-    );
-    assert_eq!(execute("FIND users AS OF COMMIT c1", &provider), all);
+    query_error(Planner.plan(&logical), "unsupported query feature: as_of");
     let grouped = QueryParser::parse("SELECT * FROM users GROUP BY team").unwrap();
-    assert_eq!(
-        Planner.plan(&grouped).unwrap().operators,
-        [PhysicalOperator::GroupBy(vec!["team".into()])]
+    query_error(
+        Planner.plan(&grouped),
+        "unsupported query feature: group_by",
     );
-    assert_eq!(execute("SELECT * FROM users GROUP BY team", &provider), all);
 }
 
 #[test]

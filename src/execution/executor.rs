@@ -1,5 +1,5 @@
 use crate::document::{Record, RecordId};
-use crate::errors::Result;
+use crate::errors::{PraxisError, Result};
 use crate::planner::{AggregateExpr, PhysicalOperator, PhysicalPlan};
 use crate::query::{BooleanExpression, JoinClause, LogicalPlan, MutationPlan, Predicate};
 use serde_json::Value;
@@ -56,6 +56,21 @@ impl Executor {
         provider: &P,
         plan: &PhysicalPlan,
     ) -> Result<Vec<Record>> {
+        for operator in &plan.operators {
+            match operator {
+                PhysicalOperator::AsOf => {
+                    return Err(PraxisError::Query(
+                        "unsupported query feature: as_of".into(),
+                    ));
+                }
+                PhysicalOperator::GroupBy(_) => {
+                    return Err(PraxisError::Query(
+                        "unsupported query feature: group_by".into(),
+                    ));
+                }
+                _ => {}
+            }
+        }
         let mut records = plan
             .operators
             .iter()
@@ -131,7 +146,7 @@ impl Executor {
                     let mut seen = BTreeSet::new();
                     records.retain(|r| seen.insert(r.id.storage_key()));
                 }
-                PhysicalOperator::GroupBy(_) => {}
+                PhysicalOperator::GroupBy(_) => unreachable!("preflight rejects GroupBy"),
                 PhysicalOperator::Aggregate(expr) => {
                     records = execute_aggregate(records, expr);
                 }
@@ -154,7 +169,7 @@ impl Executor {
                 PhysicalOperator::Rank(rank_expr) => {
                     records = rank_records(records, rank_expr);
                 }
-                PhysicalOperator::AsOf => {}
+                PhysicalOperator::AsOf => unreachable!("preflight rejects AsOf"),
             }
         }
         Ok(records)
