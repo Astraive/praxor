@@ -22,6 +22,15 @@ pub(crate) struct WriterLease {
     _parent: Option<Box<WriterLease>>,
 }
 
+impl Drop for WriterLease {
+    fn drop(&mut self) {
+        // A forked child may still hold a duplicate of this open file
+        // description before exec. Release the lock when the final owner
+        // drops instead of waiting for every inherited descriptor to close.
+        let _ = self._file.unlock();
+    }
+}
+
 impl WriterLease {
     pub(crate) fn acquire(root: impl AsRef<Path>) -> Result<Self> {
         Self::acquire_impl(root.as_ref(), None)
@@ -157,5 +166,37 @@ pub(crate) fn lock_artifact_exists(path: &Path) -> Result<bool> {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::WriterLease;
+    use crate::errors::PraxisError;
+
+    #[test]
+    fn inherited_file_handle_does_not_extend_final_writer_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("db");
+        let owner = WriterLease::acquire(&root).unwrap();
+        assert!(matches!(
+            WriterLease::acquire(&root),
+            Err(PraxisError::AlreadyOpen { .. })
+        ));
+
+        // File::try_clone shares the flock open-file description that a forked
+        // child inherits before exec. Closing only the original descriptor
+        // must not leave that old lease blocking a new owner.
+        let inherited = owner._file.try_clone().unwrap();
+        drop(owner);
+        let next = WriterLease::acquire(&root).unwrap();
+        assert!(matches!(
+            WriterLease::acquire(&root),
+            Err(PraxisError::AlreadyOpen { .. })
+        ));
+
+        drop(inherited);
+        drop(next);
+        WriterLease::acquire(root).unwrap();
     }
 }
