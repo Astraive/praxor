@@ -428,6 +428,32 @@ pub(crate) fn parse_core_record_prefix(bytes: &[u8], source: &Path) -> Result<Co
         if batch.len() != ordinary_count {
             return Err(corrupt(source, "catalog WAL operation count mismatch"));
         }
+    } else if magic == WAL_V2_MAGIC {
+        // A complete v2 frame has already passed CRC and a borrowed structural
+        // walk. Reserve its exact ordinary-op count fallibly before ownership
+        // conversion, avoiding geometric Vec growth for dense valid frames.
+        // The legacy v1 branch below retains its historical decoding path.
+        let count = u32::from_le_bytes(payload[8..12].try_into().unwrap()) as usize;
+        let ordinary_count = if matches!(control, ParsedControl::Record(_)) {
+            count
+                .checked_sub(1)
+                .ok_or_else(|| corrupt(source, "record WAL control has no operation slot"))?
+        } else {
+            count
+        };
+        batch
+            .try_reserve_ops(ordinary_count)
+            .map_err(|_| corrupt(source, "cannot reserve v2 WAL operations"))?;
+        walk_payload(payload, source, true, false, |op| {
+            let owned = op.try_into_owned(source)?;
+            if !batch.try_push_reserved_op(owned) {
+                return Err(corrupt(source, "v2 WAL operation reserve mismatch"));
+            }
+            Ok(())
+        })?;
+        if batch.len() != ordinary_count {
+            return Err(corrupt(source, "v2 WAL operation count mismatch"));
+        }
     } else {
         walk_payload(payload, source, magic == WAL_V2_MAGIC, false, |op| {
             batch.push_op(op.into_owned());

@@ -24,6 +24,9 @@ tokio = { version = "1.48", features = ["macros", "net", "rt-multi-thread", "sig
 toml = "0.9"
 zstd = "0.13"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 tempfile = "3.13"
 criterion = { version = "0.5", features = ["html_reports"] }
