@@ -210,7 +210,10 @@ impl PraxisEngine {
                 });
             }
         }
-        Self::open_owned(config, writer_lease, None)
+        // Classify every legacy WAL, including retired files, before layout
+        // creation or unfinished-job reconciliation can modify this root.
+        let generic_wal_records = Wal::replay_dir(&writer_lease.root().join("wal"))?;
+        Self::open_owned(config, writer_lease, None, Some(generic_wal_records))
     }
 
     pub(crate) fn open_records(
@@ -218,13 +221,14 @@ impl PraxisEngine {
         lease: WriterLease,
         manifest: crate::manifest::Manifest,
     ) -> Result<Self> {
-        Self::open_owned(config, lease, Some(manifest))
+        Self::open_owned(config, lease, Some(manifest), None)
     }
 
     fn open_owned(
         config: PraxisConfig,
         writer_lease: WriterLease,
         record_manifest: Option<crate::manifest::Manifest>,
+        generic_wal_records: Option<Vec<crate::wal::WalRecord>>,
     ) -> Result<Self> {
         slog::Logger::init(config.logging.clone());
         let accelerator: Arc<dyn Accelerator> = match config.accelerator {
@@ -300,7 +304,8 @@ impl PraxisEngine {
         }
         let wal_records = match validated_records {
             Some(records) => records,
-            None => Wal::replay_dir(&layout.wal_root())?
+            None => generic_wal_records
+                .expect("generic WAL preflight precedes owned open")
                 .into_iter()
                 .map(crate::wal::record::CoreWalRecord::User)
                 .collect(),
@@ -2080,8 +2085,6 @@ impl PraxisEngine {
         use super::backup::{self, Capture, Phase, Stage};
         let started = std::time::Instant::now();
         let source_primary = lease_existing_primary(&self.inner._writer_lease)?;
-        let (destination, _primary) =
-            acquire_copy_destination(self.inner.layout.root(), backup_dir.as_ref())?;
         let _maintenance = self.inner.maintenance_serialization.lock();
         let capture = {
             let _writer = self.inner.write_serialization.lock();
@@ -2103,6 +2106,8 @@ impl PraxisEngine {
             let manifest = self.inner.manifest.lock().clone();
             Capture::from_live(self.inner.layout.root(), manifest)?
         };
+        let (destination, _primary) =
+            acquire_copy_destination(self.inner.layout.root(), backup_dir.as_ref())?;
         backup::phase(Phase::Captured)?;
         let stage = Stage::create(destination.root())?;
         let staged = capture.stage(

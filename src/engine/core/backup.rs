@@ -41,6 +41,12 @@ pub(super) struct Capture {
     root: PathBuf,
     pub manifest: Manifest,
     wals: Vec<(u64, u64)>,
+    // Includes retired generic WALs omitted from the copied prefix. Their
+    // complete records still have to be classified before target acquisition.
+    all_wals: Vec<(u64, u64)>,
+    // Source prefix digests are verified again on staged copies, so an
+    // equal-length rewrite through a hard link cannot change the snapshot.
+    wal_digests: BTreeMap<u64, blake3::Hash>,
     // v3 validates complete retained evidence even when a flushed file need
     // not be copied. Maintenance retains these exact captured prefixes.
     proof_wals: Vec<(u64, u64)>,
@@ -74,6 +80,8 @@ impl Capture {
             root: root.to_path_buf(),
             manifest,
             wals: Vec::new(),
+            all_wals: Vec::new(),
+            wal_digests: BTreeMap::new(),
             proof_wals: Vec::new(),
             origin: None,
         };
@@ -93,25 +101,24 @@ impl Capture {
             for entry in fs::read_dir(&wal_root)? {
                 let path = entry?.path();
                 if path.extension().is_none_or(|extension| extension != "wal") {
-                    continue;
+                    return corrupt(&path, "unexpected captured WAL role");
                 }
                 let id = file_id(&path, "wal")?;
+                if id > capture.manifest.active_wal_id {
+                    return corrupt(&path, "WAL beyond captured active identity");
+                }
+                let local = capture.local(&wal_relative(id))?;
+                let len = fs::metadata(local)?.len();
+                capture.all_wals.push((id, len));
                 if capture.manifest.record_authority.is_some() {
-                    if id > capture.manifest.active_wal_id {
-                        return corrupt(&path, "WAL beyond captured authority identity");
-                    }
-                    let local = capture.local(&wal_relative(id))?;
-                    capture.proof_wals.push((id, fs::metadata(local)?.len()));
+                    capture.proof_wals.push((id, len));
                 }
                 if id > capture.manifest.flushed_wal_id || id == capture.manifest.active_wal_id {
-                    if id > capture.manifest.active_wal_id {
-                        return corrupt(&path, "WAL beyond captured active identity");
-                    }
-                    let local = capture.local(&wal_relative(id))?;
-                    capture.wals.push((id, fs::metadata(local)?.len()));
+                    capture.wals.push((id, len));
                 }
             }
         }
+        capture.all_wals.sort_unstable();
         capture.wals.sort_unstable();
         if capture.manifest.record_authority.is_none() {
             capture.proof_wals = capture.wals.clone();
@@ -133,21 +140,47 @@ impl Capture {
     pub(super) fn from_bundle(root: &Path) -> Result<Self> {
         let path = root.join("MANIFEST");
         let bytes = fs::read(&path)?;
-        let capture = Self::new(root, Manifest::decode(&bytes, &path)?)?;
+        let mut capture = Self::new(root, Manifest::decode(&bytes, &path)?)?;
         // Offline restore must refuse before acquiring/creating a destination.
         // No live writer guard is held here, so bulk hashing is appropriate.
         capture.validate_checkpoint()?;
+        capture.preflight_legacy_wal_controls()?;
         Ok(capture)
     }
 
     pub(super) fn from_live(root: &Path, manifest: Manifest) -> Result<Self> {
-        let capture = Self::new(root, manifest)?;
+        let mut capture = Self::new(root, manifest)?;
         if let Some(origin) = &capture.origin
             && fs::canonicalize(origin)? != root
         {
             return corrupt(origin, "live backup reference is outside its owned root");
         }
+        capture.preflight_legacy_wal_controls()?;
         Ok(capture)
+    }
+
+    /// Check every canonical WAL at the captured byte length before a copy
+    /// destination can be acquired. Retired generic WALs retain their historic
+    /// torn-tail tolerance but cannot hide a complete protected control.
+    fn preflight_legacy_wal_controls(&mut self) -> Result<()> {
+        let record_authority = self.manifest.record_authority.is_some();
+        for (id, len) in &self.all_wals {
+            let path = self.local(&wal_relative(*id))?;
+            let strict = record_authority
+                || *id > self.manifest.flushed_wal_id
+                || *id == self.manifest.active_wal_id;
+            let digest = Wal::inspect_backup_file_for_owner(
+                &path,
+                *id,
+                *len,
+                self.manifest.last_sequence,
+                record_authority,
+                strict,
+                |_| Ok(()),
+            )?;
+            self.wal_digests.insert(*id, digest);
+        }
+        Ok(())
     }
 
     pub(super) fn validate(
@@ -324,18 +357,27 @@ impl Capture {
             let source = self.local(&relative)?;
             let target = stage.join(&relative);
             copy_prefix(&source, &target, *len)?;
-            let records = Wal::validate_backup_prefix(
-                &fs::read(&target)?,
+            let mut copied_covered = covered;
+            let digest = Wal::inspect_backup_file_for_owner(
                 &target,
                 *id,
+                *len,
                 self.manifest.last_sequence,
+                self.manifest.record_authority.is_some(),
+                true,
+                |sequence| {
+                    extend_coverage(
+                        &target,
+                        self.manifest.flushed_sequence,
+                        &mut copied_covered,
+                        [sequence],
+                    )
+                },
             )?;
-            extend_coverage(
-                &target,
-                self.manifest.flushed_sequence,
-                &mut covered,
-                records.iter().map(|record| record.sequence()),
-            )?;
+            if self.wal_digests.get(id) != Some(&digest) {
+                return corrupt(&target, "staged WAL differs from preflighted prefix");
+            }
+            covered = copied_covered;
             files.insert(relative);
         }
         require_coverage(stage, covered, self.manifest.last_sequence)?;
