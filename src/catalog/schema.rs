@@ -86,6 +86,14 @@ impl Catalog {
         self.collections.values()
     }
 
+    /// Preserve the map key alongside its schema for admission checks before
+    /// a detached query authority can rekey schemas by `schema.name`.
+    pub(crate) fn collection_entries(&self) -> impl Iterator<Item = (&str, &CollectionSchema)> {
+        self.collections
+            .iter()
+            .map(|(name, schema)| (name.as_str(), schema))
+    }
+
     pub fn validate_record(&self, record: &Record) -> Result<()> {
         self.collection(&record.id.collection)?
             .validate_record(record)
@@ -669,6 +677,47 @@ fn default_local_embedding_model(dimensions: usize) -> &'static str {
         0..=384 => "praxis-local-minilm-l6-v2",
         385..=768 => "praxis-local-e5-base-v2",
         _ => "praxis-local-bge-large-en-v1.5",
+    }
+}
+
+#[cfg(test)]
+mod catalog_entry_tests {
+    use super::{Catalog, CollectionSchema};
+
+    #[test]
+    fn deserialized_entry_exposes_original_collection_map_key() {
+        let serialized = serde_json::json!({
+            "collections": {
+                "wrong-key": CollectionSchema::new("canonical")
+            }
+        });
+        let catalog: Catalog = serde_json::from_value(serialized).unwrap();
+
+        let entries: Vec<_> = catalog
+            .collection_entries()
+            .map(|(key, schema)| (key, schema.name.as_str()))
+            .collect();
+
+        assert_eq!(entries, vec![("wrong-key", "canonical")]);
+    }
+
+    #[test]
+    fn deserialized_entries_preserve_duplicate_schema_names_under_distinct_keys() {
+        let schema = CollectionSchema::new("logical");
+        let serialized = serde_json::json!({
+            "collections": {
+                "logical": schema,
+                "shadow": schema
+            }
+        });
+        let catalog: Catalog = serde_json::from_value(serialized).unwrap();
+
+        let entries: Vec<_> = catalog
+            .collection_entries()
+            .map(|(key, schema)| (key, schema.name.as_str()))
+            .collect();
+
+        assert_eq!(entries, vec![("logical", "logical"), ("shadow", "logical")]);
     }
 }
 
