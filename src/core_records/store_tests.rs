@@ -1723,11 +1723,6 @@ fn gateway_fault_fixture() -> GatewayFaultFixture {
         }
         // A same-row State read may share the Payload path, but it completes
         // before that row's Payload hook renames it.
-        eprintln!(
-            "gateway fault preflight rid={} state_payload_path_alias={}",
-            rids[left].0,
-            state_paths[left] == payload_paths[left]
-        );
     }
     assert_eq!(
         gateway_fault_rows(
@@ -2199,9 +2194,6 @@ fn gateway_public_retained_race_cell(
     assert_eq!(new_rid, RecordId(3));
     flushed.unwrap();
     let compaction_count = compacted.unwrap();
-    eprintln!(
-        "gateway retained race barrier={barrier:?} strategy={strategy:?} compaction_count={compaction_count}"
-    );
     assert!(
         compaction_count > 0,
         "{barrier:?}/{strategy:?}: compaction must do real work"
