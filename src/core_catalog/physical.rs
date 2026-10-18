@@ -1,7 +1,7 @@
 //! Private, read-only physical evidence for a v4 catalog owner.
 //!
-//! Only the D=0 unflushed-bootstrap F=0/L=1 and retired-bootstrap F=1/L=1
-//! cuts are admitted here. Every other cut remains unsupported until its
+//! Only the D=0 F=0/L=1 bootstrap, F=1/L=1 retired bootstrap, and F=2/L=2
+//! installed CREATE cuts are admitted here. Every other cut remains unsupported until its
 //! installed and replay relations are proven. No public owner is constructed.
 use super::codec::{Anchor, CatalogKey, CatalogValue, Head, anchor_digest, canonical_head_at_1};
 use super::control::CatalogControl;
@@ -23,7 +23,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
-// This first cut has four bootstrap rows. A later general inspector needs a
+// These one-segment cuts have at most seven rows. A later general inspector needs a
 // streaming block iterator rather than decoding arbitrary segments.
 const MAX_BOOTSTRAP_SEGMENT_BYTES: u64 = 1024 * 1024;
 
@@ -174,6 +174,59 @@ impl CatalogReplayRows {
 }
 
 impl CatalogReplayState {
+    fn from_observed_create(
+        rows: CatalogReplayRows,
+        database_id: [u8; 16],
+        source: &Path,
+    ) -> Result<Self> {
+        if rows.head.key.as_slice() != [0] || rows.anchor.key.as_slice() != [4] {
+            return Err(corrupt(
+                source,
+                "v4 installed CREATE Head/Anchor keys mismatch",
+            ));
+        }
+        let CatalogValue::Head(head) =
+            CatalogValue::decode(&CatalogKey::Head, &rows.head.value, source)?
+        else {
+            return Err(corrupt(source, "v4 installed CREATE Head role mismatch"));
+        };
+        let CatalogValue::Anchor(anchor) =
+            CatalogValue::decode(&CatalogKey::Anchor, &rows.anchor.value, source)?
+        else {
+            return Err(corrupt(source, "v4 installed CREATE Anchor role mismatch"));
+        };
+        if head.database_id != database_id
+            || anchor.database_id != database_id
+            || anchor.head_at_1_digest != anchor_digest(database_id)?
+        {
+            return Err(corrupt(source, "v4 installed CREATE authority mismatch"));
+        }
+        let state = Self {
+            source: source.to_path_buf(),
+            database_id,
+            anchor,
+            head,
+            rows,
+        };
+        let name = state
+            .rows
+            .name
+            .as_ref()
+            .ok_or_else(|| corrupt(source, "missing installed Name@2"))?;
+        let schema = state
+            .rows
+            .schema
+            .as_ref()
+            .ok_or_else(|| corrupt(source, "missing installed Schema@2"))?;
+        let namespace = state
+            .rows
+            .namespace
+            .as_ref()
+            .ok_or_else(|| corrupt(source, "missing installed Namespace@2"))?;
+        state.validate_created_relation(&state.rows.head, name, schema, namespace)?;
+        Ok(state)
+    }
+
     fn from_head_anchor(head: Head, anchor: Anchor, source: &Path) -> Result<Self> {
         let rows = CatalogReplayRows {
             head: OwnedCatalogRow {
@@ -350,10 +403,20 @@ impl PriorCatalog for CatalogReplayState {
 pub(crate) enum InstalledEndpoint {
     Empty,
     FlushedBootstrap(Box<FlushedBootstrap>),
+    FlushedCreate(Box<FlushedCreate>),
 }
 
 #[derive(Debug)]
 pub(crate) struct FlushedBootstrap {
+    segment: FileWitness,
+    pub(crate) binding: ([u8; 16], u32),
+    pub(crate) allocator: Allocator,
+    pub(crate) head: Head,
+    pub(crate) anchor: Anchor,
+}
+
+#[derive(Debug)]
+pub(crate) struct FlushedCreate {
     segment: FileWitness,
     pub(crate) binding: ([u8; 16], u32),
     pub(crate) allocator: Allocator,
@@ -501,6 +564,17 @@ impl CatalogOwnerProof {
                 let (_, current) = read_bound(&segment.path, segment.len.max(1))?;
                 if current != *segment || paths.segment != segment.path {
                     return Err(corrupt(&segment.path, "v4 installed segment changed"));
+                }
+            }
+            InstalledEndpoint::FlushedCreate(installed) => {
+                let paths = creation_paths(&self.root)?;
+                let segment = &installed.segment;
+                let (_, current) = read_bound(&segment.path, segment.len.max(1))?;
+                if current != *segment || paths.segment != segment.path {
+                    return Err(corrupt(
+                        &segment.path,
+                        "v4 installed CREATE segment changed",
+                    ));
                 }
             }
         }
@@ -720,6 +794,49 @@ fn empty_paths(root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn creation_paths(root: &Path) -> Result<NarrowPaths> {
+    exact_named_children(
+        root,
+        [
+            "MANIFEST",
+            crate::writer_lease::LOCK_FILE_NAME,
+            "wal",
+            "segments",
+            "values",
+            "checkpoints",
+            "tmp",
+        ],
+    )?;
+    let manifest = root.join("MANIFEST");
+    if !fs::symlink_metadata(&manifest)?.is_file() {
+        return Err(corrupt(&manifest, "v4 CREATE MANIFEST is not a file"));
+    }
+    let lock = root.join(crate::writer_lease::LOCK_FILE_NAME);
+    let lock_meta = fs::symlink_metadata(&lock)?;
+    if !lock_meta.is_file() || lock_meta.len() != 0 {
+        return Err(corrupt(&lock, "v4 CREATE lock artifact changed"));
+    }
+    let wal = root.join("wal");
+    exact_named_children(&wal, ["00000000000000000003.wal"])?;
+    let wal_file = wal.join("00000000000000000003.wal");
+    if !fs::symlink_metadata(&wal_file)?.is_file() {
+        return Err(corrupt(&wal_file, "v4 CREATE WAL is not a file"));
+    }
+    let segments = root.join("segments");
+    exact_named_children(&segments, ["0", "1"])?;
+    let level0 = segments.join("0");
+    exact_named_children(&level0, ["00000000000000000001.tseg"])?;
+    let segment = level0.join("00000000000000000001.tseg");
+    if !fs::symlink_metadata(&segment)?.is_file() {
+        return Err(corrupt(&segment, "v4 CREATE segment is not a file"));
+    }
+    exact_named_children(&segments.join("1"), [])?;
+    for role in ["values", "checkpoints", "tmp"] {
+        exact_named_children(&root.join(role), [])?;
+    }
+    Ok(NarrowPaths { manifest, segment })
+}
+
 fn inspect_unflushed_bootstrap(
     lease: &WriterLease,
     manifest: &Manifest,
@@ -801,6 +918,258 @@ fn inspect_unflushed_bootstrap(
     Ok(proof)
 }
 
+fn inspect_flushed_create(
+    lease: &WriterLease,
+    manifest: &Manifest,
+    manifest_witness: FileWitness,
+    accelerator: &dyn Accelerator,
+) -> Result<CatalogOwnerProof> {
+    let root = lease.root();
+    let paths = creation_paths(root)?;
+    if paths.manifest != manifest_witness.path {
+        return Err(corrupt(root, "v4 CREATE MANIFEST role changed"));
+    }
+    let meta = &manifest.segments[0];
+    if meta.id != 1
+        || meta.level != 0
+        || meta.path != paths.segment.to_string_lossy()
+        || meta.partitioned_bloom_filter.is_some()
+        || meta.entries != 7
+    {
+        return Err(corrupt(
+            &paths.manifest,
+            "v4 CREATE segment metadata mismatch",
+        ));
+    }
+    let (segment_bytes, segment_witness) = read_bound(&paths.segment, MAX_BOOTSTRAP_SEGMENT_BYTES)?;
+    if meta.file_digest != segment_witness.digest.to_hex().to_string() {
+        return Err(corrupt(&paths.segment, "v4 CREATE segment digest mismatch"));
+    }
+    // decode_segment may allocate from the claimed decompressed block size.
+    // This private cut only admits an uncompressed, bounded physical file.
+    if segment_bytes.get(8) != Some(&0) {
+        return Err(corrupt(
+            &paths.segment,
+            "compressed v4 CREATE segment is unsupported",
+        ));
+    }
+    let decoded = decode_segment(&segment_bytes, &paths.segment, accelerator)?;
+    if decoded.id != 1 || decoded.level != 0 || decoded.compression != Compression::None {
+        return Err(corrupt(&paths.segment, "v4 CREATE segment header mismatch"));
+    }
+    let rows: Vec<_> = decoded.blocks.into_iter().flatten().collect();
+    if rows.len() != 7
+        || rows.first().map(|raw| raw.entry.key.as_ref()) != Some(meta.min_key.as_slice())
+        || rows.last().map(|raw| raw.entry.key.as_ref()) != Some(meta.max_key.as_slice())
+    {
+        return Err(corrupt(
+            &paths.segment,
+            "v4 CREATE segment row metadata mismatch",
+        ));
+    }
+    let mut bloom = BloomFilter::with_expected_items(rows.len());
+    let mut previous: Option<(&str, &[u8])> = None;
+    for raw in &rows {
+        let current = (raw.entry.cf.0.as_str(), raw.entry.key.as_ref());
+        if previous.is_some_and(|prior| prior >= current) {
+            return Err(corrupt(
+                &paths.segment,
+                "v4 CREATE rows are not strictly sorted",
+            ));
+        }
+        previous = Some(current);
+        bloom.insert(&bloom_key(current.0, current.1));
+    }
+    if bloom != meta.bloom_filter {
+        return Err(corrupt(&paths.segment, "v4 CREATE bloom metadata mismatch"));
+    }
+    let id = manifest
+        .record_authority
+        .as_ref()
+        .expect("validated v4 record authority")
+        .identity(&paths.manifest)?;
+    let mut binding = None;
+    let mut allocator = None;
+    let mut head = None;
+    let mut anchor = None;
+    let mut name = None;
+    let mut schema = None;
+    let mut namespace = None;
+    for raw in rows {
+        let entry = raw.entry;
+        if raw.blob_expiry.is_some() {
+            return Err(corrupt(&paths.segment, "expired v4 CREATE row"));
+        }
+        let StoredValue::Put(value) = entry.version.value else {
+            return Err(corrupt(&paths.segment, "v4 CREATE row must be inline Put"));
+        };
+        match entry.cf.0.as_str() {
+            "__praxor_record_meta_v1" => {
+                if entry.version.sequence != 1 {
+                    return Err(corrupt(
+                        &paths.segment,
+                        "v4 CREATE record sequence mismatch",
+                    ));
+                }
+                let key = RecordKey::decode(Role::Meta, &entry.key, &paths.segment)?;
+                let expected_len = match key {
+                    RecordKey::Binding => 80,
+                    RecordKey::Allocator => 56,
+                    _ => return Err(corrupt(&paths.segment, "unexpected v4 CREATE record key")),
+                };
+                if entry.key.len() != 1 || value.len() != expected_len {
+                    return Err(corrupt(&paths.segment, "v4 CREATE record length mismatch"));
+                }
+                let row = RecordRow::decode(&key, &value, &paths.segment)?;
+                match (key, row) {
+                    (
+                        RecordKey::Binding,
+                        RecordRow::Binding {
+                            database_id,
+                            descriptor_count,
+                        },
+                    ) if database_id == id && descriptor_count == 0 && binding.is_none() => {
+                        binding = Some((database_id, descriptor_count));
+                    }
+                    (RecordKey::Allocator, RecordRow::Allocator(found))
+                        if found == Allocator::default() && allocator.is_none() =>
+                    {
+                        allocator = Some(found);
+                    }
+                    _ => {
+                        return Err(corrupt(
+                            &paths.segment,
+                            "v4 CREATE record relation mismatch",
+                        ));
+                    }
+                }
+            }
+            super::authority::CATALOG_CF => {
+                let key = CatalogKey::decode(&entry.key, &paths.segment)?;
+                let (sequence, key_cap, value_cap) = match key {
+                    CatalogKey::Head => (2, 1, 48),
+                    CatalogKey::Anchor => (1, 1, 72),
+                    CatalogKey::Name(_) => (2, 258, 12),
+                    CatalogKey::Schema(_) => (2, 9, 33_947),
+                    CatalogKey::Namespace(_) => (2, 9, 16),
+                };
+                if entry.version.sequence != sequence
+                    || entry.key.len() > key_cap
+                    || value.len() > value_cap
+                {
+                    return Err(corrupt(
+                        &paths.segment,
+                        "v4 CREATE catalog row version/cap mismatch",
+                    ));
+                }
+                let row = CatalogValue::decode(&key, &value, &paths.segment)?;
+                let owned =
+                    OwnedCatalogRow::new(&entry.key, &value, key_cap, value_cap, &paths.segment)?;
+                match (key, row) {
+                    (CatalogKey::Head, CatalogValue::Head(found))
+                        if found.database_id == id
+                            && found.revision == 2
+                            && found.collection_count == 1
+                            && head.is_none() =>
+                    {
+                        head = Some((found, owned));
+                    }
+                    (CatalogKey::Anchor, CatalogValue::Anchor(found))
+                        if found.database_id == id
+                            && found.head_at_1_digest == anchor_digest(id)?
+                            && anchor.is_none() =>
+                    {
+                        anchor = Some((found, owned));
+                    }
+                    (CatalogKey::Name(_), CatalogValue::Name(_)) if name.is_none() => {
+                        name = Some(owned)
+                    }
+                    (CatalogKey::Schema(_), CatalogValue::Schema(_)) if schema.is_none() => {
+                        schema = Some(owned)
+                    }
+                    (CatalogKey::Namespace(_), CatalogValue::Namespace(_))
+                        if namespace.is_none() =>
+                    {
+                        namespace = Some(owned)
+                    }
+                    _ => {
+                        return Err(corrupt(
+                            &paths.segment,
+                            "v4 CREATE catalog relation mismatch",
+                        ));
+                    }
+                }
+            }
+            _ => return Err(corrupt(&paths.segment, "unexpected v4 CREATE family")),
+        }
+    }
+    let binding = binding.ok_or_else(|| corrupt(&paths.segment, "missing record Binding@1"))?;
+    let allocator =
+        allocator.ok_or_else(|| corrupt(&paths.segment, "missing record Allocator@1"))?;
+    let (installed_head, head_row) =
+        head.ok_or_else(|| corrupt(&paths.segment, "missing catalog Head@2"))?;
+    let (installed_anchor, anchor_row) =
+        anchor.ok_or_else(|| corrupt(&paths.segment, "missing catalog Anchor@1"))?;
+    let effective = CatalogReplayState::from_observed_create(
+        CatalogReplayRows {
+            head: head_row,
+            anchor: anchor_row,
+            name,
+            schema,
+            namespace,
+        },
+        id,
+        &paths.segment,
+    )?;
+    let cut = WalCut {
+        flushed_sequence: manifest.flushed_sequence,
+        last_sequence: manifest.last_sequence,
+        flushed_wal_id: manifest.flushed_wal_id,
+        active_wal_id: manifest.active_wal_id,
+        next_wal_id: manifest.next_wal_id,
+    };
+    let wal_path = root.join("wal/00000000000000000003.wal");
+    let wal_witnesses = scan_v4_wals(root, cut, |_, _, _, _| {
+        Err(corrupt(&wal_path, "unexpected v4 CREATE active WAL frame"))
+    })?;
+    if wal_witnesses.len() != 1
+        || wal_witnesses[0].id != 3
+        || wal_witnesses[0].record_count != 0
+        || wal_witnesses[0].catalog_bootstraps != 0
+        || wal_witnesses[0].catalog_creates != 0
+        || wal_witnesses[0].first_sequence.is_some()
+        || wal_witnesses[0].last_sequence.is_some()
+        || wal_witnesses[0].full_len != 16
+        || wal_witnesses[0].prefix_len != 16
+        || wal_witnesses[0].torn_start.is_some()
+    {
+        return Err(corrupt(
+            &wal_path,
+            "v4 CREATE active WAL is not header-only",
+        ));
+    }
+    let proof = CatalogOwnerProof {
+        root: root.to_path_buf(),
+        manifest: manifest_witness,
+        installed: InstalledEndpoint::FlushedCreate(Box::new(FlushedCreate {
+            segment: segment_witness,
+            binding,
+            allocator,
+            head: installed_head,
+            anchor: installed_anchor,
+        })),
+        cut,
+        recovered_sequence: 2,
+        recovered_binding: binding,
+        recovered_allocator: allocator,
+        bootstrap_effects: None,
+        effective,
+        wal_witnesses,
+    };
+    proof.recheck(lease)?;
+    Ok(proof)
+}
+
 pub(crate) fn inspect_v4_owner(
     lease: &WriterLease,
     config: &PraxisConfig,
@@ -841,13 +1210,23 @@ pub(crate) fn inspect_v4_owner(
         && manifest.next_wal_id == 3
         && manifest.next_segment_id == 2
         && manifest.segments.len() == 1;
-    if common_invalid || (!unflushed && !flushed) {
+    let flushed_create = manifest.flushed_sequence == 2
+        && manifest.last_sequence == 2
+        && manifest.flushed_wal_id == 2
+        && manifest.active_wal_id == 3
+        && manifest.next_wal_id == 4
+        && manifest.next_segment_id == 2
+        && manifest.segments.len() == 1;
+    if common_invalid || (!unflushed && !flushed && !flushed_create) {
         return Err(PraxisError::UnsupportedCatalogFeature {
             feature: "v4 installed cut beyond narrow D0 bootstrap",
         });
     }
     if unflushed {
         return inspect_unflushed_bootstrap(lease, &manifest, manifest_witness);
+    }
+    if flushed_create {
+        return inspect_flushed_create(lease, &manifest, manifest_witness, accelerator);
     }
     let paths = narrow_paths(root)?;
     if paths.manifest != manifest_path {
