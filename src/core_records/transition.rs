@@ -461,15 +461,11 @@ impl<'a> Cursor<'a, '_> {
     }
 }
 
-/// Parse by actual operations, never a claimed count. In historical mode every
-/// RID is bounded by that envelope's prior/new floor, not today's liveness.
-pub(crate) fn validate(
+fn validate_envelope_context(
     sequence: u64,
     envelope: &Envelope,
-    batch: &WriteBatch,
     context: &Context<'_>,
-    mut read: Option<&mut ReadRow<'_>>,
-) -> Result<Rows> {
+) -> Result<()> {
     envelope.validate(sequence, context.source)?;
     if envelope.database_id != context.id
         || envelope.prior_compatibility_sequence != envelope.prior_append_ordinal
@@ -480,6 +476,38 @@ pub(crate) fn validate(
             "authority identity/fresh counter domains mismatch",
         ));
     }
+    Ok(())
+}
+
+/// Check a bootstrap envelope and its borrowed record-only operations without
+/// constructing row updates. V4 calls this on the prefix before its catalog
+/// Head and Anchor; v3 retains its historical materialized updates below.
+pub(crate) fn validate_bootstrap_ops(
+    sequence: u64,
+    envelope: &Envelope,
+    ops: &[BatchOp],
+    context: &Context<'_>,
+) -> Result<()> {
+    validate_envelope_context(sequence, envelope, context)?;
+    if envelope.kind != Kind::Bootstrap {
+        return Err(corrupt(
+            context.source,
+            "record bootstrap envelope kind mismatch",
+        ));
+    }
+    check_bootstrap_ops(ops, context)
+}
+
+/// Parse by actual operations, never a claimed count. In historical mode every
+/// RID is bounded by that envelope's prior/new floor, not today's liveness.
+pub(crate) fn validate(
+    sequence: u64,
+    envelope: &Envelope,
+    batch: &WriteBatch,
+    context: &Context<'_>,
+    mut read: Option<&mut ReadRow<'_>>,
+) -> Result<Rows> {
+    validate_envelope_context(sequence, envelope, context)?;
     if envelope.kind == Kind::Bootstrap {
         return bootstrap(batch, context);
     }
@@ -691,10 +719,65 @@ pub(crate) fn validate(
     Ok(cursor.updates)
 }
 
-fn bootstrap(batch: &WriteBatch, context: &Context<'_>) -> Result<Rows> {
-    if batch.len().checked_sub(2) != Some(context.descriptors as usize) {
+fn borrowed_bootstrap_put<'a>(
+    op: &'a BatchOp,
+    context: &Context<'_>,
+) -> Result<(Key<'a>, Row<'a>)> {
+    let BatchOp::Put { cf, key, value } = op else {
+        return Err(corrupt(context.source, "canonical record expected put"));
+    };
+    if cf.0 != Role::Meta.cf() {
+        return Err(corrupt(context.source, "bootstrap record role mismatch"));
+    }
+    let key = Key::decode(Role::Meta, key, context.source)?;
+    let row = Row::decode(&key, value, context.source)?;
+    Ok((key, row))
+}
+
+pub(crate) fn check_bootstrap_ops(ops: &[BatchOp], context: &Context<'_>) -> Result<()> {
+    let Some(expected_len) = usize::try_from(context.descriptors)
+        .ok()
+        .and_then(|descriptors| descriptors.checked_add(2))
+    else {
+        return Err(corrupt(context.source, "bootstrap registry count overflow"));
+    };
+    if ops.len() != expected_len {
         return Err(corrupt(context.source, "bootstrap registry count mismatch"));
     }
+    let (key, row) = borrowed_bootstrap_put(&ops[0], context)?;
+    if key != Key::Binding
+        || row
+            != (Row::Binding {
+                database_id: context.id,
+                descriptor_count: context.descriptors,
+            })
+    {
+        return Err(corrupt(context.source, "bootstrap binding mismatch"));
+    }
+    let (key, row) = borrowed_bootstrap_put(&ops[1], context)?;
+    if key != Key::Allocator || row != Row::Allocator(Allocator::default()) {
+        return Err(corrupt(context.source, "bootstrap allocator mismatch"));
+    }
+    let mut previous = None;
+    for (position, op) in ops.iter().enumerate().skip(2) {
+        let expected = u32::try_from(position - 1)
+            .map_err(|_| corrupt(context.source, "descriptor ID overflow"))?;
+        let (key, row) = borrowed_bootstrap_put(op, context)?;
+        let Row::Descriptor { name, .. } = row else {
+            return Err(corrupt(context.source, "bootstrap descriptor shape"));
+        };
+        if key != Key::Descriptor(expected)
+            || previous.is_some_and(|value: &str| value.as_bytes() >= name.as_bytes())
+        {
+            return Err(corrupt(context.source, "bootstrap descriptor order"));
+        }
+        previous = Some(name);
+    }
+    Ok(())
+}
+
+fn bootstrap(batch: &WriteBatch, context: &Context<'_>) -> Result<Rows> {
+    check_bootstrap_ops(batch.ops(), context)?;
     let mut cursor = Cursor {
         ops: batch.ops(),
         position: 0,
