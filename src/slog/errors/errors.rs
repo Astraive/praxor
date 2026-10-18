@@ -53,6 +53,8 @@ pub enum PraxisError {
         "index {index} does not support raw sequence snapshot reads; register a plugin with an explicit snapshot capability"
     )]
     UnsupportedIndexSnapshotRead { index: String },
+    #[error("unsupported catalog feature: {feature}")]
+    UnsupportedCatalogFeature { feature: &'static str },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("serialization error: {0}")]

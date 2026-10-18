@@ -16,6 +16,7 @@ pub mod cache;
 pub mod catalog;
 pub mod cli;
 pub mod config;
+pub mod core_catalog;
 pub mod core_records;
 pub mod datatype;
 pub mod disk;
@@ -56,6 +57,7 @@ pub use catalog::schema::{
     AttributeSchema, AttributeType, Catalog, CollectionSchema, DistanceMetric, StorageClass,
 };
 pub use config::{CompactionStrategy, Compression, PraxisConfig, WalSyncPolicy};
+pub use core_catalog::CatalogDatabase;
 pub use core_records::{
     CoreDatabase, CoreRecordSnapshot, CoreRecordStore, MappingDescriptor, RecordAuthorityOptions,
     RecordHistoryReclaimReport,
