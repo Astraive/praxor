@@ -6,7 +6,10 @@
 mod authority;
 #[allow(dead_code)] // The private format codec is wired into WAL relations in the next B1 slice.
 mod codec;
+mod control;
 mod database;
+
+pub(crate) use control::CatalogControl;
 
 pub use authority::{CatalogAuthorityV1, CatalogBindingV1};
 pub use database::CatalogDatabase;

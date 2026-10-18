@@ -663,6 +663,11 @@ impl Evidence {
     }
 
     pub(crate) fn wal(&mut self, record: &CoreWalRecord) -> Result<()> {
+        if matches!(record, CoreWalRecord::Catalog { .. }) {
+            return Err(PraxisError::CatalogAuthorityWalRequired {
+                path: self.source.clone(),
+            });
+        }
         if self.authority.is_some() {
             let sequence = record.sequence();
             if sequence == 0
@@ -685,6 +690,9 @@ impl Evidence {
             self.installed()?;
         }
         match (self.authority, record) {
+            (_, CoreWalRecord::Catalog { .. }) => Err(PraxisError::CatalogAuthorityWalRequired {
+                path: self.source.clone(),
+            }),
             (None, CoreWalRecord::User(_)) => Ok(()),
             (None, CoreWalRecord::Record { .. }) => Err(PraxisError::RecordAuthorityWalRequired {
                 path: self.source.clone(),

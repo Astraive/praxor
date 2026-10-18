@@ -13,6 +13,7 @@ const LOCK: &str = ".praxor.writer.lock";
 // Frozen with independent Python stdlib struct/zlib (no production encoder),
 // audited SHA-256 9f350e478b8e2b906565fbb4e7af444a1cdca033127c4fb46230051cf2412065.
 const RECORD_BOOTSTRAP: &[u8; 121] = include_bytes!("fixtures/tag5_bootstrap_s1.bin");
+const CATALOG_BOOTSTRAP: &[u8; 563] = include_bytes!("fixtures/catalog_tag6_bootstrap_s1.bin");
 
 struct PeakAllocator;
 thread_local! {
@@ -469,6 +470,194 @@ fn record_control_refusal_preserves_existing_restore_destination() {
         tree(&destination) == before_destination,
         "restore changed existing target"
     );
+}
+
+fn sized_catalog_frame(total_len: usize) -> Vec<u8> {
+    let value_len = total_len - 168;
+    let mut payload = 1u64.to_le_bytes().to_vec();
+    payload.extend(2u32.to_le_bytes());
+    payload.push(6);
+    payload.extend(120u32.to_le_bytes());
+    payload.extend(&CATALOG_BOOTSTRAP[33..153]);
+    payload.push(1); // Put
+    payload.extend(1u32.to_le_bytes());
+    payload.push(b'x');
+    payload.extend(1u32.to_le_bytes());
+    payload.push(b'k');
+    payload.extend((value_len as u32).to_le_bytes());
+    payload.resize(payload.len() + value_len, b'v');
+    let mut frame = 0x5457_4132u32.to_le_bytes().to_vec();
+    frame.extend((payload.len() as u32).to_le_bytes());
+    frame.extend(crc32fast::hash(&payload).to_le_bytes());
+    frame.extend(crc32fast::hash(&frame).to_le_bytes());
+    frame.extend(payload);
+    assert_eq!(frame.len(), total_len);
+    frame
+}
+
+#[test]
+fn catalog_backup_preflight_streams_overlimit_before_whole_frame_allocation() {
+    let exact = sized_catalog_frame(1_048_576);
+    assert_eq!(
+        u32::from_le_bytes(exact[8..12].try_into().unwrap()),
+        0xef4d_77c6
+    );
+    let oversized = sized_catalog_frame(1_048_577);
+    let mut bad_crc = oversized.clone();
+    bad_crc[40] ^= 1;
+    for retired in [false, true] {
+        for (case, frame) in [
+            ("exact", exact.as_slice()),
+            ("oversized", oversized.as_slice()),
+            ("bad-crc", bad_crc.as_slice()),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = PraxisEngine::open(PraxisConfig::new(temp.path().join("source"))).unwrap();
+            if retired {
+                source.put("kept", "row").unwrap();
+                source.flush().unwrap();
+            }
+            let bundle = temp.path().join("bundle");
+            source.backup_to(&bundle).unwrap();
+            drop(source);
+            if retired {
+                let mut bytes = fs::read(canonical_wal(&bundle, 2)).unwrap()[..16].to_vec();
+                bytes[8..16].copy_from_slice(&1u64.to_le_bytes());
+                bytes.extend_from_slice(frame);
+                fs::write(canonical_wal(&bundle, 1), bytes).unwrap();
+            } else {
+                OpenOptions::new()
+                    .append(true)
+                    .open(canonical_wal(&bundle, 1))
+                    .unwrap()
+                    .write_all(frame)
+                    .unwrap();
+            }
+            let destination = temp.path().join("absent-target");
+            let before = tree(&bundle);
+            PEAK.with(|peak| peak.set(Some(0)));
+            let result = PraxisEngine::restore_from_backup(&bundle, &destination);
+            let peak = PEAK.with(|peak| peak.replace(None)).unwrap();
+            let error = result.unwrap_err();
+            match case {
+                "exact" => assert!(
+                    matches!(error, PraxisError::CatalogAuthorityWalRequired { .. }),
+                    "{error:?}"
+                ),
+                "oversized" => assert!(
+                    error
+                        .to_string()
+                        .contains("catalog WAL frame exceeds 1 MiB limit"),
+                    "{error:?}"
+                ),
+                "bad-crc" => assert!(
+                    error.to_string().contains("WAL checksum mismatch"),
+                    "{error:?}"
+                ),
+                _ => unreachable!(),
+            }
+            let limit = if case == "exact" {
+                2 * 1024 * 1024
+            } else {
+                512 * 1024
+            };
+            assert!(
+                peak < limit,
+                "{case} retired={retired} requested {peak} bytes"
+            );
+            assert!(!destination.exists(), "preflight acquired destination");
+            assert_eq!(tree(&bundle), before, "preflight changed source");
+        }
+    }
+}
+
+#[test]
+fn live_catalog_backup_preflight_streams_active_and_retired_frames() {
+    let exact = sized_catalog_frame(1_048_576);
+    let oversized = sized_catalog_frame(1_048_577);
+    let mut bad_crc = oversized.clone();
+    bad_crc[40] ^= 1;
+    for retired in [false, true] {
+        for (case, frame) in [
+            ("exact", exact.as_slice()),
+            ("oversized", oversized.as_slice()),
+            ("bad-crc", bad_crc.as_slice()),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("source");
+            let source = PraxisEngine::open(PraxisConfig::new(&root)).unwrap();
+            if retired {
+                source.put("kept", "row").unwrap();
+                source.flush().unwrap();
+                let mut retired_header = fs::read(canonical_wal(&root, 2)).unwrap()[..16].to_vec();
+                retired_header[8..16].copy_from_slice(&1u64.to_le_bytes());
+                fs::write(canonical_wal(&root, 1), retired_header).unwrap();
+            }
+            OpenOptions::new()
+                .append(true)
+                .open(canonical_wal(&root, 1))
+                .unwrap()
+                .write_all(frame)
+                .unwrap();
+            let destination = temp.path().join("absent-target");
+            let before = tree(&root);
+            PEAK.with(|peak| peak.set(Some(0)));
+            let result = source.backup_to(&destination);
+            let peak = PEAK.with(|peak| peak.replace(None)).unwrap();
+            let error = result.unwrap_err();
+            match case {
+                "exact" => assert!(
+                    matches!(error, PraxisError::CatalogAuthorityWalRequired { .. }),
+                    "{error:?}"
+                ),
+                "oversized" => assert!(
+                    error
+                        .to_string()
+                        .contains("catalog WAL frame exceeds 1 MiB limit"),
+                    "{error:?}"
+                ),
+                "bad-crc" => assert!(
+                    error.to_string().contains("WAL checksum mismatch"),
+                    "{error:?}"
+                ),
+                _ => unreachable!(),
+            }
+            let limit = if case == "exact" {
+                2 * 1024 * 1024
+            } else {
+                512 * 1024
+            };
+            assert!(
+                peak < limit,
+                "{case} retired={retired} requested {peak} bytes"
+            );
+            assert!(!destination.exists(), "live preflight acquired target");
+            assert_eq!(tree(&root), before, "live preflight changed source");
+        }
+    }
+}
+
+#[test]
+fn ordinary_v2_frame_above_catalog_limit_remains_backup_and_restore_compatible() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("source");
+    let bundle = temp.path().join("bundle");
+    let destination = temp.path().join("restored");
+    let source = PraxisEngine::open(PraxisConfig::new(&root)).unwrap();
+    let value = vec![b'U'; 1_200_000];
+    source.put("large-user", value.clone()).unwrap();
+    let wal = fs::read(canonical_wal(&root, 1)).unwrap();
+    assert!(wal.len() > 1_048_576 + 16);
+    assert_eq!(
+        u32::from_le_bytes(wal[16..20].try_into().unwrap()),
+        0x5457_4132
+    );
+    assert_eq!(wal[44], 1, "frame must begin with an ordinary Put");
+    source.backup_to(&bundle).unwrap();
+    drop(source);
+    PraxisEngine::restore_from_backup(&bundle, &destination).unwrap();
+    let restored = PraxisEngine::open(PraxisConfig::new(&destination)).unwrap();
+    assert_eq!(restored.get("large-user").unwrap().unwrap().as_ref(), value);
 }
 
 #[test]
