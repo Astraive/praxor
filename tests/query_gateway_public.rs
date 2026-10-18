@@ -461,6 +461,53 @@ fn public_foreign_frame_must_decode_fully_and_reports_physical_rid() {
     ));
 }
 
+fn public_malformed_envelope_at(bad_at: usize) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = PraxisConfig::new(dir.path());
+    config.memtable_flush_threshold_bytes = usize::MAX;
+    let db = CoreDatabase::create_fresh(config, RecordAuthorityOptions::default()).unwrap();
+    let records = db.records();
+    let mut frames = [
+        fixture::frame("users", "first", &[("name", Scalar::Text("first"))]).unwrap(),
+        fixture::frame("users", "middle", &[("name", Scalar::Text("middle"))]).unwrap(),
+        fixture::frame("users", "last", &[("name", Scalar::Text("last"))]).unwrap(),
+    ];
+    // The independent writer provides valid neighbours. Change only the magic
+    // byte of one complete envelope, leaving its core State/Payload valid.
+    frames[bad_at][0] ^= 1;
+    let rids = frames.map(|frame| records.put(&frame, &[]).unwrap());
+    assert_eq!(rids, [RecordId(1), RecordId(2), RecordId(3)]);
+    records.flush().unwrap();
+
+    let gateway = QueryGateway::attach_fixture_v1(&db, name_catalog()).unwrap();
+    let view = gateway.begin_read().unwrap();
+    match gateway.query(&view, "SELECT name FROM users", &TypedParameters::default()) {
+        Err(QueryReadError::Document { core_rid, reason }) => {
+            assert_eq!(
+                core_rid, rids[bad_at],
+                "malformed physical ordinal {bad_at}"
+            );
+            assert_eq!(reason, QueryDocumentReason::InvalidMagic);
+        }
+        other => panic!("ordinal {bad_at} returned partial Rows or wrong error: {other:?}"),
+    }
+}
+
+#[test]
+fn public_malformed_envelope_first_reports_physical_rid() {
+    public_malformed_envelope_at(0);
+}
+
+#[test]
+fn public_malformed_envelope_middle_reports_physical_rid() {
+    public_malformed_envelope_at(1);
+}
+
+#[test]
+fn public_malformed_envelope_last_reports_physical_rid() {
+    public_malformed_envelope_at(2);
+}
+
 #[test]
 fn public_duplicate_logical_id_reports_the_second_physical_rid() {
     let (_dir, db, gateway, _rids) = seeded_users();
