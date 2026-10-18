@@ -1,6 +1,11 @@
 use super::*;
 use crate::core_records::{CoreRecordScanError, RecordScanLimits};
+use crate::query::{QueryGateway, QueryReadError, QueryReadView, QueryResult, TypedParameters};
+use crate::types::{StoredValue, VersionedValue};
 use crate::{CoreDatabase, MappingDescriptor, PraxisConfig, RecordAuthorityOptions};
+use std::cell::Cell;
+use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -1475,6 +1480,543 @@ fn scan_releases_topology_before_a_barrier_and_returns_one_retained_view() {
     drop(latest);
     assert_eq!(db.kv().inner.snapshots.pinned_count(), 0);
 }
+
+// These frames are independently frozen PRXQDOC-NUL v1 bytes. In particular,
+// neither this fixture nor its expected query rows call the sibling codec.
+const GATEWAY_FRAME_ONE: &[u8] = b"PRXQDOC\0\x00\x01\x00\x00\x00\x00\x00\x29\x00\x04docs\x00\x03one\x00\x01\x00\x01n\x04\x00\x00\x00\x00\x00\x00\x00\x01";
+const GATEWAY_FRAME_TWO: &[u8] = b"PRXQDOC\0\x00\x01\x00\x00\x00\x00\x00\x29\x00\x04docs\x00\x03two\x00\x01\x00\x01n\x04\x00\x00\x00\x00\x00\x00\x00\x02";
+const GATEWAY_FRAME_THREE: &[u8] = b"PRXQDOC\0\x00\x01\x00\x00\x00\x00\x00\x2b\x00\x04docs\x00\x05three\x00\x01\x00\x01n\x04\x00\x00\x00\x00\x00\x00\x00\x03";
+
+type GatewayLiteralRow = (String, String, Vec<(String, serde_json::Value)>);
+
+fn gateway_fault_expected_rows() -> Vec<GatewayLiteralRow> {
+    vec![
+        (
+            "docs".into(),
+            "one".into(),
+            vec![("n".into(), serde_json::json!(1))],
+        ),
+        (
+            "docs".into(),
+            "two".into(),
+            vec![("n".into(), serde_json::json!(2))],
+        ),
+        (
+            "docs".into(),
+            "three".into(),
+            vec![("n".into(), serde_json::json!(3))],
+        ),
+    ]
+}
+
+fn gateway_fault_rows(result: QueryResult) -> Vec<GatewayLiteralRow> {
+    let QueryResult::Rows(rows) = result else {
+        panic!("expected Rows")
+    };
+    rows.into_iter()
+        .map(|row| (row.id.collection, row.id.key, row.fields))
+        .collect()
+}
+
+fn gateway_fault_catalog() -> crate::Catalog {
+    use crate::catalog::IntegerType;
+    use crate::{AttributeSchema, AttributeType, CollectionSchema};
+
+    let mut catalog = crate::Catalog::new();
+    catalog
+        .create_collection(
+            CollectionSchema::new("docs").with_attribute(AttributeSchema::new(
+                "n",
+                AttributeType::Integer(IntegerType::Uint8),
+            )),
+        )
+        .unwrap();
+    catalog
+}
+
+fn gateway_resolver_chain(
+    records: &CoreRecordStore,
+    role: Role,
+    rid: RecordId,
+) -> Vec<VersionedValue> {
+    let key = match role {
+        Role::State => Key::State(rid.0),
+        Role::Payload => Key::Payload(rid.0),
+        _ => panic!("gateway fault target must be State or Payload"),
+    }
+    .encode()
+    .unwrap();
+    let cf = ColumnFamily(role.cf().into());
+    let engine = &records.engine;
+    // Match the resolver's segment -> mutable -> immutable tie order while
+    // topology is held, then release every lock before query or rename.
+    let mut chain = {
+        let _topology = engine.inner.topology.read();
+        let mut chain = engine
+            .inner
+            .segment_index
+            .read()
+            .get(&(cf.clone(), Bytes::copy_from_slice(&key)))
+            .cloned()
+            .unwrap_or_default();
+        chain.extend(engine.inner.memtable.read().versions_for_key(&cf, &key));
+        for immutable in engine.inner.immutable_memtables.lock().iter() {
+            chain.extend(immutable.versions_for_key(&cf, &key));
+        }
+        chain
+    };
+    chain.sort_by_key(|version| version.sequence);
+    chain
+}
+
+fn gateway_pointer_path(
+    records: &CoreRecordStore,
+    role: Role,
+    rid: RecordId,
+    sequence: u64,
+) -> PathBuf {
+    let chain = gateway_resolver_chain(records, role, rid);
+    let visible = chain
+        .iter()
+        .filter(|version| version.sequence <= sequence)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        visible.len(),
+        1,
+        "{role:?} {rid}: exactly one visible version required"
+    );
+    let StoredValue::BlobPointer(pointer) = &visible[0].value else {
+        panic!("{role:?} {rid}: visible version is not a BlobPointer")
+    };
+    let path = PathBuf::from(&pointer.path);
+    assert!(path.is_file(), "{role:?} {rid}: pointer file absent");
+    let pointed = crate::values::ValueLog::read_pointer(pointer).unwrap();
+    let key = match role {
+        Role::State => Key::State(rid.0),
+        Role::Payload => Key::Payload(rid.0),
+        _ => unreachable!(),
+    }
+    .encode()
+    .unwrap();
+    let segment = records
+        .engine
+        .inner
+        .segment_index
+        .read()
+        .get(&(ColumnFamily(role.cf().into()), Bytes::copy_from_slice(&key)))
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        segment.len(),
+        1,
+        "{role:?} {rid}: one segment version required"
+    );
+    assert_eq!(
+        &segment[0], visible[0],
+        "{role:?} {rid}: pointer must be the segment version"
+    );
+    assert_eq!(
+        records
+            .engine
+            .resolve_value_at_snapshot(&ColumnFamily(role.cf().into()), &key, sequence)
+            .unwrap(),
+        Some(pointed),
+        "{role:?} {rid}: held resolver must read that one pointer"
+    );
+    path
+}
+
+struct GatewayFaultFixture {
+    _dir: tempfile::TempDir,
+    db: CoreDatabase,
+    records: CoreRecordStore,
+    gateway: QueryGateway,
+    view: QueryReadView,
+    rids: [RecordId; 3],
+    sequence: u64,
+    state_paths: [PathBuf; 3],
+    payload_paths: [PathBuf; 3],
+}
+
+impl GatewayFaultFixture {
+    fn target_path(&self, role: Role, index: usize) -> &PathBuf {
+        match role {
+            Role::State => &self.state_paths[index],
+            Role::Payload => &self.payload_paths[index],
+            _ => unreachable!(),
+        }
+    }
+
+    fn query(&self) -> std::result::Result<QueryResult, QueryReadError> {
+        self.gateway.query(
+            &self.view,
+            "SELECT n FROM docs",
+            &TypedParameters::default(),
+        )
+    }
+}
+
+fn gateway_fault_fixture() -> GatewayFaultFixture {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = PraxisConfig::new(dir.path());
+    config.large_value_threshold = 1;
+    config.memtable_flush_threshold_bytes = usize::MAX;
+    let db = CoreDatabase::create_fresh(config.clone(), RecordAuthorityOptions::default()).unwrap();
+    let records = db.records();
+    let mut rids = Vec::new();
+    for frame in [GATEWAY_FRAME_ONE, GATEWAY_FRAME_TWO, GATEWAY_FRAME_THREE] {
+        let rid = records.put(frame, &[]).unwrap();
+        records.flush().unwrap();
+        rids.push(rid);
+    }
+    assert_eq!(rids, [RecordId(1), RecordId(2), RecordId(3)]);
+    drop(records);
+    drop(db);
+
+    let db = CoreDatabase::open(config).unwrap();
+    let records = db.records();
+    let gateway = QueryGateway::attach_fixture_v1(&db, gateway_fault_catalog()).unwrap();
+    let view = gateway.begin_read().unwrap();
+    let adjacent = records.pin_snapshot().unwrap();
+    let sequence = adjacent.core_sequence();
+    let key = Key::Allocator;
+    let allocator_bytes = records
+        .value(Role::Meta, &key, adjacent.pin_for(&records.engine).unwrap())
+        .unwrap()
+        .unwrap();
+    let Row::Allocator(allocator) =
+        Row::decode(&key, &allocator_bytes, records.engine.inner.layout.root()).unwrap()
+    else {
+        unreachable!()
+    };
+    assert_eq!(allocator.last_rid, 3);
+    assert_eq!(allocator.live_count, 3);
+    assert_eq!(allocator.dead_count, 0);
+    assert_eq!(
+        allocator.live_payload_bytes,
+        (GATEWAY_FRAME_ONE.len() + GATEWAY_FRAME_TWO.len() + GATEWAY_FRAME_THREE.len()) as u64
+    );
+    let candidates = records
+        .bounded_state_candidates(RecordScanLimits::fixture_v1())
+        .unwrap()
+        .into_iter()
+        .map(|raw| {
+            let Key::State(rid) =
+                Key::decode(Role::State, &raw, records.engine.inner.layout.root()).unwrap()
+            else {
+                panic!("non-State candidate")
+            };
+            rid
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(candidates, [1, 2, 3]);
+    let rids: [RecordId; 3] = rids.try_into().unwrap();
+    let state_paths = rids.map(|rid| gateway_pointer_path(&records, Role::State, rid, sequence));
+    let payload_paths =
+        rids.map(|rid| gateway_pointer_path(&records, Role::Payload, rid, sequence));
+    for left in 0..3 {
+        for right in left + 1..3 {
+            assert_ne!(state_paths[left], state_paths[right]);
+            assert_ne!(payload_paths[left], payload_paths[right]);
+            assert_ne!(state_paths[left], payload_paths[right]);
+            assert_ne!(payload_paths[left], state_paths[right]);
+        }
+        // A same-row State read may share the Payload path, but it completes
+        // before that row's Payload hook renames it.
+        eprintln!(
+            "gateway fault preflight rid={} state_payload_path_alias={}",
+            rids[left].0,
+            state_paths[left] == payload_paths[left]
+        );
+    }
+    assert_eq!(
+        gateway_fault_rows(
+            gateway
+                .query(&view, "SELECT n FROM docs", &TypedParameters::default())
+                .unwrap()
+        ),
+        gateway_fault_expected_rows()
+    );
+    drop(adjacent);
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 1);
+    GatewayFaultFixture {
+        _dir: dir,
+        db,
+        records,
+        gateway,
+        view,
+        rids,
+        sequence,
+        state_paths,
+        payload_paths,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct GatewayScanHits {
+    captured: usize,
+    state: usize,
+    payload: usize,
+    before_return: usize,
+}
+
+impl GatewayScanHits {
+    fn record(&mut self, phase: ReadPhase) -> usize {
+        let count = match phase {
+            ReadPhase::ScanCaptured => &mut self.captured,
+            ReadPhase::ScanState => &mut self.state,
+            ReadPhase::ScanPayload => &mut self.payload,
+            ReadPhase::ScanBeforeReturn => &mut self.before_return,
+            _ => return 0,
+        };
+        *count += 1;
+        *count
+    }
+}
+
+fn gateway_expected_terminal_hits(role: Role, index: usize) -> GatewayScanHits {
+    GatewayScanHits {
+        captured: 1,
+        state: index + 1,
+        payload: index + usize::from(role == Role::Payload),
+        before_return: 0,
+    }
+}
+
+struct GatewayHookReset {
+    installed: bool,
+}
+
+impl GatewayHookReset {
+    fn clear(&mut self) -> std::result::Result<(), &'static str> {
+        READ_HOOK.with(|slot| {
+            let Ok(mut hook) = slot.try_borrow_mut() else {
+                return Err("gateway hook still borrowed");
+            };
+            if hook.is_none() {
+                return Err("gateway hook missing");
+            }
+            *hook = None;
+            self.installed = false;
+            Ok(())
+        })
+    }
+}
+
+impl Drop for GatewayHookReset {
+    fn drop(&mut self) {
+        if self.installed {
+            READ_HOOK.with(|slot| {
+                // During unwinding this must not cause a second panic.
+                if let Ok(mut hook) = slot.try_borrow_mut() {
+                    *hook = None;
+                }
+            });
+        }
+    }
+}
+
+struct GatewayPathRestore {
+    original: PathBuf,
+    displaced: PathBuf,
+    armed: Rc<Cell<bool>>,
+}
+
+impl GatewayPathRestore {
+    fn new(original: PathBuf) -> Self {
+        let displaced = original.with_extension("stage4b-held");
+        assert!(!displaced.exists(), "fault displacement already exists");
+        Self {
+            original,
+            displaced,
+            armed: Rc::new(Cell::new(false)),
+        }
+    }
+
+    fn restore(&self) -> std::io::Result<()> {
+        if self.armed.get() {
+            std::fs::rename(&self.displaced, &self.original)?;
+            self.armed.set(false);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for GatewayPathRestore {
+    fn drop(&mut self) {
+        // Best effort on unwind; the explicit normal-path restore is checked.
+        let _ = self.restore();
+    }
+}
+
+fn gateway_public_physical_io_cell(role: Role, index: usize) {
+    let fixture = gateway_fault_fixture();
+    let target = fixture.target_path(role, index).clone();
+    let restore = GatewayPathRestore::new(target.clone());
+    let displaced = restore.displaced.clone();
+    let armed = Rc::clone(&restore.armed);
+    let hits = Rc::new(Cell::new(GatewayScanHits::default()));
+    let hook_hits = Rc::clone(&hits);
+    let target_phase = if role == Role::State {
+        ReadPhase::ScanState
+    } else {
+        ReadPhase::ScanPayload
+    };
+    READ_HOOK.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "previous hook leaked into fault cell"
+        );
+        *slot.borrow_mut() = Some(Box::new(move |phase| {
+            let mut current = hook_hits.get();
+            let ordinal = current.record(phase);
+            hook_hits.set(current);
+            if phase == target_phase && ordinal == index + 1 && !armed.get() {
+                std::fs::rename(&target, &displaced).unwrap();
+                armed.set(true);
+            }
+        }));
+    });
+    // The reset guard is created after the restore guard, so it drops first
+    // during unwind. Never clear READ_HOOK inside its borrowed callback.
+    let mut reset = GatewayHookReset { installed: true };
+    let result = fixture.query();
+    let terminal_hits = hits.get();
+    reset.clear().expect("gateway I/O hook did not clear");
+    drop(reset);
+    let renamed = restore.armed.get();
+    restore.restore().unwrap();
+    assert!(
+        renamed,
+        "{role:?} index {index}: target hook did not rename"
+    );
+    assert_eq!(
+        terminal_hits,
+        gateway_expected_terminal_hits(role, index),
+        "{role:?} index {index}: wrong scan ordinal or retry"
+    );
+    assert!(
+        matches!(
+            &result,
+            Err(QueryReadError::Storage(PraxisError::Io(error)))
+                if error.kind() == std::io::ErrorKind::NotFound
+        ),
+        "{role:?} index {index}: expected physical Io(NotFound), got {result:?}"
+    );
+    assert_eq!(
+        gateway_fault_rows(fixture.query().unwrap()),
+        gateway_fault_expected_rows(),
+        "{role:?} index {index}: same held view must survive restored I/O"
+    );
+}
+
+fn gateway_public_corrupt_cell(role: Role, index: usize) {
+    let fixture = gateway_fault_fixture();
+    let rid = fixture.rids[index];
+    let physical_key = match role {
+        Role::State => Key::State(rid.0),
+        Role::Payload => Key::Payload(rid.0),
+        _ => unreachable!(),
+    };
+    let key = physical_key.encode().unwrap();
+    inject_raw_at(
+        &fixture.db,
+        fixture.sequence,
+        role,
+        key.clone(),
+        Some(vec![0]),
+    );
+    let chain = gateway_resolver_chain(&fixture.records, role, rid);
+    let visible = chain
+        .iter()
+        .filter(|version| version.sequence <= fixture.sequence)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        visible.len(),
+        2,
+        "{role:?} {rid}: expected pointer then injected Put"
+    );
+    let segment = disk_versions(&fixture.db, role, physical_key);
+    assert_eq!(segment.len(), 1);
+    assert_eq!(
+        visible[0], &segment[0],
+        "{role:?} {rid}: original segment first"
+    );
+    assert!(matches!(visible[0].value, StoredValue::BlobPointer(_)));
+    assert_eq!(visible[1].sequence, fixture.sequence);
+    assert!(matches!(&visible[1].value, StoredValue::Put(bytes) if bytes == &[0]));
+    assert_eq!(
+        fixture
+            .records
+            .engine
+            .resolve_value_at_snapshot(&ColumnFamily(role.cf().into()), &key, fixture.sequence)
+            .unwrap(),
+        Some(vec![0]),
+        "{role:?} {rid}: held resolver must choose injected raw byte"
+    );
+
+    let hits = Rc::new(Cell::new(GatewayScanHits::default()));
+    let hook_hits = Rc::clone(&hits);
+    READ_HOOK.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "previous hook leaked into corrupt cell"
+        );
+        *slot.borrow_mut() = Some(Box::new(move |phase| {
+            let mut current = hook_hits.get();
+            current.record(phase);
+            hook_hits.set(current);
+        }));
+    });
+    let mut reset = GatewayHookReset { installed: true };
+    let result = fixture.query();
+    let terminal_hits = hits.get();
+    reset.clear().expect("gateway Corrupt hook did not clear");
+    drop(reset);
+    assert_eq!(
+        terminal_hits,
+        gateway_expected_terminal_hits(role, index),
+        "{role:?} index {index}: wrong corrupt-scan ordinal or retry"
+    );
+    assert!(
+        matches!(
+            &result,
+            Err(QueryReadError::Storage(PraxisError::Corrupt { .. }))
+        ),
+        "{role:?} index {index}: expected Storage(Corrupt), got {result:?}"
+    );
+}
+
+macro_rules! gateway_io_case {
+    ($name:ident, $role:expr, $index:expr) => {
+        #[test]
+        fn $name() {
+            gateway_public_physical_io_cell($role, $index);
+        }
+    };
+}
+
+macro_rules! gateway_corrupt_case {
+    ($name:ident, $role:expr, $index:expr) => {
+        #[test]
+        fn $name() {
+            gateway_public_corrupt_cell($role, $index);
+        }
+    };
+}
+
+gateway_io_case!(gateway_public_io_state_first, Role::State, 0);
+gateway_io_case!(gateway_public_io_state_middle, Role::State, 1);
+gateway_io_case!(gateway_public_io_state_last, Role::State, 2);
+gateway_io_case!(gateway_public_io_payload_first, Role::Payload, 0);
+gateway_io_case!(gateway_public_io_payload_middle, Role::Payload, 1);
+gateway_io_case!(gateway_public_io_payload_last, Role::Payload, 2);
+gateway_corrupt_case!(gateway_public_corrupt_state_first, Role::State, 0);
+gateway_corrupt_case!(gateway_public_corrupt_state_middle, Role::State, 1);
+gateway_corrupt_case!(gateway_public_corrupt_state_last, Role::State, 2);
+gateway_corrupt_case!(gateway_public_corrupt_payload_first, Role::Payload, 0);
+gateway_corrupt_case!(gateway_public_corrupt_payload_middle, Role::Payload, 1);
+gateway_corrupt_case!(gateway_public_corrupt_payload_last, Role::Payload, 2);
 
 #[test]
 fn combined_reads_hold_exactly_one_pin_through_delete_and_all_compactions() {
