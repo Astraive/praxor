@@ -83,12 +83,33 @@ direct old execution is still experimental. Q0 made no production parser,
 planner, executor or backend correction and manufactured no RED; the #61
 behavioral tests were run against Q0 source before the refusal change.
 
+## Bounded Q1 compiler path
+
+The readiness matrix above characterizes the legacy `QueryParser`, planner and
+executor. Its parameter row applies to `QueryParser::parse_with_params` and the
+raw substitution helper. The separate engine-owned `query::compile` path in
+[#61](https://github.com/Astraive/praxor/issues/61) accepts SQL text with
+`TypedParameters` and a detached, process-local `QueryCatalogView`. It binds
+`$1..$256`, `:name` and `@name` as typed values without rewriting SQL source.
+The bounded path compiles collection `SELECT` with projection and predicates,
+or returns a read-only `EXPLAIN SELECT` artifact; recognized features outside
+that scope receive typed refusals. A legacy `LogicalPlan` cannot become an
+executable bound select through this API.
+
+`execute_in_memory` evaluates a bound select over caller-supplied immutable
+document records. It does not read `CoreDatabase`, persist the detached catalog,
+provide a product query endpoint, or authorize historical, grouped, ordered,
+vector, graph or transactional SQL execution. Q2 and Q3 retain the storage-view
+and persisted catalog gates described below. The new compiler path does not
+change the legacy observations or serde fixtures in the Q0 matrix.
+
 ## Follow-on gates
 
-[Q1 #61](https://github.com/Astraive/praxor/issues/61) owns bounded canonical
-SELECT/filter compilation, real typed parameters and deterministic capability
-rejection of ignored features. Existing candidate behavior defects require
-actual pre-fix behavioral evidence; parser/plan success alone is insufficient.
+[Q1 #61](https://github.com/Astraive/praxor/issues/61) tracks the bounded
+canonical SELECT/filter compiler, typed parameters and deterministic capability
+refusals described above. Its validation includes actual pre-fix behavioral
+evidence for legacy no-op features and function-call error classification;
+parser/plan success alone is insufficient.
 
 [Q2 #62](https://github.com/Astraive/praxor/issues/62) owns a fallible retained
 read-view backend after the appropriate record-authority/snapshot gates. A
