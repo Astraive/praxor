@@ -3,7 +3,9 @@
 use super::codec::{Allocator, Decision, Key, Role, Row};
 use super::intent::{IntentKind, Mapping, NewRecord, RecordIntent, RecordResult};
 use super::schema::corrupt;
+use super::snapshot::CoreRecordSnapshot;
 use crate::memory::PinnedSnapshot;
+use crate::recovery::GcReport;
 use crate::store::{BatchRecord, IndexInsert, RecordId};
 use crate::types::ColumnFamily;
 use crate::{PraxisEngine, PraxisError, Result};
@@ -17,6 +19,14 @@ pub struct CoreRecordStore {
     engine: PraxisEngine,
 }
 
+/// Result of one requested protected-history rewrite and ordinary whole-file GC.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RecordHistoryReclaimReport {
+    pub rewrite_performed: bool,
+    pub protected_versions_removed: u64,
+    pub gc: GcReport,
+}
+
 impl CoreRecordStore {
     pub(super) fn new(engine: PraxisEngine) -> Self {
         Self { engine }
@@ -24,7 +34,51 @@ impl CoreRecordStore {
 
     fn pin(&self) -> Result<PinnedSnapshot> {
         self.engine.inner.group_commit.ensure_writable()?;
-        Ok(self.engine.pin_snapshot())
+        self.engine.try_pin_snapshot()
+    }
+
+    /// Retain the current published core view and this actual live owner.
+    /// This registers one process-local pin; it is not a durability barrier.
+    pub fn pin_snapshot(&self) -> Result<CoreRecordSnapshot> {
+        CoreRecordSnapshot::new(self.engine.clone(), self.pin()?)
+    }
+
+    /// Fetch canonical state/payload at the held view. A live guard never expires.
+    pub fn fetch_at_snapshot(
+        &self,
+        rid: RecordId,
+        snapshot: &CoreRecordSnapshot,
+    ) -> Result<Vec<u8>> {
+        self.fetch_at(rid, snapshot.pin_for(&self.engine)?)
+    }
+
+    /// Resolve a mapping head at the held core view, distinct from a raw ceiling.
+    pub fn lookup_rid_at_snapshot(
+        &self,
+        index_type: &str,
+        key: &[u8],
+        snapshot: &CoreRecordSnapshot,
+    ) -> Result<Option<RecordId>> {
+        let pin = snapshot.pin_for(&self.engine)?;
+        self.lookup(&self.mapping(index_type, key, pin)?, pin)
+    }
+
+    /// Resolve head, state and payload with the same retained pin.
+    pub fn fetch_by_index_at_snapshot(
+        &self,
+        index_type: &str,
+        key: &[u8],
+        snapshot: &CoreRecordSnapshot,
+    ) -> Result<Option<Vec<u8>>> {
+        let pin = snapshot.pin_for(&self.engine)?;
+        let Some(rid) = self.lookup(&self.mapping(index_type, key, pin)?, pin)? else {
+            return Ok(None);
+        };
+        match self.fetch_at(rid, pin) {
+            Ok(value) => Ok(Some(value)),
+            Err(PraxisError::KeyNotFound) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     fn value(&self, role: Role, key: &Key<'_>, pin: &PinnedSnapshot) -> Result<Option<Vec<u8>>> {
@@ -394,6 +448,14 @@ impl CoreRecordStore {
         self.engine.durable_barrier()?;
         self.engine.flush()?;
         Ok(())
+    }
+
+    /// Remove protected versions needed by neither the latest view nor any
+    /// registered core pin. Physical bytes are reclaimed only by whole-file GC.
+    pub fn reclaim_snapshot_history(&self) -> Result<RecordHistoryReclaimReport> {
+        self.engine.inner.group_commit.ensure_writable()?;
+        self.engine.durable_barrier()?;
+        self.engine.reclaim_record_snapshot_history()
     }
 }
 

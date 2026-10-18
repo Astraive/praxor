@@ -130,3 +130,78 @@ fn never_client_flush_executes_one_ordered_durable_barrier_without_consuming_seq
         b"shared-owner"
     );
 }
+
+#[test]
+fn historical_capability_guard_is_static_while_poisoned_owner_rejects_operations() {
+    use std::sync::atomic::Ordering;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = CoreDatabase::create_fresh(
+        PraxisConfig::new(dir.path()),
+        RecordAuthorityOptions { indexes: vec![] },
+    )
+    .unwrap();
+    let service = CorePrimitiveStorageService::new(db.records());
+    let client = LocalCorepraxisClient::new(service.clone());
+    let rid = service.records().put(b"held", &[]).unwrap();
+    let held = client.records().pin_snapshot().unwrap();
+    let engine = db.kv();
+    engine
+        .inner
+        .group_commit
+        .poison("test uncertain publication".into());
+    let admissions = engine
+        .inner
+        .metrics
+        .write_admissions
+        .load(Ordering::Relaxed);
+    let syncs = engine
+        .inner
+        .metrics
+        .commit_sync_attempts
+        .load(Ordering::Relaxed);
+    let sequence = engine.snapshot().sequence;
+
+    for capability in [
+        CoreRecordServiceCapability::LogicalCrud,
+        CoreRecordServiceCapability::FixedMappingIndex,
+        CoreRecordServiceCapability::DurableFlush,
+        CoreRecordServiceCapability::HistoricalPayload,
+    ] {
+        assert_eq!(service.require_capability(capability), Ok(()));
+        assert_eq!(client.require_capability(capability), Ok(()));
+    }
+    assert_eq!(
+        engine
+            .inner
+            .metrics
+            .write_admissions
+            .load(Ordering::Relaxed),
+        admissions
+    );
+    assert_eq!(
+        engine
+            .inner
+            .metrics
+            .commit_sync_attempts
+            .load(Ordering::Relaxed),
+        syncs
+    );
+    assert_eq!(engine.snapshot().sequence, sequence);
+    assert!(matches!(
+        service.records().pin_snapshot(),
+        Err(PraxisError::RecoveryRequired)
+    ));
+    assert!(matches!(
+        client.records().fetch_at_snapshot(rid, &held),
+        Err(PraxisError::RecoveryRequired)
+    ));
+    assert!(matches!(
+        client.records().reclaim_snapshot_history(),
+        Err(PraxisError::RecoveryRequired)
+    ));
+    assert!(matches!(
+        client.get_record(RequestContext::new("poisoned"), rid),
+        Err(PraxisError::RecoveryRequired)
+    ));
+}
