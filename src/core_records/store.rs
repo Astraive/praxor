@@ -27,6 +27,42 @@ pub struct RecordHistoryReclaimReport {
     pub gc: GcReport,
 }
 
+/// Limits on the new collections owned by one fixture-root State scan. The
+/// underlying engine's per-key version-chain and value allocations are not
+/// bounded by these limits.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RecordScanLimits {
+    max_candidate_keys: usize,
+    max_raw_key_bytes: usize,
+    max_candidate_key_bytes: usize,
+    max_live_rows: u64,
+    max_payload_bytes: u64,
+}
+
+impl RecordScanLimits {
+    pub(crate) fn fixture_v1() -> Self {
+        Self {
+            max_candidate_keys: 65_536,
+            max_raw_key_bytes: 4_096,
+            max_candidate_key_bytes: 4 * 1024 * 1024,
+            max_live_rows: 16_384,
+            max_payload_bytes: 32 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum CoreRecordScanError {
+    Storage(PraxisError),
+    ResourceLimit { code: &'static str },
+}
+
+impl From<PraxisError> for CoreRecordScanError {
+    fn from(error: PraxisError) -> Self {
+        Self::Storage(error)
+    }
+}
+
 impl CoreRecordStore {
     pub(super) fn new(engine: PraxisEngine) -> Self {
         Self { engine }
@@ -87,6 +123,254 @@ impl CoreRecordStore {
             &key.encode()?,
             pin.sequence(),
         )
+    }
+
+    /// Validate a retained view without registering a second pin.
+    pub(crate) fn validate_snapshot(&self, snapshot: &CoreRecordSnapshot) -> Result<()> {
+        snapshot.pin_for(&self.engine).map(|_| ())
+    }
+
+    /// Capture all physical State keys while flush/compaction topology is
+    /// stable. Every tier lock is released before any point resolution.
+    fn bounded_state_candidates(
+        &self,
+        limits: RecordScanLimits,
+    ) -> std::result::Result<BTreeSet<Bytes>, CoreRecordScanError> {
+        let cf = ColumnFamily(Role::State.cf().into());
+        let _topology = self.engine.inner.topology.read();
+        let mut keys = BTreeSet::new();
+        let mut total_bytes = 0usize;
+        let mut insert = |key: &Bytes| -> std::result::Result<(), CoreRecordScanError> {
+            if key.len() > limits.max_raw_key_bytes {
+                return Err(CoreRecordScanError::ResourceLimit {
+                    code: "raw_state_key_bytes",
+                });
+            }
+            if keys.contains(key) {
+                return Ok(());
+            }
+            let next_count =
+                keys.len()
+                    .checked_add(1)
+                    .ok_or(CoreRecordScanError::ResourceLimit {
+                        code: "state_candidates",
+                    })?;
+            if next_count > limits.max_candidate_keys {
+                return Err(CoreRecordScanError::ResourceLimit {
+                    code: "state_candidates",
+                });
+            }
+            let next_bytes =
+                total_bytes
+                    .checked_add(key.len())
+                    .ok_or(CoreRecordScanError::ResourceLimit {
+                        code: "candidate_key_bytes",
+                    })?;
+            if next_bytes > limits.max_candidate_key_bytes {
+                return Err(CoreRecordScanError::ResourceLimit {
+                    code: "candidate_key_bytes",
+                });
+            }
+            keys.insert(key.clone());
+            total_bytes = next_bytes;
+            Ok(())
+        };
+        {
+            let mutable = self.engine.inner.memtable.read();
+            for key in mutable.keys_in_cf(&cf) {
+                insert(key)?;
+            }
+        }
+        {
+            let immutables = self.engine.inner.immutable_memtables.lock();
+            for immutable in immutables.iter() {
+                for key in immutable.keys_in_cf(&cf) {
+                    insert(key)?;
+                }
+            }
+        }
+        {
+            let segments = self.engine.inner.segment_index.read();
+            for ((_, key), _) in segments
+                .range((cf.clone(), Bytes::new())..)
+                .take_while(|((entry_cf, _), _)| entry_cf == &cf)
+            {
+                insert(key)?;
+            }
+        }
+        drop(insert);
+        Ok(keys)
+    }
+
+    /// Materialize every live record from one retained State/Payload view.
+    /// A late fault discards the buffered rows; no partial result is returned.
+    pub(crate) fn scan_live_at_snapshot(
+        &self,
+        snapshot: &CoreRecordSnapshot,
+        limits: RecordScanLimits,
+    ) -> std::result::Result<Vec<(RecordId, Vec<u8>)>, CoreRecordScanError> {
+        let pin = snapshot.pin_for(&self.engine)?;
+        let allocator_key = Key::Allocator;
+        let allocator_bytes = self
+            .value(Role::Meta, &allocator_key, pin)?
+            .ok_or_else(|| {
+                corrupt(
+                    self.engine.inner.layout.root(),
+                    "record allocator is missing",
+                )
+            })?;
+        let Row::Allocator(allocator) = Row::decode(
+            &allocator_key,
+            &allocator_bytes,
+            self.engine.inner.layout.root(),
+        )?
+        else {
+            unreachable!()
+        };
+        let candidate_limit = u64::try_from(limits.max_candidate_keys).map_err(|_| {
+            CoreRecordScanError::ResourceLimit {
+                code: "state_candidates",
+            }
+        })?;
+        if allocator.last_rid > candidate_limit {
+            return Err(CoreRecordScanError::ResourceLimit {
+                code: "state_candidates",
+            });
+        }
+        if allocator.live_count > limits.max_live_rows {
+            return Err(CoreRecordScanError::ResourceLimit { code: "live_rows" });
+        }
+        if allocator.live_payload_bytes > limits.max_payload_bytes {
+            return Err(CoreRecordScanError::ResourceLimit {
+                code: "payload_bytes",
+            });
+        }
+
+        let candidates = self.bounded_state_candidates(limits)?;
+        #[cfg(test)]
+        read_phase(ReadPhase::ScanCaptured);
+        let state_cf = ColumnFamily(Role::State.cf().into());
+        let mut rows = Vec::new();
+        let mut visible_states = 0u64;
+        let mut live_count = 0u64;
+        let mut dead_count = 0u64;
+        let mut live_bytes = 0u64;
+        for raw_key in candidates {
+            #[cfg(test)]
+            read_phase(ReadPhase::ScanState);
+            let Some(state_bytes) = self.engine.resolve_value_at_snapshot(
+                &state_cf,
+                raw_key.as_ref(),
+                pin.sequence(),
+            )?
+            else {
+                // A physical candidate first written after this pin is not
+                // part of the retained view, even if its key is malformed.
+                continue;
+            };
+            let Key::State(rid) = Key::decode(
+                Role::State,
+                raw_key.as_ref(),
+                self.engine.inner.layout.root(),
+            )?
+            else {
+                unreachable!()
+            };
+            visible_states = visible_states.checked_add(1).ok_or_else(|| {
+                corrupt(
+                    self.engine.inner.layout.root(),
+                    "visible State count overflow",
+                )
+            })?;
+            if rid > allocator.last_rid || rid != visible_states {
+                return Err(corrupt(
+                    self.engine.inner.layout.root(),
+                    "visible State RIDs disagree with held allocator",
+                )
+                .into());
+            }
+            let Row::State {
+                live,
+                payload_length,
+            } = Row::decode(
+                &Key::State(rid),
+                &state_bytes,
+                self.engine.inner.layout.root(),
+            )?
+            else {
+                unreachable!()
+            };
+            if live {
+                live_count = live_count.checked_add(1).ok_or_else(|| {
+                    corrupt(self.engine.inner.layout.root(), "live State count overflow")
+                })?;
+                if live_count > limits.max_live_rows {
+                    return Err(CoreRecordScanError::ResourceLimit { code: "live_rows" });
+                }
+                live_bytes = live_bytes.checked_add(payload_length).ok_or_else(|| {
+                    corrupt(
+                        self.engine.inner.layout.root(),
+                        "live payload byte count overflow",
+                    )
+                })?;
+                if live_bytes > limits.max_payload_bytes {
+                    return Err(CoreRecordScanError::ResourceLimit {
+                        code: "payload_bytes",
+                    });
+                }
+                #[cfg(test)]
+                read_phase(ReadPhase::ScanPayload);
+                let payload_key = Key::Payload(rid);
+                let payload_bytes =
+                    self.value(Role::Payload, &payload_key, pin)?
+                        .ok_or_else(|| {
+                            corrupt(
+                                self.engine.inner.layout.root(),
+                                "live RID has no canonical payload",
+                            )
+                        })?;
+                let Row::Payload(payload) = Row::decode(
+                    &payload_key,
+                    &payload_bytes,
+                    self.engine.inner.layout.root(),
+                )?
+                else {
+                    unreachable!()
+                };
+                let actual_length = u64::try_from(payload.len()).map_err(|_| {
+                    CoreRecordScanError::ResourceLimit {
+                        code: "payload_bytes",
+                    }
+                })?;
+                if actual_length != payload_length {
+                    return Err(corrupt(
+                        self.engine.inner.layout.root(),
+                        "live RID payload length disagrees with state",
+                    )
+                    .into());
+                }
+                rows.push((RecordId(rid), payload.to_vec()));
+            } else {
+                dead_count = dead_count.checked_add(1).ok_or_else(|| {
+                    corrupt(self.engine.inner.layout.root(), "dead State count overflow")
+                })?;
+            }
+        }
+        if visible_states != allocator.last_rid
+            || live_count != allocator.live_count
+            || dead_count != allocator.dead_count
+            || live_bytes != allocator.live_payload_bytes
+        {
+            return Err(corrupt(
+                self.engine.inner.layout.root(),
+                "visible State counts or bytes disagree with held allocator",
+            )
+            .into());
+        }
+        #[cfg(test)]
+        read_phase(ReadPhase::ScanBeforeReturn);
+        self.validate_snapshot(snapshot)?;
+        Ok(rows)
     }
 
     /// Gather only matching tier keys while topology is coherent, then release
@@ -465,6 +749,10 @@ enum ReadPhase {
     Head,
     State,
     RangeKeys,
+    ScanCaptured,
+    ScanState,
+    ScanPayload,
+    ScanBeforeReturn,
 }
 #[cfg(test)]
 type ReadHook = Box<dyn Fn(ReadPhase)>;
