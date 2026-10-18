@@ -1,4 +1,4 @@
-use super::physical::inspect_v4_owner;
+use super::physical::{InstalledEndpoint, inspect_v4_owner};
 use super::{CatalogAuthorityV1, CatalogBindingV1};
 use crate::accel::cpu::scalar::CpuAccelerator;
 use crate::config::{Compression, PraxisConfig};
@@ -191,17 +191,306 @@ fn fixture(include_anchor: bool) -> (tempfile::TempDir, PraxisConfig, WriterLeas
     (dir, config, lease)
 }
 
+fn unflushed_fixture() -> (tempfile::TempDir, PraxisConfig, WriterLease) {
+    let temp_root = std::env::var_os("PRAXOR_TEST_TMP_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = tempfile::tempdir_in(temp_root).unwrap();
+    let lease = WriterLease::acquire(dir.path()).unwrap();
+    let root = lease.root();
+    let layout = DiskLayout::create(root).unwrap();
+    let mut config = PraxisConfig::new(root);
+    config.compression = Compression::None;
+    let mut manifest = v4_manifest(&config);
+    manifest.flushed_sequence = 0;
+    manifest.flushed_wal_id = 0;
+    manifest.active_wal_id = 1;
+    manifest.next_wal_id = 2;
+    manifest.next_segment_id = 1;
+    ManifestStore::new(layout.manifest_path())
+        .save(&manifest)
+        .unwrap();
+    let mut wal = Vec::new();
+    wal.extend(0x5457_4146u32.to_le_bytes());
+    wal.extend(1u32.to_le_bytes());
+    wal.extend(1u64.to_le_bytes());
+    wal.extend(BOOTSTRAP_FRAME);
+    fs::write(layout.wal_path(1), wal).unwrap();
+    (dir, config, lease)
+}
+
+fn unflushed_wal_path(root: &Path) -> PathBuf {
+    root.join("wal/00000000000000000001.wal")
+}
+
+fn replace_unflushed_frames(root: &Path, frames: &[u8]) {
+    let path = unflushed_wal_path(root);
+    let mut wal = fs::read(&path).unwrap();
+    wal.truncate(16);
+    wal.extend_from_slice(frames);
+    fs::write(path, wal).unwrap();
+}
+
+fn append_unflushed_frame_bytes(root: &Path, bytes: &[u8]) {
+    let path = unflushed_wal_path(root);
+    let mut wal = fs::read(&path).unwrap();
+    wal.extend_from_slice(bytes);
+    fs::write(path, wal).unwrap();
+}
+
+fn assert_unflushed_refused_without_mutation(
+    dir: &tempfile::TempDir,
+    config: &PraxisConfig,
+    lease: &WriterLease,
+) {
+    let before = snapshot(dir.path());
+    assert!(inspect_v4_owner(lease, config, &CpuAccelerator).is_err());
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn unflushed_literal_bootstrap_s1_is_private_recovered_endpoint() {
+    let (dir, config, lease) = unflushed_fixture();
+    let before = snapshot(dir.path());
+    let proof = inspect_v4_owner(&lease, &config, &CpuAccelerator).unwrap();
+    assert_eq!(
+        (proof.cut.flushed_sequence, proof.cut.last_sequence),
+        (0, 1)
+    );
+    assert_eq!(proof.recovered_sequence, 1);
+    assert_eq!(proof.wal_witnesses.len(), 1);
+    let wal = &proof.wal_witnesses[0];
+    assert_eq!(
+        (
+            wal.id,
+            wal.record_count,
+            wal.catalog_bootstraps,
+            wal.catalog_creates
+        ),
+        (1, 1, 1, 0)
+    );
+    assert_eq!((wal.full_len, wal.prefix_len), (579, 579));
+    assert_eq!((wal.first_sequence, wal.last_sequence), (Some(1), Some(1)));
+    assert!(wal.torn_start.is_none());
+    assert_eq!(proof.effective.head.database_id, ID);
+    assert_eq!(
+        (
+            proof.effective.head.revision,
+            proof.effective.head.collection_count
+        ),
+        (1, 0)
+    );
+    assert_eq!(proof.effective.rows.len(), 2);
+    assert!(matches!(proof.installed, InstalledEndpoint::Empty));
+    assert_eq!(proof.recovered_binding, (ID, 0));
+    assert_eq!(proof.recovered_allocator, Default::default());
+    let oracle: serde_json::Value = serde_json::from_str(ORACLE).unwrap();
+    for name in ["catalog_head_at_1", "catalog_anchor_at_1"] {
+        let row = oracle["bootstrap_tag6"]["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"].as_str() == Some(name))
+            .unwrap();
+        let key = bytes(row["key_hex"].as_str().unwrap());
+        let value = bytes(row["value_hex"].as_str().unwrap());
+        assert_eq!(proof.effective.rows.get(&key), Some(&value));
+    }
+    let effects = proof.bootstrap_effects.as_ref().unwrap();
+    for (effect, oracle) in effects
+        .rows
+        .iter()
+        .zip(oracle["bootstrap_tag6"]["operations"].as_array().unwrap())
+    {
+        assert_eq!(effect.cf, oracle["cf_utf8"].as_str().unwrap());
+        assert_eq!(
+            effect.key.as_slice(),
+            bytes(oracle["key_hex"].as_str().unwrap())
+        );
+        assert_eq!(effect.value, bytes(oracle["value_hex"].as_str().unwrap()));
+    }
+    proof.recheck(&lease).unwrap();
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn unflushed_bootstrap_refuses_missing_partial_wrong_and_mutated_frames() {
+    for frames in [
+        Vec::new(),
+        BOOTSTRAP_FRAME[..200].to_vec(),
+        CREATE_FRAME.to_vec(),
+        oracle_mutation("bootstrap_anchor_digest_only"),
+    ] {
+        let (dir, config, lease) = unflushed_fixture();
+        replace_unflushed_frames(lease.root(), &frames);
+        assert_unflushed_refused_without_mutation(&dir, &config, &lease);
+    }
+    for extra in [BOOTSTRAP_FRAME.as_slice(), CREATE_FRAME.as_slice()] {
+        let (dir, config, lease) = unflushed_fixture();
+        append_unflushed_frame_bytes(lease.root(), extra);
+        assert_unflushed_refused_without_mutation(&dir, &config, &lease);
+    }
+}
+
+#[test]
+fn unflushed_bootstrap_refuses_every_short_suffix_without_tail_repair() {
+    for length in 1..=15 {
+        let (dir, config, lease) = unflushed_fixture();
+        append_unflushed_frame_bytes(lease.root(), &CREATE_FRAME[..length]);
+        let before = snapshot(dir.path());
+        let error = inspect_v4_owner(&lease, &config, &CpuAccelerator).unwrap_err();
+        assert!(
+            format!("{error}").contains("incomplete or has an extra tail"),
+            "suffix length {length}: {error}"
+        );
+        assert_eq!(snapshot(dir.path()), before);
+    }
+}
+
+#[test]
+fn unflushed_bootstrap_refuses_hidden_content_in_every_empty_role() {
+    for role in ["segments/0", "segments/1", "values", "checkpoints", "tmp"] {
+        let (dir, config, lease) = unflushed_fixture();
+        fs::write(lease.root().join(role).join("hidden"), b"not installed").unwrap();
+        assert_unflushed_refused_without_mutation(&dir, &config, &lease);
+    }
+}
+
+#[test]
+fn unflushed_bootstrap_requires_every_creation_layout_directory() {
+    for role in ["segments/0", "segments/1", "values", "checkpoints", "tmp"] {
+        let (dir, config, lease) = unflushed_fixture();
+        fs::remove_dir(lease.root().join(role)).unwrap();
+        assert_unflushed_refused_without_mutation(&dir, &config, &lease);
+
+        let (dir, config, lease) = unflushed_fixture();
+        fs::remove_dir(lease.root().join(role)).unwrap();
+        fs::write(lease.root().join(role), b"wrong role type").unwrap();
+        assert_unflushed_refused_without_mutation(&dir, &config, &lease);
+    }
+
+    let (dir, config, lease) = unflushed_fixture();
+    fs::remove_file(unflushed_wal_path(lease.root())).unwrap();
+    fs::remove_dir(lease.root().join("wal")).unwrap();
+    assert_unflushed_refused_without_mutation(&dir, &config, &lease);
+
+    let (dir, config, lease) = unflushed_fixture();
+    fs::remove_file(unflushed_wal_path(lease.root())).unwrap();
+    fs::remove_dir(lease.root().join("wal")).unwrap();
+    fs::write(lease.root().join("wal"), b"wrong role type").unwrap();
+    assert_unflushed_refused_without_mutation(&dir, &config, &lease);
+
+    for replace in [false, true] {
+        let (dir, config, lease) = unflushed_fixture();
+        for level in ["0", "1"] {
+            fs::remove_dir(lease.root().join("segments").join(level)).unwrap();
+        }
+        fs::remove_dir(lease.root().join("segments")).unwrap();
+        if replace {
+            fs::write(lease.root().join("segments"), b"wrong role type").unwrap();
+        }
+        assert_unflushed_refused_without_mutation(&dir, &config, &lease);
+    }
+}
+
+#[test]
+fn unflushed_bootstrap_refuses_extra_root_or_second_wal() {
+    let (dir, config, lease) = unflushed_fixture();
+    fs::write(lease.root().join("unlisted"), b"hidden").unwrap();
+    assert_unflushed_refused_without_mutation(&dir, &config, &lease);
+
+    let (dir, config, lease) = unflushed_fixture();
+    let mut second_header = fs::read(unflushed_wal_path(lease.root())).unwrap()[..16].to_vec();
+    second_header[8..16].copy_from_slice(&2u64.to_le_bytes());
+    fs::write(
+        lease.root().join("wal/00000000000000000002.wal"),
+        second_header,
+    )
+    .unwrap();
+    assert_unflushed_refused_without_mutation(&dir, &config, &lease);
+}
+
+#[test]
+fn unflushed_bootstrap_refuses_manifest_and_wal_hardlink_aliases() {
+    for role in ["MANIFEST", "wal/00000000000000000001.wal"] {
+        let (dir, config, lease) = unflushed_fixture();
+        let alias_dir = tempfile::tempdir_in(dir.path().parent().unwrap()).unwrap();
+        fs::hard_link(lease.root().join(role), alias_dir.path().join("alias")).unwrap();
+        let before = snapshot(dir.path());
+        let error = inspect_v4_owner(&lease, &config, &CpuAccelerator).unwrap_err();
+        assert!(
+            format!("{error}").contains("hardlink alias"),
+            "{role}: {error}"
+        );
+        assert_eq!(snapshot(dir.path()), before);
+    }
+}
+
+#[test]
+fn unflushed_bootstrap_recheck_refuses_same_length_wal_and_manifest_replacement() {
+    let (dir, config, lease) = unflushed_fixture();
+    let proof = inspect_v4_owner(&lease, &config, &CpuAccelerator).unwrap();
+    replace_unflushed_frames(
+        lease.root(),
+        &oracle_mutation("bootstrap_anchor_digest_only"),
+    );
+    let before = snapshot(dir.path());
+    assert!(proof.recheck(&lease).is_err());
+    assert_eq!(snapshot(dir.path()), before);
+
+    let (dir, config, lease) = unflushed_fixture();
+    let proof = inspect_v4_owner(&lease, &config, &CpuAccelerator).unwrap();
+    let path = lease.root().join("MANIFEST");
+    let bytes = fs::read(&path).unwrap();
+    let moved = tempfile::tempdir_in(dir.path().parent().unwrap()).unwrap();
+    fs::rename(&path, moved.path().join("original-MANIFEST")).unwrap();
+    fs::write(&path, bytes).unwrap();
+    let before = snapshot(dir.path());
+    assert!(proof.recheck(&lease).is_err());
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn unflushed_bootstrap_recheck_refuses_new_content_in_every_empty_role() {
+    for role in ["segments/0", "segments/1", "values", "checkpoints", "tmp"] {
+        let (dir, config, lease) = unflushed_fixture();
+        let proof = inspect_v4_owner(&lease, &config, &CpuAccelerator).unwrap();
+        fs::write(lease.root().join(role).join("after-proof"), b"hidden").unwrap();
+        let before = snapshot(dir.path());
+        assert!(proof.recheck(&lease).is_err(), "{role}");
+        assert_eq!(snapshot(dir.path()), before);
+    }
+}
+
+#[test]
+fn unflushed_bootstrap_recheck_refuses_replaced_required_directory() {
+    let (dir, config, lease) = unflushed_fixture();
+    let proof = inspect_v4_owner(&lease, &config, &CpuAccelerator).unwrap();
+    let path = lease.root().join("values");
+    fs::remove_dir(&path).unwrap();
+    fs::write(&path, b"wrong role type").unwrap();
+    let before = snapshot(dir.path());
+    assert!(proof.recheck(&lease).is_err());
+    assert_eq!(snapshot(dir.path()), before);
+}
+
 #[test]
 fn retired_bootstrap_has_four_physical_rows_and_header_only_active_wal() {
     let (dir, config, lease) = fixture(true);
     let before = snapshot(dir.path());
     let proof = inspect_v4_owner(&lease, &config, &CpuAccelerator).unwrap();
-    assert_eq!(proof.binding, (ID, 0));
-    assert_eq!(proof.allocator, Default::default());
-    assert_eq!(proof.head.database_id, ID);
-    assert_eq!(proof.head.revision, 1);
-    assert_eq!(proof.head.collection_count, 0);
-    assert_eq!(proof.anchor.database_id, ID);
+    let InstalledEndpoint::FlushedBootstrap(installed) = &proof.installed else {
+        panic!("expected flushed installed endpoint");
+    };
+    assert_eq!(installed.binding, (ID, 0));
+    assert_eq!(installed.allocator, Default::default());
+    assert_eq!(installed.head.database_id, ID);
+    assert_eq!(installed.head.revision, 1);
+    assert_eq!(installed.head.collection_count, 0);
+    assert_eq!(installed.anchor.database_id, ID);
+    assert_eq!(proof.recovered_binding, (ID, 0));
+    assert_eq!(proof.recovered_allocator, Default::default());
+    assert!(proof.bootstrap_effects.is_none());
     assert_eq!(proof.cut.flushed_sequence, 1);
     assert_eq!(proof.cut.last_sequence, 1);
     assert_eq!(proof.recovered_sequence, 1);
@@ -225,10 +514,16 @@ fn complete_unreceipted_create_s2_replays_read_only_from_installed_f1() {
     assert_eq!(proof.wal_witnesses[0].record_count, 1);
     assert_eq!(proof.wal_witnesses[0].catalog_creates, 1);
     assert_eq!(proof.wal_witnesses[0].full_len, 440);
-    assert_eq!(proof.binding, (ID, 0));
-    assert_eq!(proof.allocator, Default::default());
-    assert_eq!(proof.head.revision, 1); // installed Head remains separate
-    assert_eq!(proof.anchor.database_id, ID);
+    let InstalledEndpoint::FlushedBootstrap(installed) = &proof.installed else {
+        panic!("expected flushed installed endpoint");
+    };
+    assert_eq!(installed.binding, (ID, 0));
+    assert_eq!(installed.allocator, Default::default());
+    assert_eq!(installed.head.revision, 1); // installed Head remains separate
+    assert_eq!(installed.anchor.database_id, ID);
+    assert_eq!(proof.recovered_binding, (ID, 0));
+    assert_eq!(proof.recovered_allocator, Default::default());
+    assert!(proof.bootstrap_effects.is_none());
     assert_eq!(proof.effective.head.database_id, ID);
     assert_eq!(proof.effective.head.revision, 2);
     assert_eq!(proof.effective.head.collection_count, 1);

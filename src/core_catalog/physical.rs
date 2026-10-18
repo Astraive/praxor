@@ -1,8 +1,8 @@
 //! Private, read-only physical evidence for a v4 catalog owner.
 //!
-//! Only the retired-bootstrap F=1/L=1, D=0 cut is admitted here. Every other
-//! cut remains unsupported until its installed and replay relations are
-//! proven. No public database owner is constructed from this evidence.
+//! Only the D=0 unflushed-bootstrap F=0/L=1 and retired-bootstrap F=1/L=1
+//! cuts are admitted here. Every other cut remains unsupported until its
+//! installed and replay relations are proven. No public owner is constructed.
 use super::codec::{Anchor, CatalogKey, CatalogValue, Head, anchor_digest, canonical_head_at_1};
 use super::control::CatalogControl;
 use super::frame::{self, FrameContext, PriorCatalog, ValidatedCatalogFrame};
@@ -90,7 +90,7 @@ fn physical_id(file: &File, path: &Path) -> Result<PhysicalId> {
 compile_error!("v4 installed witnesses require opened-handle physical identity");
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct FileWitness {
+pub(crate) struct FileWitness {
     path: PathBuf,
     identity: PhysicalId,
     len: u64,
@@ -174,7 +174,7 @@ impl CatalogReplayRows {
 }
 
 impl CatalogReplayState {
-    fn from_installed(head: Head, anchor: Anchor, source: &Path) -> Result<Self> {
+    fn from_head_anchor(head: Head, anchor: Anchor, source: &Path) -> Result<Self> {
         let rows = CatalogReplayRows {
             head: OwnedCatalogRow {
                 key: CatalogKey::Head.encode()?,
@@ -347,16 +347,134 @@ impl PriorCatalog for CatalogReplayState {
 }
 
 #[derive(Debug)]
-pub(crate) struct CatalogOwnerProof {
-    root: PathBuf,
-    manifest: FileWitness,
+pub(crate) enum InstalledEndpoint {
+    Empty,
+    FlushedBootstrap(Box<FlushedBootstrap>),
+}
+
+#[derive(Debug)]
+pub(crate) struct FlushedBootstrap {
     segment: FileWitness,
-    pub(crate) cut: WalCut,
-    pub(crate) recovered_sequence: u64,
     pub(crate) binding: ([u8; 16], u32),
     pub(crate) allocator: Allocator,
     pub(crate) head: Head,
     pub(crate) anchor: Anchor,
+}
+
+#[derive(Debug)]
+pub(crate) struct BootstrapEffect {
+    pub(crate) cf: &'static str,
+    pub(crate) key: [u8; 1],
+    pub(crate) value: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub(crate) struct BootstrapEffects {
+    pub(crate) rows: [BootstrapEffect; 4],
+}
+
+struct StagedBootstrap {
+    effects: BootstrapEffects,
+    binding: ([u8; 16], u32),
+    allocator: Allocator,
+    head: Head,
+    anchor: Anchor,
+}
+
+impl StagedBootstrap {
+    fn from_validated(
+        frame: ValidatedCatalogFrame<'_>,
+        id: [u8; 16],
+        source: &Path,
+    ) -> Result<Self> {
+        if frame.sequence() != 1 || frame.ops().len() != 4 {
+            return Err(corrupt(source, "unsupported v4 bootstrap replay cut"));
+        }
+        let expected = [
+            (Role::Meta.cf(), [0], 80),
+            (Role::Meta.cf(), [1], 56),
+            (super::authority::CATALOG_CF, [0], 48),
+            (super::authority::CATALOG_CF, [4], 72),
+        ];
+        let mut staged = Vec::new();
+        staged
+            .try_reserve_exact(4)
+            .map_err(|_| corrupt(source, "cannot reserve v4 bootstrap effects"))?;
+        for (op, (expected_cf, expected_key, value_len)) in frame.ops().iter().zip(expected) {
+            let BatchOp::Put { cf, key, value } = op else {
+                return Err(corrupt(source, "v4 bootstrap effect is not plain Put"));
+            };
+            if cf.0 != expected_cf || key.as_slice() != expected_key || value.len() != value_len {
+                return Err(corrupt(source, "v4 bootstrap effect role/length mismatch"));
+            }
+            let mut owned = Vec::new();
+            owned
+                .try_reserve_exact(value_len)
+                .map_err(|_| corrupt(source, "cannot reserve v4 bootstrap row"))?;
+            owned.extend_from_slice(value);
+            staged.push(BootstrapEffect {
+                cf: expected_cf,
+                key: expected_key,
+                value: owned,
+            });
+        }
+        let rows: [BootstrapEffect; 4] = staged
+            .try_into()
+            .map_err(|_| corrupt(source, "v4 bootstrap effect count mismatch"))?;
+        let RecordRow::Binding {
+            database_id,
+            descriptor_count,
+        } = RecordRow::decode(&RecordKey::Binding, &rows[0].value, source)?
+        else {
+            return Err(corrupt(source, "v4 bootstrap Binding role mismatch"));
+        };
+        let RecordRow::Allocator(allocator) =
+            RecordRow::decode(&RecordKey::Allocator, &rows[1].value, source)?
+        else {
+            return Err(corrupt(source, "v4 bootstrap Allocator role mismatch"));
+        };
+        let CatalogValue::Head(head) =
+            CatalogValue::decode(&CatalogKey::Head, &rows[2].value, source)?
+        else {
+            return Err(corrupt(source, "v4 bootstrap Head role mismatch"));
+        };
+        let CatalogValue::Anchor(anchor) =
+            CatalogValue::decode(&CatalogKey::Anchor, &rows[3].value, source)?
+        else {
+            return Err(corrupt(source, "v4 bootstrap Anchor role mismatch"));
+        };
+        if database_id != id
+            || descriptor_count != 0
+            || allocator != Allocator::default()
+            || head.database_id != id
+            || head.revision != 1
+            || head.collection_count != 0
+            || rows[2].value != canonical_head_at_1(id)?
+            || anchor.database_id != id
+            || anchor.head_at_1_digest != anchor_digest(id)?
+        {
+            return Err(corrupt(source, "v4 bootstrap recovered relation mismatch"));
+        }
+        Ok(Self {
+            effects: BootstrapEffects { rows },
+            binding: (database_id, descriptor_count),
+            allocator,
+            head,
+            anchor,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CatalogOwnerProof {
+    root: PathBuf,
+    manifest: FileWitness,
+    pub(crate) installed: InstalledEndpoint,
+    pub(crate) cut: WalCut,
+    pub(crate) recovered_sequence: u64,
+    pub(crate) recovered_binding: ([u8; 16], u32),
+    pub(crate) recovered_allocator: Allocator,
+    pub(crate) bootstrap_effects: Option<BootstrapEffects>,
     pub(crate) effective: CatalogReplayState,
     pub(crate) wal_witnesses: Vec<WalFileWitness>,
 }
@@ -371,15 +489,20 @@ impl CatalogOwnerProof {
                 "v4 proof has a different writer root",
             ));
         }
-        let paths = narrow_paths(&self.root)?;
-        for expected in [&self.manifest, &self.segment] {
-            let (_, current) = read_bound(&expected.path, expected.len.max(1))?;
-            if &current != expected {
-                return Err(corrupt(&expected.path, "v4 installed file changed"));
-            }
+        let (_, current) = read_bound(&self.manifest.path, self.manifest.len.max(1))?;
+        if current != self.manifest || self.manifest.path != self.root.join("MANIFEST") {
+            return Err(corrupt(&self.manifest.path, "v4 MANIFEST changed"));
         }
-        if paths.manifest != self.manifest.path || paths.segment != self.segment.path {
-            return Err(corrupt(&self.root, "v4 installed namespace changed"));
+        match &self.installed {
+            InstalledEndpoint::Empty => empty_paths(&self.root)?,
+            InstalledEndpoint::FlushedBootstrap(installed) => {
+                let paths = narrow_paths(&self.root)?;
+                let segment = &installed.segment;
+                let (_, current) = read_bound(&segment.path, segment.len.max(1))?;
+                if current != *segment || paths.segment != segment.path {
+                    return Err(corrupt(&segment.path, "v4 installed segment changed"));
+                }
+            }
         }
         recheck_v4_wals(&self.root, self.cut, &self.wal_witnesses)
     }
@@ -532,6 +655,152 @@ fn narrow_paths(root: &Path) -> Result<NarrowPaths> {
     })
 }
 
+fn exact_named_children<const N: usize>(dir: &Path, expected: [&str; N]) -> Result<()> {
+    check_real(dir)?;
+    if !fs::symlink_metadata(dir)?.is_dir() {
+        return Err(corrupt(dir, "v4 empty-installed role is not a directory"));
+    }
+    let mut seen = [false; N];
+    for item in fs::read_dir(dir)? {
+        let item = item?;
+        let Some(index) = expected.iter().position(|name| item.file_name() == *name) else {
+            return Err(corrupt(&item.path(), "unexpected v4 empty-installed entry"));
+        };
+        if seen[index] {
+            return Err(corrupt(&item.path(), "duplicate v4 empty-installed entry"));
+        }
+        seen[index] = true;
+        check_real(&item.path())?;
+    }
+    if !seen.into_iter().all(|present| present) {
+        return Err(corrupt(dir, "v4 empty-installed role is incomplete"));
+    }
+    Ok(())
+}
+
+fn empty_paths(root: &Path) -> Result<()> {
+    exact_named_children(
+        root,
+        [
+            "MANIFEST",
+            crate::writer_lease::LOCK_FILE_NAME,
+            "wal",
+            "segments",
+            "values",
+            "checkpoints",
+            "tmp",
+        ],
+    )?;
+    let manifest = root.join("MANIFEST");
+    if !fs::symlink_metadata(&manifest)?.is_file() {
+        return Err(corrupt(
+            &manifest,
+            "v4 empty-installed MANIFEST is not a file",
+        ));
+    }
+    let lock = root.join(crate::writer_lease::LOCK_FILE_NAME);
+    let lock_meta = fs::symlink_metadata(&lock)?;
+    if !lock_meta.is_file() || lock_meta.len() != 0 {
+        return Err(corrupt(&lock, "v4 empty-installed lock artifact changed"));
+    }
+    let wal = root.join("wal");
+    exact_named_children(&wal, ["00000000000000000001.wal"])?;
+    let wal_file = wal.join("00000000000000000001.wal");
+    if !fs::symlink_metadata(&wal_file)?.is_file() {
+        return Err(corrupt(&wal_file, "v4 empty-installed WAL is not a file"));
+    }
+    let segments = root.join("segments");
+    exact_named_children(&segments, ["0", "1"])?;
+    for level in ["0", "1"] {
+        exact_named_children(&segments.join(level), [])?;
+    }
+    for role in ["values", "checkpoints", "tmp"] {
+        exact_named_children(&root.join(role), [])?;
+    }
+    Ok(())
+}
+
+fn inspect_unflushed_bootstrap(
+    lease: &WriterLease,
+    manifest: &Manifest,
+    manifest_witness: FileWitness,
+) -> Result<CatalogOwnerProof> {
+    let root = lease.root();
+    empty_paths(root)?;
+    let wal_path = root.join("wal/00000000000000000001.wal");
+    let record_authority = manifest
+        .record_authority
+        .as_ref()
+        .expect("validated v4 record authority");
+    let catalog_authority = manifest
+        .catalog_authority
+        .as_ref()
+        .expect("validated v4 catalog authority");
+    let id = record_authority.identity(&manifest_witness.path)?;
+    let context = FrameContext::new(record_authority, catalog_authority, &wal_path)?;
+    let cut = WalCut {
+        flushed_sequence: 0,
+        last_sequence: 1,
+        flushed_wal_id: 0,
+        active_wal_id: 1,
+        next_wal_id: 2,
+    };
+    let mut staged = None;
+    let wal_witnesses = scan_v4_wals(root, cut, |wal_id, start, end, record| {
+        if staged.is_some() || wal_id != 1 || start != 16 || end != 579 || record.sequence() != 1 {
+            return Err(corrupt(
+                &wal_path,
+                "unexpected v4 unflushed bootstrap frame",
+            ));
+        }
+        if !matches!(
+            record,
+            CoreWalRecord::Catalog {
+                control: CatalogControl::Bootstrap { .. },
+                ..
+            }
+        ) {
+            return Err(corrupt(&wal_path, "unexpected v4 unflushed frame kind"));
+        }
+        let validated = frame::validate_bootstrap(record, &context)?;
+        staged = Some(StagedBootstrap::from_validated(validated, id, &wal_path)?);
+        Ok(())
+    })?;
+    if wal_witnesses.len() != 1
+        || wal_witnesses[0].id != 1
+        || wal_witnesses[0].record_count != 1
+        || wal_witnesses[0].catalog_bootstraps != 1
+        || wal_witnesses[0].catalog_creates != 0
+        || wal_witnesses[0].first_sequence != Some(1)
+        || wal_witnesses[0].last_sequence != Some(1)
+        || wal_witnesses[0].full_len != 579
+        || wal_witnesses[0].prefix_len != 579
+        || wal_witnesses[0].torn_start.is_some()
+    {
+        return Err(corrupt(
+            &wal_path,
+            "v4 unflushed bootstrap WAL is incomplete or has an extra tail",
+        ));
+    }
+    let staged =
+        staged.ok_or_else(|| corrupt(&wal_path, "missing v4 unflushed bootstrap frame"))?;
+    let effective = CatalogReplayState::from_head_anchor(staged.head, staged.anchor, &wal_path)?;
+    let proof = CatalogOwnerProof {
+        root: root.to_path_buf(),
+        manifest: manifest_witness,
+        installed: InstalledEndpoint::Empty,
+        cut,
+        recovered_sequence: 1,
+        recovered_binding: staged.binding,
+        recovered_allocator: staged.allocator,
+        bootstrap_effects: Some(staged.effects),
+        effective,
+        wal_witnesses,
+    };
+    proof.recheck(lease)?;
+    Ok(proof)
+}
+
 pub(crate) fn inspect_v4_owner(
     lease: &WriterLease,
     config: &PraxisConfig,
@@ -542,34 +811,47 @@ pub(crate) fn inspect_v4_owner(
     if fs::canonicalize(&config.data_dir)? != root {
         return Err(corrupt(root, "v4 config and writer lease roots differ"));
     }
-    let paths = narrow_paths(root)?;
-    let (manifest_bytes, manifest_witness) = read_bound(&paths.manifest, MAX_MANIFEST_BYTES)?;
-    let manifest = Manifest::decode(&manifest_bytes, &paths.manifest)?;
+    let manifest_path = root.join("MANIFEST");
+    let (manifest_bytes, manifest_witness) = read_bound(&manifest_path, MAX_MANIFEST_BYTES)?;
+    let manifest = Manifest::decode(&manifest_bytes, &manifest_path)?;
     if manifest.format_version != 4 || manifest.effective_config != config.persisted() {
-        return Err(corrupt(&paths.manifest, "v4 config or format mismatch"));
+        return Err(corrupt(&manifest_path, "v4 config or format mismatch"));
     }
-    // This is the first physical proof slice, not a general F/L/R owner.
-    if manifest.flushed_sequence != 1
-        || manifest.last_sequence != 1
-        || manifest.flushed_wal_id != 1
-        || manifest.active_wal_id != 2
-        || manifest.next_wal_id != 3
-        || manifest.next_segment_id != 2
-        || manifest.next_column_family_generation != 6
+    let common_invalid = manifest.next_column_family_generation != 6
         || manifest.column_families.len() != 6
         || manifest.column_family_generations.len() != 6
-        || manifest.segments.len() != 1
         || manifest.latest_checkpoint.is_some()
         || !manifest.compaction_jobs.is_empty()
         || !manifest.tier_migrations.is_empty()
         || manifest
             .record_authority
             .as_ref()
-            .is_none_or(|r| r.index_descriptor_count != 0)
-    {
+            .is_none_or(|r| r.index_descriptor_count != 0);
+    let unflushed = manifest.flushed_sequence == 0
+        && manifest.last_sequence == 1
+        && manifest.flushed_wal_id == 0
+        && manifest.active_wal_id == 1
+        && manifest.next_wal_id == 2
+        && manifest.next_segment_id == 1
+        && manifest.segments.is_empty();
+    let flushed = manifest.flushed_sequence == 1
+        && manifest.last_sequence == 1
+        && manifest.flushed_wal_id == 1
+        && manifest.active_wal_id == 2
+        && manifest.next_wal_id == 3
+        && manifest.next_segment_id == 2
+        && manifest.segments.len() == 1;
+    if common_invalid || (!unflushed && !flushed) {
         return Err(PraxisError::UnsupportedCatalogFeature {
-            feature: "v4 installed cut beyond retired D0 bootstrap",
+            feature: "v4 installed cut beyond narrow D0 bootstrap",
         });
+    }
+    if unflushed {
+        return inspect_unflushed_bootstrap(lease, &manifest, manifest_witness);
+    }
+    let paths = narrow_paths(root)?;
+    if paths.manifest != manifest_path {
+        return Err(corrupt(root, "v4 MANIFEST role changed"));
     }
     let meta = &manifest.segments[0];
     if meta.id != 1
@@ -726,7 +1008,7 @@ pub(crate) fn inspect_v4_owner(
         next_wal_id: manifest.next_wal_id,
     };
     let wal_path = root.join("wal/00000000000000000002.wal");
-    let mut effective = CatalogReplayState::from_installed(head, anchor, &wal_path)?;
+    let mut effective = CatalogReplayState::from_head_anchor(head, anchor, &wal_path)?;
     let context = FrameContext::new(
         manifest
             .record_authority
@@ -784,13 +1066,18 @@ pub(crate) fn inspect_v4_owner(
     let proof = CatalogOwnerProof {
         root: root.to_path_buf(),
         manifest: manifest_witness,
-        segment: segment_witness,
+        installed: InstalledEndpoint::FlushedBootstrap(Box::new(FlushedBootstrap {
+            segment: segment_witness,
+            binding,
+            allocator,
+            head,
+            anchor,
+        })),
         cut,
         recovered_sequence,
-        binding,
-        allocator,
-        head,
-        anchor,
+        recovered_binding: binding,
+        recovered_allocator: allocator,
+        bootstrap_effects: None,
         effective,
         wal_witnesses,
     };
