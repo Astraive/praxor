@@ -4,6 +4,8 @@
 //! durable. This module never hands out a writable owner on partial evidence.
 
 mod authority;
+#[allow(dead_code)] // The private format codec is wired into WAL relations in the next B1 slice.
+mod codec;
 mod database;
 
 pub use authority::{CatalogAuthorityV1, CatalogBindingV1};
