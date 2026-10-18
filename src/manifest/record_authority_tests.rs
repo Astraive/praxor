@@ -201,3 +201,94 @@ fn v3_later_user_family_and_legacy_zero_or_zero_floor_families_remain_supported(
         assert!(decode(&manifest).is_ok());
     }
 }
+
+fn legacy_header_fixture(version: u32) -> String {
+    let mut manifest = if version == 3 {
+        valid()
+    } else {
+        Manifest::fresh(&PraxisConfig::default())
+    };
+    manifest.format_version = version;
+    let mut wire = toml::Value::try_from(&manifest).unwrap();
+    if version == 1 {
+        // A genuine v1 file has neither generation field on disk. Its
+        // in-memory upgrade to v2 happens only after the header is checked.
+        let fields = wire.as_table_mut().unwrap();
+        fields.remove("column_family_generations");
+        fields.remove("next_column_family_generation");
+    }
+    let bytes = toml::to_string(&wire).unwrap();
+    let decoded = Manifest::decode(bytes.as_bytes(), Path::new("legacy-fixture")).unwrap();
+    assert_eq!(
+        decoded.format_version,
+        if version == 1 { 2 } else { version }
+    );
+    bytes
+}
+
+fn assert_legacy_catalog_field_is_rejected(version: u32) {
+    let fixture = legacy_header_fixture(version);
+    let forms = [
+        format!("catalog_authority = false\n{fixture}"),
+        format!("{fixture}\n[catalog_authority]\n"),
+        format!("{fixture}\n[catalog_authority]\nkind = \"core_catalog\"\nschema_version = 1\n"),
+    ];
+    for (index, bytes) in forms.iter().enumerate() {
+        assert!(
+            matches!(
+                Manifest::decode(bytes.as_bytes(), Path::new("legacy-catalog-field")),
+                Err(PraxisError::Corrupt { .. })
+            ),
+            "v{version} accepted catalog_authority form {index}"
+        );
+    }
+}
+
+#[test]
+fn legacy_catalog_authority_v1_presence_is_rejected() {
+    assert_legacy_catalog_field_is_rejected(1);
+}
+
+#[test]
+fn legacy_catalog_authority_v2_presence_is_rejected() {
+    assert_legacy_catalog_field_is_rejected(2);
+}
+
+#[test]
+fn legacy_catalog_authority_v3_presence_is_rejected() {
+    assert_legacy_catalog_field_is_rejected(3);
+}
+
+#[test]
+fn legacy_unknown_top_level_field_remains_permitted() {
+    for version in 1..=3 {
+        let bytes = format!(
+            "unrelated_future_field = true\n{}",
+            legacy_header_fixture(version)
+        );
+        let decoded = Manifest::decode(bytes.as_bytes(), Path::new("legacy-future-field")).unwrap();
+        assert_eq!(
+            decoded.format_version,
+            if version == 1 { 2 } else { version }
+        );
+    }
+}
+
+#[test]
+fn v2_generic_owner_reopens_with_unrelated_top_level_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = PraxisConfig::new(dir.path());
+    let engine = crate::PraxisEngine::open(config.clone()).unwrap();
+    engine.put("legacy-key", "legacy-value").unwrap();
+    drop(engine);
+
+    let path = dir.path().join("MANIFEST");
+    let original = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("unrelated_future_field = true\n{original}")).unwrap();
+
+    let reopened = crate::PraxisEngine::open(config).unwrap();
+    assert_eq!(
+        reopened.get("legacy-key").unwrap(),
+        Some(bytes::Bytes::from_static(b"legacy-value"))
+    );
+}

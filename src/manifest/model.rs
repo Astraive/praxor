@@ -76,6 +76,7 @@ impl Manifest {
         struct Header {
             format_version: u32,
             record_authority: Option<serde::de::IgnoredAny>,
+            catalog_authority: Option<serde::de::IgnoredAny>,
             column_family_generations: Option<serde::de::IgnoredAny>,
             next_column_family_generation: Option<serde::de::IgnoredAny>,
         }
@@ -89,6 +90,11 @@ impl Manifest {
         };
         if !matches!(header.format_version, 1..=3) {
             return Err(corrupt("unsupported manifest format version"));
+        }
+        if header.catalog_authority.is_some() {
+            return Err(corrupt(
+                "legacy manifest contains catalog authority metadata",
+            ));
         }
         if header.format_version < 3 && header.record_authority.is_some() {
             return Err(corrupt(
