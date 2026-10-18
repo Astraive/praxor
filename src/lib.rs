@@ -83,7 +83,8 @@ pub use query::{
 pub use query::{
     BoundSelect, ByteSpan, CompileInput, CompiledStatement, ExplainV1, ParameterValue,
     PredicateShapeOp, ProjectedRow, QueryCatalogAuthority, QueryCatalogView, QueryCompileError,
-    TypedParameters, compile, execute_in_memory,
+    QueryDocumentReason, QueryGateway, QueryReadError, QueryReadView, QueryResult, TypedParameters,
+    compile, execute_in_memory,
 };
 pub use storage::lsm::LsmIndex;
 pub use store::RecordId;
