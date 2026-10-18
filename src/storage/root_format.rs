@@ -96,6 +96,8 @@ pub enum RootKind {
     Empty,
     CoreLegacy,
     CoreRecords,
+    /// Structurally valid v4 manifest; physical catalog recovery is separate.
+    CoreCatalog,
     PointerLegacy,
     /// Proven empty standalone primary prepared for its pointer owner.
     PointerScaffold,
@@ -195,7 +197,7 @@ impl RootInspection {
         }
         let owner = match self.kind {
             RootKind::Absent | RootKind::Empty => return Ok(()),
-            RootKind::CoreLegacy | RootKind::CoreRecords => RootOwner::Core,
+            RootKind::CoreLegacy | RootKind::CoreRecords | RootKind::CoreCatalog => RootOwner::Core,
             RootKind::PointerLegacy | RootKind::PointerScaffold => RootOwner::Pointer,
             RootKind::RecordLegacy => RootOwner::Record,
             RootKind::PageLegacy | RootKind::PageScaffold => RootOwner::Page,
@@ -231,6 +233,31 @@ impl RootInspection {
                 evidence: evidence(),
             })
         }
+    }
+
+    /// Legacy core recovery and offline restore may inspect, but must never
+    /// adopt a structurally recognized catalog owner.
+    pub(crate) fn reject_catalog_for_legacy_core(&self) -> Result<()> {
+        if let Some(manifest) = self.evidence.iter().find(|item| {
+            item.owner == RootOwner::Core
+                && item.role == "authoritative manifest"
+                && item.version == Some(4)
+        }) {
+            return Err(unsupported_catalog_for_legacy_core(
+                &self.requested_path,
+                &manifest.path,
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn unsupported_catalog_for_legacy_core(root: &Path, manifest: &Path) -> PraxisError {
+    PraxisError::StorageFormatUnsupported {
+        path: root.to_path_buf(),
+        expected: RootOwner::Core,
+        reason: "catalog format version 4 requires a validated catalog owner".into(),
+        evidence: vec![manifest.to_path_buf()],
     }
 }
 
@@ -962,7 +989,7 @@ impl Inspector {
             std::str::from_utf8(&bytes).map_err(|_| damaged(&path, "manifest is not UTF-8"))?;
         let header: Header = toml::from_str(text)
             .map_err(|err| damaged(&path, &format!("invalid typed manifest header: {err}")))?;
-        if !matches!(header.format_version, 1..=3) {
+        if !matches!(header.format_version, 1..=4) {
             return Err(unsupported(
                 &path,
                 "core manifest",
@@ -1024,10 +1051,10 @@ impl Inspector {
                 "tmp",
             ],
         );
-        Ok(if header.format_version == 3 {
-            RootKind::CoreRecords
-        } else {
-            RootKind::CoreLegacy
+        Ok(match header.format_version {
+            4 => RootKind::CoreCatalog,
+            3 => RootKind::CoreRecords,
+            _ => RootKind::CoreLegacy,
         })
     }
 
@@ -1459,6 +1486,18 @@ impl Inspector {
                 "temporary manifest contains a foreign owner's control format",
             ));
         }
+        if owner == RootOwner::Core {
+            #[derive(Deserialize)]
+            struct Header {
+                format_version: u32,
+            }
+            if let Ok(text) = std::str::from_utf8(&bytes)
+                && let Ok(Header { format_version: 4 }) = toml::from_str::<Header>(text)
+            {
+                Manifest::decode(&bytes, &path).map_err(|err| damaged(&path, &err.to_string()))?;
+                return Err(unsupported(&path, "core temporary manifest", 4));
+            }
+        }
         Ok(())
     }
 
@@ -1772,7 +1811,7 @@ fn unsupported(path: &Path, format: &'static str, version: u64) -> InspectionDia
     diagnostic(
         path,
         DiagnosticKind::UnsupportedVersion { format, version },
-        "unsupported physical format version",
+        &format!("{format} format version {version} is unsupported"),
     )
 }
 fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {

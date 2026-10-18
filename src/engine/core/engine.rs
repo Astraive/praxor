@@ -187,16 +187,23 @@ impl PraxisEngine {
     pub fn open(config: PraxisConfig) -> Result<Self> {
         config.validate()?;
         let writer_lease = WriterLease::acquire(&config.data_dir)?;
-        crate::storage::root_format::inspect_storage_root(
+        let report = crate::storage::root_format::inspect_storage_root(
             writer_lease.root(),
             crate::storage::root_format::InspectionOptions::for_admission(),
-        )?
-        .require_compatible(crate::storage::root_format::RootOwner::Core)?;
+        )?;
+        report.require_compatible(crate::storage::root_format::RootOwner::Core)?;
+        report.reject_catalog_for_legacy_core()?;
         if writer_lease.root().join("MANIFEST").exists() {
-            let manifest = crate::manifest::Manifest::decode(
-                &fs::read(writer_lease.root().join("MANIFEST"))?,
-                &writer_lease.root().join("MANIFEST"),
-            )?;
+            let source = writer_lease.root().join("MANIFEST");
+            let manifest = crate::manifest::Manifest::decode(&fs::read(&source)?, &source)?;
+            if manifest.format_version == 4 {
+                return Err(
+                    crate::storage::root_format::unsupported_catalog_for_legacy_core(
+                        writer_lease.root(),
+                        &source,
+                    ),
+                );
+            }
             if manifest.record_authority.is_some() {
                 return Err(PraxisError::RecordAuthorityOpenRequired {
                     path: writer_lease.root().to_path_buf(),
@@ -2134,11 +2141,12 @@ impl PraxisEngine {
             ));
         }
         let source = WriterLease::acquire(backup_dir)?;
-        crate::storage::root_format::inspect_storage_root(
+        let report = crate::storage::root_format::inspect_storage_root(
             source.root(),
             crate::storage::root_format::InspectionOptions::for_admission(),
-        )?
-        .require_compatible(crate::storage::root_format::RootOwner::Core)?;
+        )?;
+        report.require_compatible(crate::storage::root_format::RootOwner::Core)?;
+        report.reject_catalog_for_legacy_core()?;
         let source_primary = lease_existing_primary(&source)?;
         validate_copy_tree(
             source.root(),

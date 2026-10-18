@@ -1,8 +1,12 @@
 use praxis::core_catalog::{CatalogAuthorityV1, CatalogBindingV1};
 use praxis::manifest::{
-    ColumnFamilyDescriptor, ColumnFamilyGeneration, ColumnFamilyOptions, ManifestStore,
+    ColumnFamilyDescriptor, ColumnFamilyGeneration, ColumnFamilyOptions, CompactionJobState,
+    CompactionJobStatus, ManifestStore,
 };
-use praxis::{CoreDatabase, PraxisConfig, PraxisEngine, PraxisError, RecordAuthorityOptions};
+use praxis::storage::root_format::{InspectionOptions, RootKind, RootOwner, inspect_storage_root};
+use praxis::{
+    CatalogDatabase, CoreDatabase, PraxisConfig, PraxisEngine, PraxisError, RecordAuthorityOptions,
+};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -104,6 +108,279 @@ fn v3_shell(root: &Path) {
             .unwrap(),
     );
     std::fs::write(root.join(".praxor.writer.lock"), b"existing lock bytes").unwrap();
+}
+
+fn running_job(root: &Path) {
+    let path = root.join("MANIFEST");
+    let mut manifest = ManifestStore::new(&path)
+        .load_or_create(&PraxisConfig::new(root))
+        .unwrap();
+    manifest.compaction_jobs.push(CompactionJobState {
+        id: 1,
+        strategy: praxis::CompactionStrategy::Leveled,
+        status: CompactionJobStatus::Running,
+        source_segment_ids: vec![],
+        output_segment_id: None,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+    });
+    ManifestStore::new(path).save(&manifest).unwrap();
+}
+
+#[test]
+fn v3_old_open_refuses_complete_v4_temporary_control_before_job_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("owner");
+    v3_shell(&root);
+    let v4 = strict_v4_from_v3(&root);
+    running_job(&root);
+    std::fs::write(root.join("MANIFEST.tmp"), v4).unwrap();
+    let before = tree(&root);
+    let canonical = root.canonicalize().unwrap();
+
+    let error = match CoreDatabase::open(PraxisConfig::new(&root)) {
+        Ok(database) => {
+            drop(database);
+            None
+        }
+        Err(error) => Some(error),
+    };
+    let after = tree(&root);
+    assert!(
+        matches!(error, Some(PraxisError::StorageFormatUnsupported { ref reason, ref evidence, .. })
+            if reason.contains('4') && evidence.contains(&canonical.join("MANIFEST.tmp"))),
+        "old open did not identify the v4 temporary control: {error:?}; tree changed={}",
+        after != before
+    );
+    assert_eq!(
+        after, before,
+        "old open changed control, WAL, or lock bytes"
+    );
+}
+
+#[test]
+fn v2_generic_open_refuses_complete_v4_temporary_control_before_job_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("legacy-owner");
+    let engine = PraxisEngine::open(PraxisConfig::new(&root)).unwrap();
+    engine.put("legacy-row", "keep").unwrap();
+    drop(engine);
+    std::fs::write(root.join(".praxor.writer.lock"), b"existing lock bytes").unwrap();
+    let fixture = dir.path().join("v3-fixture");
+    v3_shell(&fixture);
+    let v4 = strict_v4_from_v3(&fixture);
+    running_job(&root);
+    std::fs::write(root.join("MANIFEST.tmp"), v4).unwrap();
+    let before = tree(&root);
+    let canonical = root.canonicalize().unwrap();
+
+    let error = match PraxisEngine::open(PraxisConfig::new(&root)) {
+        Ok(engine) => {
+            drop(engine);
+            None
+        }
+        Err(error) => Some(error),
+    };
+    let after = tree(&root);
+    assert!(
+        matches!(error, Some(PraxisError::StorageFormatUnsupported { ref reason, ref evidence, .. })
+            if reason.contains('4') && evidence.contains(&canonical.join("MANIFEST.tmp"))),
+        "generic open did not identify the v4 temporary control: {error:?}; tree changed={}",
+        after != before
+    );
+    assert_eq!(
+        after, before,
+        "generic open changed control, WAL, or lock bytes"
+    );
+}
+
+#[test]
+fn strict_v4_manifest_is_classified_as_a_core_catalog_shell() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("owner");
+    v3_shell(&root);
+    std::fs::write(root.join("MANIFEST"), strict_v4_from_v3(&root)).unwrap();
+    let before = tree(&root);
+
+    let report = inspect_storage_root(&root, InspectionOptions::default()).unwrap();
+    assert_eq!(report.kind, RootKind::CoreCatalog, "{report:#?}");
+    assert!(
+        report.evidence.iter().any(|item| {
+            item.owner == RootOwner::Core
+                && item.role == "authoritative manifest"
+                && item.version == Some(4)
+        }),
+        "v4 format evidence was lost: {report:#?}"
+    );
+    report.require_compatible(RootOwner::Core).unwrap();
+    assert_eq!(tree(&root), before, "classification changed the root");
+}
+
+#[test]
+fn strict_v4_shell_cannot_enter_catalog_or_old_writable_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("owner");
+    v3_shell(&root);
+    std::fs::write(root.join("MANIFEST"), strict_v4_from_v3(&root)).unwrap();
+    let before = tree(&root);
+    let canonical = root.canonicalize().unwrap();
+
+    let catalog = CatalogDatabase::open_catalog(PraxisConfig::new(&root));
+    assert!(
+        matches!(catalog, Err(PraxisError::UnsupportedCatalogFeature { .. })),
+        "catalog open should stay unavailable until physical v4 validation exists"
+    );
+    assert_eq!(
+        tree(&root),
+        before,
+        "catalog open modified a structural shell"
+    );
+
+    let create = CatalogDatabase::create_fresh_v4(
+        PraxisConfig::new(&root),
+        RecordAuthorityOptions::default(),
+    );
+    assert!(
+        matches!(create, Err(PraxisError::StorageFormatUnsupported { .. })),
+        "fresh catalog create accepted an existing shell"
+    );
+    assert_eq!(
+        tree(&root),
+        before,
+        "catalog create modified an existing shell"
+    );
+
+    let generic = PraxisEngine::open(PraxisConfig::new(&root));
+    assert!(
+        matches!(generic, Err(PraxisError::StorageFormatUnsupported { ref reason, ref evidence, .. })
+            if reason.contains('4') && evidence.contains(&canonical.join("MANIFEST"))),
+        "generic open did not identify format 4"
+    );
+    assert_eq!(tree(&root), before, "generic open modified a v4 shell");
+
+    let records = CoreDatabase::open(PraxisConfig::new(&root));
+    assert!(
+        matches!(records, Err(PraxisError::StorageFormatUnsupported { ref reason, ref evidence, .. })
+            if reason.contains('4') && evidence.contains(&canonical.join("MANIFEST"))),
+        "v3 record open did not identify format 4"
+    );
+    assert_eq!(tree(&root), before, "v3 record open modified a v4 shell");
+}
+
+#[test]
+fn strict_v4_backup_source_refuses_before_creating_a_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    v3_shell(&source);
+    std::fs::write(source.join("MANIFEST"), strict_v4_from_v3(&source)).unwrap();
+    let before = tree(&source);
+    let canonical = source.canonicalize().unwrap();
+    let target = dir.path().join("absent-target");
+    assert!(!target.exists());
+
+    let result = PraxisEngine::restore_from_backup(&source, &target);
+    assert!(
+        matches!(result, Err(PraxisError::StorageFormatUnsupported { ref reason, ref evidence, .. })
+            if reason.contains('4') && evidence.contains(&canonical.join("MANIFEST"))),
+        "restore source did not identify format 4: {result:?}"
+    );
+    assert!(
+        !target.exists(),
+        "restore created the target before source admission"
+    );
+    assert_eq!(tree(&source), before, "restore altered the source tree");
+}
+
+#[test]
+fn strict_v4_temporary_backup_source_refuses_before_creating_a_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    v3_shell(&source);
+    std::fs::write(source.join("MANIFEST.tmp"), strict_v4_from_v3(&source)).unwrap();
+    let before = tree(&source);
+    let canonical = source.canonicalize().unwrap();
+    let target = dir.path().join("absent-target");
+
+    let result = PraxisEngine::restore_from_backup(&source, &target);
+    assert!(
+        matches!(result, Err(PraxisError::StorageFormatUnsupported { ref reason, ref evidence, .. })
+            if reason.contains('4') && evidence.contains(&canonical.join("MANIFEST.tmp"))),
+        "restore source did not identify the v4 temporary control: {result:?}"
+    );
+    assert!(
+        !target.exists(),
+        "restore created the target before source admission"
+    );
+    assert_eq!(tree(&source), before, "restore altered the source tree");
+}
+
+#[test]
+fn malformed_v4_temporary_control_keeps_old_open_incomplete() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("owner");
+    v3_shell(&root);
+    std::fs::write(
+        root.join("MANIFEST.tmp"),
+        b"format_version = 4\n[catalog_authority]\n",
+    )
+    .unwrap();
+    let before = tree(&root);
+    let result = CoreDatabase::open(PraxisConfig::new(&root));
+    assert!(
+        matches!(result, Err(PraxisError::StorageFormatIncomplete { .. })),
+        "malformed v4 temporary control changed refusal family"
+    );
+    assert_eq!(tree(&root), before);
+}
+
+#[test]
+fn aliased_temporary_control_keeps_old_open_incomplete_without_following_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("owner");
+    v3_shell(&root);
+    let outside = dir.path().join("outside-v4-control");
+    std::fs::write(&outside, strict_v4_from_v3(&root)).unwrap();
+    file_alias(&outside, &root.join("MANIFEST.tmp"));
+    let before = tree(&root);
+    let outside_before = std::fs::read(&outside).unwrap();
+
+    let result = CoreDatabase::open(PraxisConfig::new(&root));
+    assert!(
+        matches!(result, Err(PraxisError::StorageFormatIncomplete { .. })),
+        "aliased temporary control changed refusal family"
+    );
+    assert_eq!(tree(&root), before);
+    assert_eq!(std::fs::read(&outside).unwrap(), outside_before);
+}
+
+#[test]
+fn ordinary_old_temporary_controls_still_allow_old_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let records_root = dir.path().join("records");
+    v3_shell(&records_root);
+    std::fs::copy(
+        records_root.join("MANIFEST"),
+        records_root.join("MANIFEST.tmp"),
+    )
+    .unwrap();
+    let records = CoreDatabase::open(PraxisConfig::new(&records_root)).unwrap();
+    assert_eq!(records.kv().snapshot().sequence, 1);
+    drop(records);
+
+    let legacy_root = dir.path().join("legacy");
+    let legacy = PraxisEngine::open(PraxisConfig::new(&legacy_root)).unwrap();
+    legacy.put("legacy-row", "keep").unwrap();
+    drop(legacy);
+    std::fs::copy(
+        legacy_root.join("MANIFEST"),
+        legacy_root.join("MANIFEST.tmp"),
+    )
+    .unwrap();
+    let reopened = PraxisEngine::open(PraxisConfig::new(&legacy_root)).unwrap();
+    assert_eq!(
+        reopened.get("legacy-row").unwrap().unwrap().as_ref(),
+        b"keep"
+    );
 }
 
 #[test]

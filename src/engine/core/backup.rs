@@ -612,6 +612,7 @@ fn fence_v4_destination(
                 item.kind,
                 DiagnosticKind::UnsupportedVersion { version: 4, .. }
                     if item.path == root.join("MANIFEST")
+                        || item.path == root.join("MANIFEST.tmp")
             )
         })
     {
