@@ -128,6 +128,16 @@ impl MemTable {
             .map(|((_, key), _)| key)
     }
 
+    /// Borrow every physical key in one column family, including keys whose
+    /// versions may be newer than a retained read view. The caller resolves
+    /// visibility after releasing its tier guards.
+    pub(crate) fn keys_in_cf<'a>(&'a self, cf: &'a ColumnFamily) -> impl Iterator<Item = &'a Key> {
+        self.entries
+            .range((cf.clone(), Bytes::new())..)
+            .take_while(move |((entry_cf, _), _)| entry_cf == cf)
+            .map(|((_, key), _)| key)
+    }
+
     pub fn drain_latest(&self) -> Vec<(ColumnFamily, Key, VersionedValue)> {
         self.entries
             .iter()

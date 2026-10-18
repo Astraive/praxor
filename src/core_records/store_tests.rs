@@ -1,5 +1,11 @@
 use super::*;
+use crate::core_records::{CoreRecordScanError, RecordScanLimits};
+use crate::query::{QueryGateway, QueryReadError, QueryReadView, QueryResult, TypedParameters};
+use crate::types::{StoredValue, VersionedValue};
 use crate::{CoreDatabase, MappingDescriptor, PraxisConfig, RecordAuthorityOptions};
+use std::cell::Cell;
+use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -50,6 +56,23 @@ fn disk_versions(db: &CoreDatabase, role: Role, key: Key<'_>) -> Vec<crate::type
         ))
         .cloned()
         .unwrap_or_default()
+}
+
+fn inject_raw_at(
+    db: &CoreDatabase,
+    sequence: u64,
+    role: Role,
+    key: Vec<u8>,
+    value: Option<Vec<u8>>,
+) {
+    let mut batch = crate::WriteBatch::new();
+    match value {
+        Some(value) => batch.put(role.cf(), key, value),
+        None => batch.delete(role.cf(), key),
+    };
+    for op in batch.ops() {
+        db.kv().inner.memtable.write().apply(sequence, op);
+    }
 }
 
 #[test]
@@ -827,6 +850,1546 @@ fn raw_range_skips_future_fact_keys_added_after_the_one_current_pin() {
         records.lookup_rid_at("kv", b"k", u64::MAX).unwrap(),
         Some(new)
     );
+}
+
+#[test]
+fn scan_rejects_a_visible_malformed_physical_state_key() {
+    let (_dir, _config, db) = database();
+    let records = db.records();
+    records.put(b"v", &[]).unwrap();
+    let held = records.pin_snapshot().unwrap();
+    let engine = db.kv();
+    // A tag below the first canonical RID is physically present and visible at
+    // this pin, but cannot be decoded as any State key.
+    let malformed = vec![0];
+    assert!(Key::decode(Role::State, &malformed, engine.inner.layout.root()).is_err());
+    let mut batch = crate::WriteBatch::new();
+    batch.put(
+        Role::State.cf(),
+        malformed.clone(),
+        Row::State {
+            live: false,
+            payload_length: 0,
+        }
+        .encode()
+        .unwrap(),
+    );
+    for op in batch.ops() {
+        engine
+            .inner
+            .memtable
+            .write()
+            .apply(held.core_sequence(), op);
+    }
+    assert!(
+        engine
+            .resolve_value_at_snapshot(
+                &ColumnFamily(Role::State.cf().into()),
+                &malformed,
+                held.core_sequence(),
+            )
+            .unwrap()
+            .is_some(),
+        "the malformed physical State key is visible at the retained pin"
+    );
+
+    assert!(matches!(
+        records.scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1()),
+        Err(CoreRecordScanError::Storage(PraxisError::Corrupt { .. }))
+    ));
+}
+
+#[test]
+fn scan_rejects_a_missing_live_state_even_when_the_candidate_set_is_empty() {
+    let (_dir, _config, db) = database();
+    let records = db.records();
+    let rid = records.put(b"v", &[]).unwrap();
+    let held = records.pin_snapshot().unwrap();
+    let allocator_key = Key::Allocator;
+    let allocator_bytes = records
+        .value(
+            Role::Meta,
+            &allocator_key,
+            held.pin_for(&records.engine).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    let Row::Allocator(allocator) = Row::decode(
+        &allocator_key,
+        &allocator_bytes,
+        db.kv().inner.layout.root(),
+    )
+    .unwrap() else {
+        panic!("the retained view must have an allocator row");
+    };
+    assert_eq!(allocator.live_count, 1);
+    assert_eq!(allocator.live_payload_bytes, 1);
+
+    // Remove the only physical State key without changing the allocator. This
+    // simulates a missing physical live row rather than a logical tombstone.
+    let engine = db.kv();
+    let state_cf = ColumnFamily(Role::State.cf().into());
+    engine.inner.memtable.write().remove_cf(&state_cf);
+    assert!(
+        engine
+            .resolve_value_at_snapshot(
+                &state_cf,
+                &Key::State(rid.0).encode().unwrap(),
+                held.core_sequence(),
+            )
+            .unwrap()
+            .is_none(),
+        "the live State key must really be physically absent at the retained pin"
+    );
+
+    assert!(matches!(
+        records.scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1()),
+        Err(CoreRecordScanError::Storage(PraxisError::Corrupt { .. }))
+    ));
+}
+
+#[test]
+fn scan_returns_only_live_rows_in_rid_order_and_skips_post_pin_keys() {
+    let (_dir, _config, db) = database();
+    let records = db.records();
+    let empty = records.pin_snapshot().unwrap();
+    assert!(
+        records
+            .scan_live_at_snapshot(&empty, RecordScanLimits::fixture_v1())
+            .unwrap()
+            .is_empty()
+    );
+    drop(empty);
+
+    let first = records.put(b"first", &[]).unwrap();
+    let second = records.put(b"second", &[]).unwrap();
+    let old = records.pin_snapshot().unwrap();
+    let old_clone = old.clone();
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 1);
+    records.delete_record(second).unwrap();
+    let third = records.put(b"third", &[]).unwrap();
+    let latest = records.pin_snapshot().unwrap();
+    assert_eq!(
+        records
+            .scan_live_at_snapshot(&old, RecordScanLimits::fixture_v1())
+            .unwrap(),
+        vec![(first, b"first".to_vec()), (second, b"second".to_vec())]
+    );
+    assert_eq!(
+        records
+            .scan_live_at_snapshot(&latest, RecordScanLimits::fixture_v1())
+            .unwrap(),
+        vec![(first, b"first".to_vec()), (third, b"third".to_vec())]
+    );
+    drop(old);
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 2);
+    drop(old_clone);
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 1);
+    drop(latest);
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 0);
+}
+
+#[test]
+fn scan_resolves_raw_visibility_before_decoding_a_future_malformed_key() {
+    let (_dir, _config, db) = database();
+    let records = db.records();
+    let rid = records.put(b"old", &[]).unwrap();
+    let held = records.pin_snapshot().unwrap();
+    inject_raw_at(
+        &db,
+        held.core_sequence() + 1,
+        Role::State,
+        vec![0],
+        Some(
+            Row::State {
+                live: false,
+                payload_length: 0,
+            }
+            .encode()
+            .unwrap(),
+        ),
+    );
+    assert_eq!(
+        records
+            .scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1())
+            .unwrap(),
+        vec![(rid, b"old".to_vec())]
+    );
+}
+
+#[test]
+fn scan_rejects_missing_dead_state_and_extra_live_or_dead_rid() {
+    {
+        let (_dir, _config, db) = database();
+        let records = db.records();
+        records.put(b"live", &[]).unwrap();
+        let dead = records.put(b"dead", &[]).unwrap();
+        records.delete_record(dead).unwrap();
+        records.flush().unwrap();
+        let held = records.pin_snapshot().unwrap();
+        let removed = db.kv().inner.segment_index.write().remove(&(
+            ColumnFamily(Role::State.cf().into()),
+            Bytes::from(Key::State(dead.0).encode().unwrap()),
+        ));
+        assert!(removed.is_some());
+        assert!(matches!(
+            records.scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1()),
+            Err(CoreRecordScanError::Storage(PraxisError::Corrupt { .. }))
+        ));
+    }
+    for live in [false, true] {
+        let (_dir, _config, db) = database();
+        let records = db.records();
+        records.put(b"one", &[]).unwrap();
+        let held = records.pin_snapshot().unwrap();
+        inject_raw_at(
+            &db,
+            held.core_sequence(),
+            Role::State,
+            Key::State(2).encode().unwrap(),
+            Some(
+                Row::State {
+                    live,
+                    payload_length: if live { 1 } else { 0 },
+                }
+                .encode()
+                .unwrap(),
+            ),
+        );
+        assert!(matches!(
+            records.scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1()),
+            Err(CoreRecordScanError::Storage(PraxisError::Corrupt { .. }))
+        ));
+    }
+}
+
+#[test]
+fn scan_rejects_first_middle_and_last_missing_payload_without_partial_success() {
+    for failed_index in 0..3 {
+        let (_dir, _config, db) = database();
+        let records = db.records();
+        let ids: Vec<_> = [b"one".as_slice(), b"two".as_slice(), b"three".as_slice()]
+            .iter()
+            .map(|payload| records.put(payload, &[]).unwrap())
+            .collect();
+        let held = records.pin_snapshot().unwrap();
+        inject_raw_at(
+            &db,
+            held.core_sequence(),
+            Role::Payload,
+            Key::Payload(ids[failed_index].0).encode().unwrap(),
+            None,
+        );
+        assert!(matches!(
+            records.scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1()),
+            Err(CoreRecordScanError::Storage(PraxisError::Corrupt { .. }))
+        ));
+    }
+}
+
+#[test]
+fn scan_refuses_raw_key_and_allocator_limits_with_typed_errors() {
+    let (_dir, _config, db) = database();
+    let records = db.records();
+    records.put(b"one", &[]).unwrap();
+    let held = records.pin_snapshot().unwrap();
+    let mut limits = RecordScanLimits::fixture_v1();
+    limits.max_candidate_keys = 0;
+    assert!(matches!(
+        records.scan_live_at_snapshot(&held, limits),
+        Err(CoreRecordScanError::ResourceLimit {
+            code: "state_candidates"
+        })
+    ));
+    let mut limits = RecordScanLimits::fixture_v1();
+    limits.max_live_rows = 0;
+    assert!(matches!(
+        records.scan_live_at_snapshot(&held, limits),
+        Err(CoreRecordScanError::ResourceLimit { code: "live_rows" })
+    ));
+    let mut limits = RecordScanLimits::fixture_v1();
+    limits.max_payload_bytes = 2;
+    assert!(matches!(
+        records.scan_live_at_snapshot(&held, limits),
+        Err(CoreRecordScanError::ResourceLimit {
+            code: "payload_bytes"
+        })
+    ));
+    let mut limits = RecordScanLimits::fixture_v1();
+    limits.max_candidate_key_bytes = 8;
+    assert!(matches!(
+        records.scan_live_at_snapshot(&held, limits),
+        Err(CoreRecordScanError::ResourceLimit {
+            code: "candidate_key_bytes"
+        })
+    ));
+    // Even a key first written after the pin must pass the raw-key admission
+    // limit before it can be cloned into the candidate set.
+    inject_raw_at(
+        &db,
+        held.core_sequence() + 1,
+        Role::State,
+        vec![2; 4_097],
+        Some(vec![0]),
+    );
+    assert!(matches!(
+        records.scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1()),
+        Err(CoreRecordScanError::ResourceLimit {
+            code: "raw_state_key_bytes"
+        })
+    ));
+}
+
+#[test]
+fn scan_refuses_a_second_distinct_candidate_before_its_raw_key_clone() {
+    let (_dir, _config, db) = database();
+    let records = db.records();
+    records.put(b"one", &[]).unwrap();
+    let held = records.pin_snapshot().unwrap();
+    inject_raw_at(
+        &db,
+        held.core_sequence() + 1,
+        Role::State,
+        Key::State(2).encode().unwrap(),
+        Some(
+            Row::State {
+                live: false,
+                payload_length: 0,
+            }
+            .encode()
+            .unwrap(),
+        ),
+    );
+    let mut limits = RecordScanLimits::fixture_v1();
+    limits.max_candidate_keys = 1;
+    assert!(matches!(
+        records.scan_live_at_snapshot(&held, limits),
+        Err(CoreRecordScanError::ResourceLimit {
+            code: "state_candidates"
+        })
+    ));
+}
+
+#[test]
+fn scan_adds_distinct_raw_key_lengths_before_the_cumulative_byte_limit() {
+    let (_dir, _config, db) = database();
+    let records = db.records();
+    let first = records.put(b"one", &[]).unwrap();
+    let second = records.put(b"two", &[]).unwrap();
+    let held = records.pin_snapshot().unwrap();
+    assert_eq!(Key::State(first.0).encode().unwrap().len(), 9);
+    assert_eq!(Key::State(second.0).encode().unwrap().len(), 9);
+
+    let mut admitted = RecordScanLimits::fixture_v1();
+    admitted.max_candidate_key_bytes = 18;
+    assert_eq!(
+        records.scan_live_at_snapshot(&held, admitted).unwrap(),
+        vec![(first, b"one".to_vec()), (second, b"two".to_vec())]
+    );
+    let mut refused = RecordScanLimits::fixture_v1();
+    refused.max_candidate_key_bytes = 17;
+    assert!(matches!(
+        records.scan_live_at_snapshot(&held, refused),
+        Err(CoreRecordScanError::ResourceLimit {
+            code: "candidate_key_bytes"
+        })
+    ));
+}
+
+#[test]
+fn scan_rejects_foreign_owner_and_poison_after_materialization() {
+    let (_dir, _config, db) = database();
+    let records = db.records();
+    records.put(b"one", &[]).unwrap();
+    let held = records.pin_snapshot().unwrap();
+    let (_other_dir, _other_config, other) = database();
+    assert!(matches!(
+        other
+            .records()
+            .scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1()),
+        Err(CoreRecordScanError::Storage(
+            PraxisError::ForeignRecordSnapshot { .. }
+        ))
+    ));
+    let engine = db.kv().clone();
+    READ_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |phase| {
+            if phase == ReadPhase::ScanBeforeReturn {
+                engine.inner.group_commit.poison("scan final guard".into());
+            }
+        }))
+    });
+    let late = records.scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1());
+    READ_HOOK.with(|hook| *hook.borrow_mut() = None);
+    assert!(matches!(
+        late,
+        Err(CoreRecordScanError::Storage(PraxisError::RecoveryRequired))
+    ));
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 1);
+}
+
+#[test]
+fn scan_rejects_a_poisoned_owner_before_any_scan_hook_fires() {
+    let (_dir, _config, db) = database();
+    let records = db.records();
+    records.put(b"one", &[]).unwrap();
+    let held = records.pin_snapshot().unwrap();
+    let hook_calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let observed = hook_calls.clone();
+    READ_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |_| {
+            observed.set(observed.get() + 1);
+        }))
+    });
+    db.kv().inner.group_commit.poison("scan entry guard".into());
+    let result = records.scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1());
+    READ_HOOK.with(|hook| *hook.borrow_mut() = None);
+    assert!(matches!(
+        result,
+        Err(CoreRecordScanError::Storage(PraxisError::RecoveryRequired))
+    ));
+    assert_eq!(hook_calls.get(), 0);
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 1);
+}
+
+#[test]
+fn scan_preserves_old_and_new_rows_through_flush_compaction_and_reclaim() {
+    for strategy in [
+        crate::CompactionStrategy::Leveled,
+        crate::CompactionStrategy::Tiered,
+        crate::CompactionStrategy::Universal,
+    ] {
+        let (_dir, _config, db) = database();
+        let records = db.records();
+        let old_rid = records.put(b"old", &[]).unwrap();
+        records.flush().unwrap();
+        let old = records.pin_snapshot().unwrap();
+        records.delete_record(old_rid).unwrap();
+        let new_rid = records.put(b"new", &[]).unwrap();
+        records.flush().unwrap();
+        assert!(db.kv().compact_with_strategy(strategy).unwrap() > 0);
+        records.reclaim_snapshot_history().unwrap();
+        db.kv().garbage_collect().unwrap();
+        assert_eq!(
+            records
+                .scan_live_at_snapshot(&old, RecordScanLimits::fixture_v1())
+                .unwrap(),
+            vec![(old_rid, b"old".to_vec())]
+        );
+        let latest = records.pin_snapshot().unwrap();
+        assert_eq!(
+            records
+                .scan_live_at_snapshot(&latest, RecordScanLimits::fixture_v1())
+                .unwrap(),
+            vec![(new_rid, b"new".to_vec())]
+        );
+        assert_eq!(db.kv().inner.snapshots.pinned_count(), 2);
+        drop(old);
+        drop(latest);
+        assert_eq!(db.kv().inner.snapshots.pinned_count(), 0);
+    }
+}
+
+#[test]
+fn scan_counts_a_key_in_segment_and_mutable_tiers_only_once() {
+    let (_dir, _config, db) = database();
+    let records = db.records();
+    let rid = records.put(b"old", &[]).unwrap();
+    records.flush().unwrap();
+    let held = records.pin_snapshot().unwrap();
+    records.delete_record(rid).unwrap();
+    let mut limits = RecordScanLimits::fixture_v1();
+    limits.max_candidate_keys = 1;
+    assert_eq!(
+        records.scan_live_at_snapshot(&held, limits).unwrap(),
+        vec![(rid, b"old".to_vec())]
+    );
+}
+
+#[test]
+fn scan_rejects_a_physically_missing_allocator_at_the_held_pin() {
+    let (_dir, _config, db) = database();
+    let records = db.records();
+    records.put(b"one", &[]).unwrap();
+    records.flush().unwrap();
+    let held = records.pin_snapshot().unwrap();
+    let allocator_key = Key::Allocator.encode().unwrap();
+    let meta_cf = ColumnFamily(Role::Meta.cf().into());
+    let removed = db
+        .kv()
+        .inner
+        .segment_index
+        .write()
+        .remove(&(meta_cf.clone(), Bytes::from(allocator_key.clone())));
+    assert!(removed.is_some());
+    assert!(
+        db.kv()
+            .resolve_value_at_snapshot(&meta_cf, &allocator_key, held.core_sequence())
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        db.kv()
+            .resolve_value_at_snapshot(
+                &meta_cf,
+                &Key::Binding.encode().unwrap(),
+                held.core_sequence(),
+            )
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 1);
+    assert!(matches!(
+        records.scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1()),
+        Err(CoreRecordScanError::Storage(PraxisError::Corrupt { .. }))
+    ));
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 1);
+}
+
+#[test]
+fn scan_rejects_malformed_allocator_and_state_rows() {
+    for role in [Role::Meta, Role::State] {
+        let (_dir, _config, db) = database();
+        let records = db.records();
+        let rid = records.put(b"one", &[]).unwrap();
+        let held = records.pin_snapshot().unwrap();
+        let key = match role {
+            Role::Meta => Key::Allocator,
+            Role::State => Key::State(rid.0),
+            _ => unreachable!(),
+        };
+        inject_raw_at(
+            &db,
+            held.core_sequence(),
+            role,
+            key.encode().unwrap(),
+            Some(vec![0]),
+        );
+        assert!(matches!(
+            records.scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1()),
+            Err(CoreRecordScanError::Storage(PraxisError::Corrupt { .. }))
+        ));
+    }
+}
+
+#[test]
+fn scan_preserves_external_payload_io_error_and_the_retained_pin() {
+    let (_dir, config, db) = database();
+    let records = db.records();
+    let first = records.put(b"first", &[]).unwrap();
+    let second = records.put(b"second", &[]).unwrap();
+    records.flush().unwrap();
+    drop(records);
+    drop(db);
+    let db = CoreDatabase::open(config).unwrap();
+    let records = db.records();
+    let held = records.pin_snapshot().unwrap();
+    let engine = db.kv();
+    let path = {
+        let index = engine.inner.segment_index.read();
+        let versions = &index[&(
+            ColumnFamily(Role::Payload.cf().into()),
+            Bytes::from(Key::Payload(second.0).encode().unwrap()),
+        )];
+        let crate::types::StoredValue::BlobPointer(pointer) = &versions.last().unwrap().value
+        else {
+            panic!("persisted external payload pointer required")
+        };
+        std::path::PathBuf::from(&pointer.path)
+    };
+    let held_path = path.with_extension("held");
+    std::fs::rename(&path, &held_path).unwrap();
+    assert!(matches!(
+        records.scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1()),
+        Err(CoreRecordScanError::Storage(PraxisError::Io(_)))
+    ));
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 1);
+    std::fs::rename(&held_path, &path).unwrap();
+    assert_eq!(
+        records
+            .scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1())
+            .unwrap(),
+        vec![(first, b"first".to_vec()), (second, b"second".to_vec())]
+    );
+}
+
+#[test]
+fn scan_rejects_payload_length_mismatch_after_an_earlier_live_row() {
+    let (_dir, _config, db) = database();
+    let records = db.records();
+    records.put(b"first", &[]).unwrap();
+    let second = records.put(b"second", &[]).unwrap();
+    let held = records.pin_snapshot().unwrap();
+    inject_raw_at(
+        &db,
+        held.core_sequence(),
+        Role::Payload,
+        Key::Payload(second.0).encode().unwrap(),
+        Some(Row::Payload(b"short").encode().unwrap()),
+    );
+    assert!(matches!(
+        records.scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1()),
+        Err(CoreRecordScanError::Storage(PraxisError::Corrupt { .. }))
+    ));
+}
+
+#[test]
+fn scan_releases_topology_before_a_barrier_and_returns_one_retained_view() {
+    let (_dir, _config, db) = database();
+    let records = db.records();
+    let first = records.put(b"first", &[]).unwrap();
+    records.flush().unwrap();
+    let old = records.pin_snapshot().unwrap();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let reader = records.clone();
+    let held = old.clone();
+    let join = std::thread::spawn(move || {
+        READ_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |phase| {
+                if phase == ReadPhase::ScanCaptured {
+                    ready_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                }
+            }))
+        });
+        let result = reader.scan_live_at_snapshot(&held, RecordScanLimits::fixture_v1());
+        READ_HOOK.with(|hook| *hook.borrow_mut() = None);
+        result
+    });
+    ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 1);
+    let second = records.put(b"second", &[]).unwrap();
+    records.flush().unwrap();
+    db.kv()
+        .compact_with_strategy(crate::CompactionStrategy::Leveled)
+        .unwrap();
+    resume_tx.send(()).unwrap();
+    assert_eq!(
+        join.join().unwrap().unwrap(),
+        vec![(first, b"first".to_vec())]
+    );
+    let latest = records.pin_snapshot().unwrap();
+    assert_eq!(
+        records
+            .scan_live_at_snapshot(&latest, RecordScanLimits::fixture_v1())
+            .unwrap(),
+        vec![(first, b"first".to_vec()), (second, b"second".to_vec())]
+    );
+    drop(old);
+    drop(latest);
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 0);
+}
+
+// These frames are independently frozen PRXQDOC-NUL v1 bytes. In particular,
+// neither this fixture nor its expected query rows call the sibling codec.
+const GATEWAY_FRAME_ONE: &[u8] = b"PRXQDOC\0\x00\x01\x00\x00\x00\x00\x00\x29\x00\x04docs\x00\x03one\x00\x01\x00\x01n\x04\x00\x00\x00\x00\x00\x00\x00\x01";
+const GATEWAY_FRAME_TWO: &[u8] = b"PRXQDOC\0\x00\x01\x00\x00\x00\x00\x00\x29\x00\x04docs\x00\x03two\x00\x01\x00\x01n\x04\x00\x00\x00\x00\x00\x00\x00\x02";
+const GATEWAY_FRAME_THREE: &[u8] = b"PRXQDOC\0\x00\x01\x00\x00\x00\x00\x00\x2b\x00\x04docs\x00\x05three\x00\x01\x00\x01n\x04\x00\x00\x00\x00\x00\x00\x00\x03";
+
+type GatewayLiteralRow = (String, String, Vec<(String, serde_json::Value)>);
+
+fn gateway_fault_expected_rows() -> Vec<GatewayLiteralRow> {
+    vec![
+        (
+            "docs".into(),
+            "one".into(),
+            vec![("n".into(), serde_json::json!(1))],
+        ),
+        (
+            "docs".into(),
+            "two".into(),
+            vec![("n".into(), serde_json::json!(2))],
+        ),
+        (
+            "docs".into(),
+            "three".into(),
+            vec![("n".into(), serde_json::json!(3))],
+        ),
+    ]
+}
+
+fn gateway_fault_rows(result: QueryResult) -> Vec<GatewayLiteralRow> {
+    let QueryResult::Rows(rows) = result else {
+        panic!("expected Rows")
+    };
+    rows.into_iter()
+        .map(|row| (row.id.collection, row.id.key, row.fields))
+        .collect()
+}
+
+fn gateway_fault_catalog() -> crate::Catalog {
+    use crate::catalog::IntegerType;
+    use crate::{AttributeSchema, AttributeType, CollectionSchema};
+
+    let mut catalog = crate::Catalog::new();
+    catalog
+        .create_collection(
+            CollectionSchema::new("docs").with_attribute(AttributeSchema::new(
+                "n",
+                AttributeType::Integer(IntegerType::Uint8),
+            )),
+        )
+        .unwrap();
+    catalog
+}
+
+fn gateway_resolver_chain(
+    records: &CoreRecordStore,
+    role: Role,
+    rid: RecordId,
+) -> Vec<VersionedValue> {
+    let key = match role {
+        Role::State => Key::State(rid.0),
+        Role::Payload => Key::Payload(rid.0),
+        _ => panic!("gateway fault target must be State or Payload"),
+    }
+    .encode()
+    .unwrap();
+    let cf = ColumnFamily(role.cf().into());
+    let engine = &records.engine;
+    // Match the resolver's segment -> mutable -> immutable tie order while
+    // topology is held, then release every lock before query or rename.
+    let mut chain = {
+        let _topology = engine.inner.topology.read();
+        let mut chain = engine
+            .inner
+            .segment_index
+            .read()
+            .get(&(cf.clone(), Bytes::copy_from_slice(&key)))
+            .cloned()
+            .unwrap_or_default();
+        chain.extend(engine.inner.memtable.read().versions_for_key(&cf, &key));
+        for immutable in engine.inner.immutable_memtables.lock().iter() {
+            chain.extend(immutable.versions_for_key(&cf, &key));
+        }
+        chain
+    };
+    chain.sort_by_key(|version| version.sequence);
+    chain
+}
+
+fn gateway_pointer_path(
+    records: &CoreRecordStore,
+    role: Role,
+    rid: RecordId,
+    sequence: u64,
+) -> PathBuf {
+    let chain = gateway_resolver_chain(records, role, rid);
+    let visible = chain
+        .iter()
+        .filter(|version| version.sequence <= sequence)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        visible.len(),
+        1,
+        "{role:?} {rid}: exactly one visible version required"
+    );
+    let StoredValue::BlobPointer(pointer) = &visible[0].value else {
+        panic!("{role:?} {rid}: visible version is not a BlobPointer")
+    };
+    let path = PathBuf::from(&pointer.path);
+    assert!(path.is_file(), "{role:?} {rid}: pointer file absent");
+    let pointed = crate::values::ValueLog::read_pointer(pointer).unwrap();
+    let key = match role {
+        Role::State => Key::State(rid.0),
+        Role::Payload => Key::Payload(rid.0),
+        _ => unreachable!(),
+    }
+    .encode()
+    .unwrap();
+    let segment = records
+        .engine
+        .inner
+        .segment_index
+        .read()
+        .get(&(ColumnFamily(role.cf().into()), Bytes::copy_from_slice(&key)))
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        segment.len(),
+        1,
+        "{role:?} {rid}: one segment version required"
+    );
+    assert_eq!(
+        &segment[0], visible[0],
+        "{role:?} {rid}: pointer must be the segment version"
+    );
+    assert_eq!(
+        records
+            .engine
+            .resolve_value_at_snapshot(&ColumnFamily(role.cf().into()), &key, sequence)
+            .unwrap(),
+        Some(pointed),
+        "{role:?} {rid}: held resolver must read that one pointer"
+    );
+    path
+}
+
+struct GatewayFaultFixture {
+    _dir: tempfile::TempDir,
+    db: CoreDatabase,
+    records: CoreRecordStore,
+    gateway: QueryGateway,
+    view: QueryReadView,
+    rids: [RecordId; 3],
+    sequence: u64,
+    state_paths: [PathBuf; 3],
+    payload_paths: [PathBuf; 3],
+}
+
+impl GatewayFaultFixture {
+    fn target_path(&self, role: Role, index: usize) -> &PathBuf {
+        match role {
+            Role::State => &self.state_paths[index],
+            Role::Payload => &self.payload_paths[index],
+            _ => unreachable!(),
+        }
+    }
+
+    fn query(&self) -> std::result::Result<QueryResult, QueryReadError> {
+        self.gateway.query(
+            &self.view,
+            "SELECT n FROM docs",
+            &TypedParameters::default(),
+        )
+    }
+}
+
+fn gateway_fault_fixture() -> GatewayFaultFixture {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = PraxisConfig::new(dir.path());
+    config.large_value_threshold = 1;
+    config.memtable_flush_threshold_bytes = usize::MAX;
+    let db = CoreDatabase::create_fresh(config.clone(), RecordAuthorityOptions::default()).unwrap();
+    let records = db.records();
+    let mut rids = Vec::new();
+    for frame in [GATEWAY_FRAME_ONE, GATEWAY_FRAME_TWO, GATEWAY_FRAME_THREE] {
+        let rid = records.put(frame, &[]).unwrap();
+        records.flush().unwrap();
+        rids.push(rid);
+    }
+    assert_eq!(rids, [RecordId(1), RecordId(2), RecordId(3)]);
+    drop(records);
+    drop(db);
+
+    let db = CoreDatabase::open(config).unwrap();
+    let records = db.records();
+    let gateway = QueryGateway::attach_fixture_v1(&db, gateway_fault_catalog()).unwrap();
+    let view = gateway.begin_read().unwrap();
+    let adjacent = records.pin_snapshot().unwrap();
+    let sequence = adjacent.core_sequence();
+    let key = Key::Allocator;
+    let allocator_bytes = records
+        .value(Role::Meta, &key, adjacent.pin_for(&records.engine).unwrap())
+        .unwrap()
+        .unwrap();
+    let Row::Allocator(allocator) =
+        Row::decode(&key, &allocator_bytes, records.engine.inner.layout.root()).unwrap()
+    else {
+        unreachable!()
+    };
+    assert_eq!(allocator.last_rid, 3);
+    assert_eq!(allocator.live_count, 3);
+    assert_eq!(allocator.dead_count, 0);
+    assert_eq!(
+        allocator.live_payload_bytes,
+        (GATEWAY_FRAME_ONE.len() + GATEWAY_FRAME_TWO.len() + GATEWAY_FRAME_THREE.len()) as u64
+    );
+    let candidates = records
+        .bounded_state_candidates(RecordScanLimits::fixture_v1())
+        .unwrap()
+        .into_iter()
+        .map(|raw| {
+            let Key::State(rid) =
+                Key::decode(Role::State, &raw, records.engine.inner.layout.root()).unwrap()
+            else {
+                panic!("non-State candidate")
+            };
+            rid
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(candidates, [1, 2, 3]);
+    let rids: [RecordId; 3] = rids.try_into().unwrap();
+    let state_paths = rids.map(|rid| gateway_pointer_path(&records, Role::State, rid, sequence));
+    let payload_paths =
+        rids.map(|rid| gateway_pointer_path(&records, Role::Payload, rid, sequence));
+    for left in 0..3 {
+        for right in left + 1..3 {
+            assert_ne!(state_paths[left], state_paths[right]);
+            assert_ne!(payload_paths[left], payload_paths[right]);
+            assert_ne!(state_paths[left], payload_paths[right]);
+            assert_ne!(payload_paths[left], state_paths[right]);
+        }
+        // A same-row State read may share the Payload path, but it completes
+        // before that row's Payload hook renames it.
+    }
+    assert_eq!(
+        gateway_fault_rows(
+            gateway
+                .query(&view, "SELECT n FROM docs", &TypedParameters::default())
+                .unwrap()
+        ),
+        gateway_fault_expected_rows()
+    );
+    drop(adjacent);
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 1);
+    GatewayFaultFixture {
+        _dir: dir,
+        db,
+        records,
+        gateway,
+        view,
+        rids,
+        sequence,
+        state_paths,
+        payload_paths,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct GatewayScanHits {
+    captured: usize,
+    state: usize,
+    payload: usize,
+    before_return: usize,
+}
+
+impl GatewayScanHits {
+    fn record(&mut self, phase: ReadPhase) -> usize {
+        let count = match phase {
+            ReadPhase::ScanCaptured => &mut self.captured,
+            ReadPhase::ScanState => &mut self.state,
+            ReadPhase::ScanPayload => &mut self.payload,
+            ReadPhase::ScanBeforeReturn => &mut self.before_return,
+            _ => return 0,
+        };
+        *count += 1;
+        *count
+    }
+}
+
+fn gateway_expected_terminal_hits(role: Role, index: usize) -> GatewayScanHits {
+    GatewayScanHits {
+        captured: 1,
+        state: index + 1,
+        payload: index + usize::from(role == Role::Payload),
+        before_return: 0,
+    }
+}
+
+struct GatewayHookReset {
+    installed: bool,
+}
+
+impl GatewayHookReset {
+    fn clear(&mut self) -> std::result::Result<(), &'static str> {
+        READ_HOOK.with(|slot| {
+            let Ok(mut hook) = slot.try_borrow_mut() else {
+                return Err("gateway hook still borrowed");
+            };
+            if hook.is_none() {
+                return Err("gateway hook missing");
+            }
+            *hook = None;
+            self.installed = false;
+            Ok(())
+        })
+    }
+}
+
+impl Drop for GatewayHookReset {
+    fn drop(&mut self) {
+        if self.installed {
+            READ_HOOK.with(|slot| {
+                // During unwinding this must not cause a second panic.
+                if let Ok(mut hook) = slot.try_borrow_mut() {
+                    *hook = None;
+                }
+            });
+        }
+    }
+}
+
+struct GatewayPathRestore {
+    original: PathBuf,
+    displaced: PathBuf,
+    armed: Rc<Cell<bool>>,
+}
+
+impl GatewayPathRestore {
+    fn new(original: PathBuf) -> Self {
+        let displaced = original.with_extension("stage4b-held");
+        assert!(!displaced.exists(), "fault displacement already exists");
+        Self {
+            original,
+            displaced,
+            armed: Rc::new(Cell::new(false)),
+        }
+    }
+
+    fn restore(&self) -> std::io::Result<()> {
+        if self.armed.get() {
+            std::fs::rename(&self.displaced, &self.original)?;
+            self.armed.set(false);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for GatewayPathRestore {
+    fn drop(&mut self) {
+        // Best effort on unwind; the explicit normal-path restore is checked.
+        let _ = self.restore();
+    }
+}
+
+fn gateway_public_physical_io_cell(role: Role, index: usize) {
+    let fixture = gateway_fault_fixture();
+    let target = fixture.target_path(role, index).clone();
+    let restore = GatewayPathRestore::new(target.clone());
+    let displaced = restore.displaced.clone();
+    let armed = Rc::clone(&restore.armed);
+    let hits = Rc::new(Cell::new(GatewayScanHits::default()));
+    let hook_hits = Rc::clone(&hits);
+    let target_phase = if role == Role::State {
+        ReadPhase::ScanState
+    } else {
+        ReadPhase::ScanPayload
+    };
+    READ_HOOK.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "previous hook leaked into fault cell"
+        );
+        *slot.borrow_mut() = Some(Box::new(move |phase| {
+            let mut current = hook_hits.get();
+            let ordinal = current.record(phase);
+            hook_hits.set(current);
+            if phase == target_phase && ordinal == index + 1 && !armed.get() {
+                std::fs::rename(&target, &displaced).unwrap();
+                armed.set(true);
+            }
+        }));
+    });
+    // The reset guard is created after the restore guard, so it drops first
+    // during unwind. Never clear READ_HOOK inside its borrowed callback.
+    let mut reset = GatewayHookReset { installed: true };
+    let result = fixture.query();
+    let terminal_hits = hits.get();
+    reset.clear().expect("gateway I/O hook did not clear");
+    drop(reset);
+    let renamed = restore.armed.get();
+    restore.restore().unwrap();
+    assert!(
+        renamed,
+        "{role:?} index {index}: target hook did not rename"
+    );
+    assert_eq!(
+        terminal_hits,
+        gateway_expected_terminal_hits(role, index),
+        "{role:?} index {index}: wrong scan ordinal or retry"
+    );
+    assert!(
+        matches!(
+            &result,
+            Err(QueryReadError::Storage(PraxisError::Io(error)))
+                if error.kind() == std::io::ErrorKind::NotFound
+        ),
+        "{role:?} index {index}: expected physical Io(NotFound), got {result:?}"
+    );
+    assert_eq!(
+        gateway_fault_rows(fixture.query().unwrap()),
+        gateway_fault_expected_rows(),
+        "{role:?} index {index}: same held view must survive restored I/O"
+    );
+}
+
+fn gateway_public_corrupt_cell(role: Role, index: usize) {
+    let fixture = gateway_fault_fixture();
+    let rid = fixture.rids[index];
+    let physical_key = match role {
+        Role::State => Key::State(rid.0),
+        Role::Payload => Key::Payload(rid.0),
+        _ => unreachable!(),
+    };
+    let key = physical_key.encode().unwrap();
+    inject_raw_at(
+        &fixture.db,
+        fixture.sequence,
+        role,
+        key.clone(),
+        Some(vec![0]),
+    );
+    let chain = gateway_resolver_chain(&fixture.records, role, rid);
+    let visible = chain
+        .iter()
+        .filter(|version| version.sequence <= fixture.sequence)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        visible.len(),
+        2,
+        "{role:?} {rid}: expected pointer then injected Put"
+    );
+    let segment = disk_versions(&fixture.db, role, physical_key);
+    assert_eq!(segment.len(), 1);
+    assert_eq!(
+        visible[0], &segment[0],
+        "{role:?} {rid}: original segment first"
+    );
+    assert!(matches!(visible[0].value, StoredValue::BlobPointer(_)));
+    assert_eq!(visible[1].sequence, fixture.sequence);
+    assert!(matches!(&visible[1].value, StoredValue::Put(bytes) if bytes == &[0]));
+    assert_eq!(
+        fixture
+            .records
+            .engine
+            .resolve_value_at_snapshot(&ColumnFamily(role.cf().into()), &key, fixture.sequence)
+            .unwrap(),
+        Some(vec![0]),
+        "{role:?} {rid}: held resolver must choose injected raw byte"
+    );
+
+    let hits = Rc::new(Cell::new(GatewayScanHits::default()));
+    let hook_hits = Rc::clone(&hits);
+    READ_HOOK.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "previous hook leaked into corrupt cell"
+        );
+        *slot.borrow_mut() = Some(Box::new(move |phase| {
+            let mut current = hook_hits.get();
+            current.record(phase);
+            hook_hits.set(current);
+        }));
+    });
+    let mut reset = GatewayHookReset { installed: true };
+    let result = fixture.query();
+    let terminal_hits = hits.get();
+    reset.clear().expect("gateway Corrupt hook did not clear");
+    drop(reset);
+    assert_eq!(
+        terminal_hits,
+        gateway_expected_terminal_hits(role, index),
+        "{role:?} index {index}: wrong corrupt-scan ordinal or retry"
+    );
+    assert!(
+        matches!(
+            &result,
+            Err(QueryReadError::Storage(PraxisError::Corrupt { .. }))
+        ),
+        "{role:?} index {index}: expected Storage(Corrupt), got {result:?}"
+    );
+}
+
+macro_rules! gateway_io_case {
+    ($name:ident, $role:expr, $index:expr) => {
+        #[test]
+        fn $name() {
+            gateway_public_physical_io_cell($role, $index);
+        }
+    };
+}
+
+macro_rules! gateway_corrupt_case {
+    ($name:ident, $role:expr, $index:expr) => {
+        #[test]
+        fn $name() {
+            gateway_public_corrupt_cell($role, $index);
+        }
+    };
+}
+
+gateway_io_case!(gateway_public_io_state_first, Role::State, 0);
+gateway_io_case!(gateway_public_io_state_middle, Role::State, 1);
+gateway_io_case!(gateway_public_io_state_last, Role::State, 2);
+gateway_io_case!(gateway_public_io_payload_first, Role::Payload, 0);
+gateway_io_case!(gateway_public_io_payload_middle, Role::Payload, 1);
+gateway_io_case!(gateway_public_io_payload_last, Role::Payload, 2);
+gateway_corrupt_case!(gateway_public_corrupt_state_first, Role::State, 0);
+gateway_corrupt_case!(gateway_public_corrupt_state_middle, Role::State, 1);
+gateway_corrupt_case!(gateway_public_corrupt_state_last, Role::State, 2);
+gateway_corrupt_case!(gateway_public_corrupt_payload_first, Role::Payload, 0);
+gateway_corrupt_case!(gateway_public_corrupt_payload_middle, Role::Payload, 1);
+gateway_corrupt_case!(gateway_public_corrupt_payload_last, Role::Payload, 2);
+
+// Independent, fixed PRXQDOC-NUL v1 frames for the retained-view race. The
+// expected rows below are written separately from these physical bytes.
+const GATEWAY_RACE_OLD: &[u8] = b"PRXQDOC\0\x00\x01\x00\x00\x00\x00\x00\x27\x00\x04docs\x00\x02u1\x00\x01\x00\x01n\x05\x00\x00\x00\x03old";
+const GATEWAY_RACE_STEADY: &[u8] = b"PRXQDOC\0\x00\x01\x00\x00\x00\x00\x00\x2e\x00\x04docs\x00\x06steady\x00\x01\x00\x01n\x05\x00\x00\x00\x06steady";
+const GATEWAY_RACE_NEW: &[u8] = b"PRXQDOC\0\x00\x01\x00\x00\x00\x00\x00\x27\x00\x04docs\x00\x02u1\x00\x01\x00\x01n\x05\x00\x00\x00\x03new";
+
+fn gateway_race_catalog() -> crate::Catalog {
+    use crate::{AttributeSchema, AttributeType, CollectionSchema};
+
+    let mut catalog = crate::Catalog::new();
+    catalog
+        .create_collection(
+            CollectionSchema::new("docs")
+                .with_attribute(AttributeSchema::new("n", AttributeType::Text)),
+        )
+        .unwrap();
+    catalog
+}
+
+fn gateway_race_old_rows() -> Vec<GatewayLiteralRow> {
+    vec![
+        (
+            "docs".into(),
+            "u1".into(),
+            vec![("n".into(), serde_json::json!("old"))],
+        ),
+        (
+            "docs".into(),
+            "steady".into(),
+            vec![("n".into(), serde_json::json!("steady"))],
+        ),
+    ]
+}
+
+fn gateway_race_new_rows() -> Vec<GatewayLiteralRow> {
+    vec![
+        (
+            "docs".into(),
+            "steady".into(),
+            vec![("n".into(), serde_json::json!("steady"))],
+        ),
+        (
+            "docs".into(),
+            "u1".into(),
+            vec![("n".into(), serde_json::json!("new"))],
+        ),
+    ]
+}
+
+#[derive(Clone, Copy, Debug)]
+enum GatewayRaceBarrier {
+    Captured,
+    FirstPayload,
+}
+
+// The bounded resume sender is owned by the main test thread. An unwind after
+// the worker pauses must release the hook rather than strand its scan.
+struct GatewayRaceResume(Option<mpsc::SyncSender<()>>);
+
+impl GatewayRaceResume {
+    fn resume(&mut self) -> std::result::Result<(), mpsc::SendError<()>> {
+        self.0
+            .take()
+            .expect("gateway race already resumed")
+            .send(())
+    }
+}
+
+impl Drop for GatewayRaceResume {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+fn gateway_public_retained_race_cell(
+    barrier: GatewayRaceBarrier,
+    strategy: crate::CompactionStrategy,
+) {
+    fn assert_send<T: Send>() {}
+    assert_send::<QueryGateway>();
+    assert_send::<QueryReadView>();
+
+    assert_eq!(GATEWAY_RACE_OLD.len(), 39);
+    assert_eq!(GATEWAY_RACE_STEADY.len(), 46);
+    assert_eq!(GATEWAY_RACE_NEW.len(), 39);
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = PraxisConfig::new(dir.path());
+    config.memtable_flush_threshold_bytes = usize::MAX;
+    config.large_value_threshold = 1;
+    config.default_compaction_strategy = strategy;
+    let db = CoreDatabase::create_fresh(config, RecordAuthorityOptions::default()).unwrap();
+    let options = db.kv().cf_options_map();
+    for role in [Role::State, Role::Payload] {
+        assert_eq!(
+            options.get(role.cf()).unwrap().compaction_strategy,
+            strategy,
+            "{role:?}: fixture CF policy must match this compaction cell"
+        );
+    }
+    let records = db.records();
+    let old_rid = records.put(GATEWAY_RACE_OLD, &[]).unwrap();
+    let steady_rid = records.put(GATEWAY_RACE_STEADY, &[]).unwrap();
+    assert_eq!((old_rid, steady_rid), (RecordId(1), RecordId(2)));
+    records.flush().unwrap();
+    let gateway = QueryGateway::attach_fixture_v1(&db, gateway_race_catalog()).unwrap();
+    let old_view = gateway.begin_read().unwrap();
+    assert_eq!(
+        gateway_fault_rows(
+            gateway
+                .query(&old_view, "SELECT n FROM docs", &TypedParameters::default())
+                .unwrap()
+        ),
+        gateway_race_old_rows()
+    );
+    let worker_view = old_view.clone();
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 1);
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<GatewayScanHits>(1);
+    let (resume_tx, resume_rx) = mpsc::sync_channel::<()>(1);
+    let worker = std::thread::spawn(move || {
+        // Rc/Cell belongs entirely to this thread; the gateway and held view
+        // alone cross the thread boundary.
+        let hits = Rc::new(Cell::new(GatewayScanHits::default()));
+        let hook_hits = Rc::clone(&hits);
+        let paused = Rc::new(Cell::new(false));
+        let hook_paused = Rc::clone(&paused);
+        READ_HOOK.with(|slot| {
+            assert!(slot.borrow().is_none(), "previous worker hook leaked");
+            *slot.borrow_mut() = Some(Box::new(move |phase| {
+                let mut current = hook_hits.get();
+                current.record(phase);
+                hook_hits.set(current);
+                let reached = match barrier {
+                    GatewayRaceBarrier::Captured => phase == ReadPhase::ScanCaptured,
+                    GatewayRaceBarrier::FirstPayload => {
+                        phase == ReadPhase::ScanPayload && current.payload == 1
+                    }
+                };
+                if reached && !hook_paused.replace(true) {
+                    ready_tx.send(current).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                }
+            }));
+        });
+        let mut reset = GatewayHookReset { installed: true };
+        let result = gateway.query(
+            &worker_view,
+            "SELECT n FROM docs",
+            &TypedParameters::default(),
+        );
+        let completed_hits = hits.get();
+        reset.clear().expect("gateway race hook did not clear");
+        (gateway, result, completed_hits, paused.get())
+    });
+    let mut resume = GatewayRaceResume(Some(resume_tx));
+    let at_pause = ready_rx.recv_timeout(Duration::from_secs(30));
+    if at_pause.is_err() {
+        let _ = resume.resume();
+        let _ = worker.join();
+        panic!("gateway worker did not reach {barrier:?} barrier: {at_pause:?}");
+    }
+
+    // Keep every maintenance result until the worker has been resumed and
+    // joined, so even a setup failure cannot strand the paused scanner.
+    let removed = records.delete_record(old_rid);
+    let replacement = records.put(GATEWAY_RACE_NEW, &[]);
+    let flushed = records.flush();
+    let compacted = db.kv().compact_with_strategy(strategy);
+    let reclaimed = records.reclaim_snapshot_history();
+    let collected = db.kv().garbage_collect();
+    let resume_result = resume.resume();
+    let joined = worker.join();
+
+    resume_result.expect("gateway worker resume channel closed");
+    let (gateway, result, completed_hits, did_pause) = joined.unwrap();
+    removed.unwrap();
+    let new_rid = replacement.unwrap();
+    assert_eq!(new_rid, RecordId(3));
+    flushed.unwrap();
+    let compaction_count = compacted.unwrap();
+    assert!(
+        compaction_count > 0,
+        "{barrier:?}/{strategy:?}: compaction must do real work"
+    );
+    reclaimed.unwrap();
+    collected.unwrap();
+    assert!(did_pause, "{barrier:?}/{strategy:?}: hook did not pause");
+    let expected_pause = match barrier {
+        GatewayRaceBarrier::Captured => GatewayScanHits {
+            captured: 1,
+            ..GatewayScanHits::default()
+        },
+        GatewayRaceBarrier::FirstPayload => GatewayScanHits {
+            captured: 1,
+            state: 1,
+            payload: 1,
+            before_return: 0,
+        },
+    };
+    assert_eq!(at_pause.unwrap(), expected_pause);
+    assert_eq!(
+        completed_hits,
+        GatewayScanHits {
+            captured: 1,
+            state: 2,
+            payload: 2,
+            before_return: 1,
+        },
+        "{barrier:?}/{strategy:?}: worker must complete one held scan"
+    );
+    assert_eq!(gateway_fault_rows(result.unwrap()), gateway_race_old_rows());
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 1);
+    assert_eq!(
+        gateway_fault_rows(
+            gateway
+                .query(&old_view, "SELECT n FROM docs", &TypedParameters::default())
+                .unwrap()
+        ),
+        gateway_race_old_rows(),
+        "{barrier:?}/{strategy:?}: same retained view changed"
+    );
+    let fresh = gateway.begin_read().unwrap();
+    assert_eq!(
+        gateway_fault_rows(
+            gateway
+                .query(&fresh, "SELECT n FROM docs", &TypedParameters::default())
+                .unwrap()
+        ),
+        gateway_race_new_rows(),
+        "{barrier:?}/{strategy:?}: fresh view mixed old and new"
+    );
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 2);
+    drop(fresh);
+    drop(old_view);
+    assert_eq!(db.kv().inner.snapshots.pinned_count(), 0);
+}
+
+macro_rules! gateway_retained_race_case {
+    ($name:ident, $barrier:expr, $strategy:expr) => {
+        #[test]
+        fn $name() {
+            gateway_public_retained_race_cell($barrier, $strategy);
+        }
+    };
+}
+
+gateway_retained_race_case!(
+    gateway_public_race_captured_leveled,
+    GatewayRaceBarrier::Captured,
+    crate::CompactionStrategy::Leveled
+);
+gateway_retained_race_case!(
+    gateway_public_race_captured_tiered,
+    GatewayRaceBarrier::Captured,
+    crate::CompactionStrategy::Tiered
+);
+gateway_retained_race_case!(
+    gateway_public_race_captured_universal,
+    GatewayRaceBarrier::Captured,
+    crate::CompactionStrategy::Universal
+);
+gateway_retained_race_case!(
+    gateway_public_race_first_payload_leveled,
+    GatewayRaceBarrier::FirstPayload,
+    crate::CompactionStrategy::Leveled
+);
+gateway_retained_race_case!(
+    gateway_public_race_first_payload_tiered,
+    GatewayRaceBarrier::FirstPayload,
+    crate::CompactionStrategy::Tiered
+);
+gateway_retained_race_case!(
+    gateway_public_race_first_payload_universal,
+    GatewayRaceBarrier::FirstPayload,
+    crate::CompactionStrategy::Universal
+);
+
+#[test]
+fn gateway_public_late_group_commit_poison_refuses_buffered_rows() {
+    let fixture = gateway_fault_fixture();
+    let hits = Rc::new(Cell::new(GatewayScanHits::default()));
+    let hook_hits = Rc::clone(&hits);
+    let engine = fixture.db.kv().clone();
+    READ_HOOK.with(|slot| {
+        assert!(slot.borrow().is_none(), "previous hook leaked");
+        *slot.borrow_mut() = Some(Box::new(move |phase| {
+            let mut current = hook_hits.get();
+            current.record(phase);
+            hook_hits.set(current);
+            if phase == ReadPhase::ScanBeforeReturn {
+                engine.inner.group_commit.poison("gateway late scan".into());
+            }
+        }));
+    });
+    let mut reset = GatewayHookReset { installed: true };
+    let result = fixture.query();
+    let terminal_hits = hits.get();
+    reset
+        .clear()
+        .expect("gateway late poison hook did not clear");
+    assert_eq!(
+        terminal_hits,
+        GatewayScanHits {
+            captured: 1,
+            state: 3,
+            payload: 3,
+            before_return: 1,
+        }
+    );
+    assert!(
+        matches!(
+            result,
+            Err(QueryReadError::Storage(PraxisError::RecoveryRequired))
+        ),
+        "late poison must discard buffered gateway rows"
+    );
+}
+
+#[test]
+fn gateway_public_prequery_group_commit_poison_hits_no_scan_hook() {
+    let fixture = gateway_fault_fixture();
+    let hits = Rc::new(Cell::new(GatewayScanHits::default()));
+    let hook_hits = Rc::clone(&hits);
+    READ_HOOK.with(|slot| {
+        assert!(slot.borrow().is_none(), "previous hook leaked");
+        *slot.borrow_mut() = Some(Box::new(move |phase| {
+            let mut current = hook_hits.get();
+            current.record(phase);
+            hook_hits.set(current);
+        }));
+    });
+    let mut reset = GatewayHookReset { installed: true };
+    fixture
+        .db
+        .kv()
+        .inner
+        .group_commit
+        .poison("gateway prequery scan".into());
+    let result = fixture.query();
+    let terminal_hits = hits.get();
+    reset
+        .clear()
+        .expect("gateway prequery poison hook did not clear");
+    assert_eq!(terminal_hits, GatewayScanHits::default());
+    assert!(matches!(
+        result,
+        Err(QueryReadError::Storage(PraxisError::RecoveryRequired))
+    ));
+}
+
+#[test]
+fn gateway_public_foreign_view_is_rejected_before_scan_capture() {
+    let fixture = gateway_fault_fixture();
+    let second = QueryGateway::attach_fixture_v1(&fixture.db, gateway_fault_catalog()).unwrap();
+    let hits = Rc::new(Cell::new(GatewayScanHits::default()));
+    let hook_hits = Rc::clone(&hits);
+    READ_HOOK.with(|slot| {
+        assert!(slot.borrow().is_none(), "previous hook leaked");
+        *slot.borrow_mut() = Some(Box::new(move |phase| {
+            let mut current = hook_hits.get();
+            current.record(phase);
+            hook_hits.set(current);
+        }));
+    });
+    let mut reset = GatewayHookReset { installed: true };
+    let result = second.query(
+        &fixture.view,
+        "SELECT n FROM docs",
+        &TypedParameters::default(),
+    );
+    let terminal_hits = hits.get();
+    reset
+        .clear()
+        .expect("gateway foreign-view hook did not clear");
+    assert_eq!(terminal_hits, GatewayScanHits::default());
+    assert!(matches!(result, Err(QueryReadError::ForeignGateway)));
 }
 
 #[test]
