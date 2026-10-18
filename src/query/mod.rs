@@ -1,11 +1,13 @@
-//! Query layer for praxis: the bounded Q1 compiler and experimental legacy plans.
+//! Query layer: bounded Q1 compilation, a controlled Q2 fixture gateway, and
+//! experimental legacy plans.
 //!
 //! `compile` accepts one read-only SQL SELECT or EXPLAIN SELECT over one collection,
 //! with scalar projection and typed boolean predicates. It uses a detached,
 //! process-local catalog view; `execute_in_memory` scans only caller-supplied
-//! immutable document records. It does not provide a persisted catalog generation,
-//! a row/catalog read snapshot, a storage provider, or a product query route.
-//! Q2 needs a joint row/catalog view and Q3 needs a persisted catalog protocol.
+//! immutable document records. `QueryGateway` couples one retained core record
+//! pin to fixed Loose catalog binding metadata and scans a controlled v1 fixture
+//! root. Its catalog is not persisted and it is not a product query route.
+//! Q3 needs a persisted catalog protocol before product routing.
 //!
 //! The older `QueryParser`, `Planner`, and `Executor` surfaces remain experimental.
 //! Their broader SQL/PQL syntax is not a Q1 execution capability; only their
@@ -13,6 +15,7 @@
 
 mod compile;
 mod fixture_v1;
+mod gateway;
 pub mod graph;
 pub mod hybrid;
 pub mod kv;
@@ -27,6 +30,8 @@ pub use compile::{
     PredicateShapeOp, ProjectedRow, QueryCatalogAuthority, QueryCatalogView, QueryCompileError,
     TypedParameters, compile, execute_in_memory,
 };
+pub use fixture_v1::FixtureDecodeReason as QueryDocumentReason;
+pub use gateway::{QueryGateway, QueryReadError, QueryReadView, QueryResult};
 
 // Re-export parser types for convenience
 pub use parser::{

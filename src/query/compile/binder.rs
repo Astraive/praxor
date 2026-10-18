@@ -142,7 +142,7 @@ impl BoundSelect {
 }
 
 impl QueryCatalogAuthority {
-    pub(super) fn validate_bound(&self, select: &BoundSelect) -> Result<(), QueryCompileError> {
+    pub(crate) fn validate_bound(&self, select: &BoundSelect) -> Result<(), QueryCompileError> {
         self.validate_handle(&select.owner, select.revision)
     }
 }

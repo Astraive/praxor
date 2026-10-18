@@ -301,7 +301,7 @@ fn field_limits_refuse_before_slicing_and_utf8_is_strict_without_normalization()
         Err(Reason::InvalidAttributeNameLength)
     );
     assert_eq!(
-        decode_document(&manual_single(&vec![b'n'; 129], 0, &[])),
+        decode_document(&manual_single(&[b'n'; 129], 0, &[])),
         Err(Reason::InvalidAttributeNameLength)
     );
     assert_eq!(

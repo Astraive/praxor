@@ -14,7 +14,7 @@ const MAX_ATTRIBUTE_NAME_BYTES: usize = 128;
 const MAX_TEXT_BYTES: usize = 65_536;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum FixtureDecodeReason {
+pub enum FixtureDecodeReason {
     InvalidMagic,
     UnsupportedVersion,
     UnsupportedFlags,
@@ -35,7 +35,7 @@ pub(super) enum FixtureDecodeReason {
 }
 
 impl FixtureDecodeReason {
-    pub(super) const fn code(self) -> &'static str {
+    pub const fn code(self) -> &'static str {
         match self {
             Self::InvalidMagic => "invalid_magic",
             Self::UnsupportedVersion => "unsupported_version",
@@ -58,6 +58,7 @@ impl FixtureDecodeReason {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Eq, PartialEq)]
 pub(super) enum FixtureEncodeError {
     UnsupportedFixtureValue,
@@ -132,6 +133,7 @@ fn utf8(bytes: &[u8]) -> Result<&str, FixtureDecodeReason> {
 
 /// Decode one complete, bounded fixture frame. No delimiter splitting or
 /// extension skipping is permitted, even for attributes a query will not read.
+#[cfg(test)]
 pub(super) fn decode_document(bytes: &[u8]) -> Result<Record, FixtureDecodeReason> {
     match decode_document_inner(bytes, usize::MAX) {
         Ok((record, _)) => Ok(record),
@@ -252,6 +254,7 @@ fn decode_document_inner(
     ))
 }
 
+#[cfg(test)]
 enum Scalar<'a> {
     Null,
     False,
@@ -261,6 +264,7 @@ enum Scalar<'a> {
     Text(&'a str),
 }
 
+#[cfg(test)]
 impl Scalar<'_> {
     fn payload_len(&self) -> usize {
         match self {
@@ -292,6 +296,7 @@ impl Scalar<'_> {
     }
 }
 
+#[cfg(test)]
 fn scalar(value: &Value) -> Result<Scalar<'_>, FixtureEncodeError> {
     match value {
         Value::Null => Ok(Scalar::Null),
@@ -312,6 +317,7 @@ fn scalar(value: &Value) -> Result<Scalar<'_>, FixtureEncodeError> {
     }
 }
 
+#[cfg(test)]
 fn add_frame_bytes(total: usize, count: usize) -> Result<usize, FixtureEncodeError> {
     let total = total.checked_add(count).ok_or(FixtureEncodeError::Limit {
         code: "frame_bytes",
@@ -327,6 +333,7 @@ fn add_frame_bytes(total: usize, count: usize) -> Result<usize, FixtureEncodeErr
 
 /// Encode only the three fixture fields after validating every value and the
 /// complete output length. A full Record would silently drop unsupported extras.
+#[cfg(test)]
 pub(super) fn encode_document(
     collection: &str,
     key: &str,
