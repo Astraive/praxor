@@ -4,6 +4,7 @@ mod database;
 pub(crate) mod intent;
 pub(crate) mod recovery;
 mod schema;
+mod snapshot;
 mod store;
 pub(crate) mod transition;
 
@@ -14,7 +15,8 @@ mod transition_tests;
 
 pub use database::CoreDatabase;
 pub use schema::{MappingDescriptor, RecordAuthority, RecordAuthorityOptions, RecordRoleBinding};
-pub use store::CoreRecordStore;
+pub use snapshot::CoreRecordSnapshot;
+pub use store::{CoreRecordStore, RecordHistoryReclaimReport};
 
 pub(crate) fn ensure_public_cf(
     manifest: &crate::manifest::Manifest,

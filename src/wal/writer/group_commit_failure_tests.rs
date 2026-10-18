@@ -435,6 +435,66 @@ fn failed_ordered_barrier_sync_poison_wakes_later_requests_without_a_wal_frame()
 }
 
 #[test]
+fn failed_never_barrier_stops_reclaim_before_job_reservation_or_source_change() {
+    use crate::core_records::{CoreDatabase, RecordAuthorityOptions};
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = PraxisConfig::new(temp.path().join("db"));
+    config.wal_sync_policy = WalSyncPolicy::Never;
+    config.memtable_flush_threshold_bytes = usize::MAX;
+    config.large_value_threshold = 128;
+    let db = CoreDatabase::create_fresh(config.clone(), RecordAuthorityOptions { indexes: vec![] })
+        .unwrap();
+    let records = db.records();
+    let old = records.put(&[b'a'; 1024], &[]).unwrap();
+    records.delete_record(old).unwrap();
+    let live = records.put(&[b'b'; 1024], &[]).unwrap();
+    records.flush().unwrap();
+    let before = db.kv().inner.manifest.lock().clone();
+    assert_eq!(before.segments.len(), 1);
+    let segment = std::path::PathBuf::from(&before.segments[0].path);
+    let value_log = db.kv().inner.layout.value_log_path(before.segments[0].id);
+    let segment_bytes = std::fs::read(&segment).unwrap();
+    let value_bytes = std::fs::read(&value_log).unwrap();
+    db.kv().put("user-after-source", "never-policy").unwrap();
+
+    // The real OS-device sync failure must reject reclaim before maintenance.
+    #[cfg(windows)]
+    let device = "NUL";
+    #[cfg(not(windows))]
+    let device = "/dev/null";
+    db.kv().inner.wal.lock().file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(device)
+        .unwrap();
+    assert!(matches!(
+        records.reclaim_snapshot_history(),
+        Err(PraxisError::RecoveryRequired)
+    ));
+    let after = db.kv().inner.manifest.lock().clone();
+    assert_eq!(after.next_segment_id, before.next_segment_id);
+    assert_eq!(after.compaction_jobs, before.compaction_jobs);
+    assert_eq!(after.segments, before.segments);
+    assert_eq!(std::fs::read(&segment).unwrap(), segment_bytes);
+    assert_eq!(std::fs::read(&value_log).unwrap(), value_bytes);
+    assert!(db.kv().inner.maintenance_serialization.try_lock().is_some());
+    assert!(matches!(
+        records.fetch(live),
+        Err(PraxisError::RecoveryRequired)
+    ));
+
+    drop(records);
+    drop(db);
+    let reopened = CoreDatabase::open(config).unwrap();
+    reopened.kv().verify().unwrap();
+    assert_eq!(reopened.records().fetch(live).unwrap(), [b'b'; 1024]);
+    assert!(matches!(
+        reopened.records().fetch(old),
+        Err(PraxisError::KeyNotFound)
+    ));
+}
+
+#[test]
 fn never_rotation_must_sync_old_wal_before_a_later_barrier_can_acknowledge() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = PraxisConfig::new(dir.path());

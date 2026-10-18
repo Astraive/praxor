@@ -7,6 +7,7 @@ use crate::accel::gpu::GpuBackendKind;
 use crate::accel::{Accelerator, CpuAccelerator, GpuAccelerator};
 use crate::cache::BlockCache;
 use crate::config::{AcceleratorBackend, PersistedEngineConfig, PraxisConfig};
+use crate::core_records::RecordHistoryReclaimReport;
 use crate::disk::DiskLayout;
 use crate::engine::compaction::{job_state, planner};
 use crate::errors::{PraxisError, Result};
@@ -14,7 +15,7 @@ use crate::io::{IoRateLimiter, resolve_io_execution};
 use crate::maintenance::MaintenanceScheduler;
 use crate::manifest::{
     CheckpointMetadata, ColumnFamilyDescriptor, ColumnFamilyGeneration, ColumnFamilyOptions,
-    CompactionJobStatus, ManifestStore,
+    CompactionJobStatus, Manifest, ManifestStore,
 };
 use crate::memory::{MemTable, SnapshotManager};
 use crate::metrics::EngineMetrics;
@@ -31,7 +32,7 @@ use crate::wal::{Wal, WalRecord};
 use crate::writer_lease::{LOCK_FILE_NAME, WriterLease, lock_artifact_exists};
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -40,6 +41,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct PraxisEngine {
     pub(crate) inner: Arc<EngineInner>,
+}
+
+struct CompleteSourceRewriteReservation {
+    source_segment_ids: Vec<u64>,
+    job_id: u64,
+    segment_id: u64,
+    target_level: u32,
 }
 
 #[cfg(test)]
@@ -57,6 +65,123 @@ mod durability_tests;
 #[cfg(test)]
 #[path = "engine/record_tests.rs"]
 mod record_tests;
+
+#[cfg(test)]
+#[path = "engine/reclaim_fault_tests.rs"]
+mod reclaim_fault_tests;
+
+#[cfg(test)]
+pub(crate) mod reclaim_hooks {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    use crate::Result;
+
+    type Hook = Box<dyn FnMut()>;
+    thread_local! { static AFTER_LATEST: RefCell<Option<Hook>> = RefCell::new(None); }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub enum Phase {
+        AfterPinnedViews,
+        AfterRunning,
+        BeforeReplacementWrite,
+        AfterReplacementWrite(PathBuf),
+        AfterReplacementValidated,
+        AfterManifestSave,
+        AfterIndexSwapBeforeGc,
+    }
+
+    type RewriteHook = Box<dyn FnMut(Phase) -> Result<()>>;
+    thread_local! { static REWRITE: RefCell<Option<RewriteHook>> = RefCell::new(None); }
+
+    pub struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            AFTER_LATEST.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    pub fn install(hook: impl FnMut() + 'static) -> Reset {
+        AFTER_LATEST.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        Reset
+    }
+
+    pub fn invoke() {
+        AFTER_LATEST.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().as_mut() {
+                hook();
+            }
+        });
+    }
+
+    pub struct RewriteReset;
+    impl Drop for RewriteReset {
+        fn drop(&mut self) {
+            REWRITE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    pub fn install_rewrite(hook: impl FnMut(Phase) -> Result<()> + 'static) -> RewriteReset {
+        REWRITE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        RewriteReset
+    }
+
+    pub fn try_phase(phase: Phase) -> Result<()> {
+        REWRITE.with(|slot| match slot.borrow_mut().as_mut() {
+            Some(hook) => hook(phase),
+            None => Ok(()),
+        })
+    }
+
+    pub fn cut_phase(phase: Phase) {
+        try_phase(phase).expect("post-install test hook must exit rather than return an error");
+    }
+}
+
+#[cfg(test)]
+mod retention_selector_tests {
+    use super::*;
+
+    #[test]
+    fn unsorted_source_uses_stable_sequence_order_at_each_retained_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = PraxisEngine::open(PraxisConfig::new(dir.path())).unwrap();
+        let versions = [
+            VersionedValue {
+                sequence: 3,
+                value: StoredValue::Put(b"early-three".to_vec()),
+            },
+            VersionedValue {
+                sequence: 1,
+                value: StoredValue::Put(b"one".to_vec()),
+            },
+            VersionedValue {
+                sequence: 3,
+                value: StoredValue::Put(b"last-three".to_vec()),
+            },
+            VersionedValue {
+                sequence: 2,
+                value: StoredValue::Put(b"two".to_vec()),
+            },
+        ];
+        let retained = engine.compaction_retained_versions(
+            &ColumnFamily::default(),
+            &Bytes::from_static(b"key"),
+            &versions,
+            &[2, 3],
+            crate::CompactionStrategy::Leveled,
+            false,
+        );
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[0].version.sequence, 2);
+        assert_eq!(retained[0].version.value, StoredValue::Put(b"two".to_vec()));
+        assert_eq!(retained[1].version.sequence, 3);
+        assert_eq!(
+            retained[1].version.value,
+            StoredValue::Put(b"last-three".to_vec())
+        );
+    }
+}
 
 impl PraxisEngine {
     pub fn open(config: PraxisConfig) -> Result<Self> {
@@ -1279,10 +1404,9 @@ impl PraxisEngine {
         }
         // This implementation rewrites the entire resident segment index, so
         // every represented segment must be retired to avoid replaying merges twice.
-        let source_segment_ids = self
-            .inner
-            .manifest
-            .lock()
+        let manifest = self.inner.manifest.lock().clone();
+        let protected_cfs = self.bound_record_cfs(&manifest)?;
+        let source_segment_ids = manifest
             .segments
             .iter()
             .map(|segment| segment.id)
@@ -1291,7 +1415,10 @@ impl PraxisEngine {
             self.begin_compaction_job(strategy, source_segment_ids.clone())?;
         self.mark_compaction_job_running(job_id)?;
         let latest_sequence = self.snapshot().sequence;
-        let pinned_snapshots = self.inner.snapshots.pinned_sequences();
+        let mut retained_views = self.inner.snapshots.pinned_sequences();
+        retained_views.push(latest_sequence);
+        retained_views.sort_unstable();
+        retained_views.dedup();
         let mut compacted = Vec::new();
         let cf_options = self.cf_options_map();
         for ((cf, key), versions) in self.inner.segment_index.read().iter() {
@@ -1303,11 +1430,171 @@ impl PraxisEngine {
                 cf,
                 key,
                 versions,
-                latest_sequence,
-                &pinned_snapshots,
+                &retained_views,
                 strategy,
+                protected_cfs.contains(&cf.0),
             ));
         }
+        self.install_complete_source_rewrite(
+            CompleteSourceRewriteReservation {
+                source_segment_ids,
+                job_id,
+                segment_id,
+                target_level,
+            },
+            compacted,
+            &cf_options,
+            started,
+            None,
+        )
+    }
+
+    /// An explicit, bounded protected-history rewrite. The caller completes
+    /// the ordered durable barrier before this maintenance region begins.
+    pub(crate) fn reclaim_record_snapshot_history(&self) -> Result<RecordHistoryReclaimReport> {
+        let _maintenance = self.inner.maintenance_serialization.lock();
+        let started = std::time::Instant::now();
+        self.flush()?;
+        // Reuse F1's complete live capture/evidence validator. A bad current
+        // authority or retained row must fail before a replacement is reserved.
+        self.verify()?;
+        let manifest = self.inner.manifest.lock().clone();
+        if manifest.record_authority.is_none() {
+            return Err(PraxisError::InvalidConfig(
+                "record history maintenance requires a v3 authority".into(),
+            ));
+        }
+        let protected_cfs = self.bound_record_cfs(&manifest)?;
+        let cf_options = manifest
+            .column_families
+            .iter()
+            .map(|descriptor| (descriptor.name.clone(), descriptor.options.clone()))
+            .collect::<BTreeMap<_, _>>();
+        // Capture exactly the published latest view and registered pins once.
+        // A later pin sees at least this source view plus any new memtable rows.
+        let latest_sequence = self.snapshot().sequence;
+        #[cfg(test)]
+        reclaim_hooks::invoke();
+        let mut retained_views = self.inner.snapshots.pinned_sequences();
+        retained_views.push(latest_sequence);
+        retained_views.sort_unstable();
+        retained_views.dedup();
+        #[cfg(test)]
+        reclaim_hooks::try_phase(reclaim_hooks::Phase::AfterPinnedViews)?;
+        let mut compacted = Vec::new();
+        let mut source_protected_versions = 0usize;
+        let mut retained_protected_versions = 0usize;
+        for ((cf, key), versions) in self.inner.segment_index.read().iter() {
+            let is_protected = protected_cfs.contains(&cf.0);
+            let strategy = cf_options
+                .get(&cf.0)
+                .map(|options| options.compaction_strategy)
+                .unwrap_or(self.inner.config.default_compaction_strategy);
+            let retained = self.compaction_retained_versions(
+                cf,
+                key,
+                versions,
+                &retained_views,
+                strategy,
+                is_protected,
+            );
+            if is_protected {
+                source_protected_versions = source_protected_versions
+                    .checked_add(versions.len())
+                    .ok_or_else(|| {
+                    PraxisError::InvalidConfig("version count overflow".into())
+                })?;
+                retained_protected_versions = retained_protected_versions
+                    .checked_add(retained.len())
+                    .ok_or_else(|| PraxisError::InvalidConfig("version count overflow".into()))?;
+            }
+            compacted.extend(retained);
+        }
+        let removed = source_protected_versions
+            .checked_sub(retained_protected_versions)
+            .ok_or_else(|| PraxisError::InvalidConfig("version count underflow".into()))?;
+        let removed = u64::try_from(removed)
+            .map_err(|_| PraxisError::InvalidConfig("version count exceeds u64".into()))?;
+        if removed == 0 {
+            return Ok(RecordHistoryReclaimReport {
+                rewrite_performed: false,
+                protected_versions_removed: 0,
+                gc: self.garbage_collect()?,
+            });
+        }
+        let source_segment_ids = manifest
+            .segments
+            .iter()
+            .map(|segment| segment.id)
+            .collect::<Vec<_>>();
+        if source_segment_ids.is_empty() {
+            return Err(PraxisError::InvalidConfig(
+                "protected disk versions have no installed source segment".into(),
+            ));
+        }
+        let strategy = self.inner.config.default_compaction_strategy;
+        let plan = planner::pick_compaction_plan(strategy, &manifest.segments);
+        let target_level = if plan.source_segment_ids.is_empty() {
+            manifest
+                .segments
+                .iter()
+                .map(|segment| segment.level)
+                .max()
+                .unwrap_or(0)
+                .max(1)
+        } else {
+            plan.target_level
+        };
+        let (job_id, segment_id) =
+            self.begin_compaction_job(strategy, source_segment_ids.clone())?;
+        self.mark_compaction_job_running(job_id)?;
+        #[cfg(test)]
+        reclaim_hooks::try_phase(reclaim_hooks::Phase::AfterRunning)?;
+        let rewritten = self.install_complete_source_rewrite(
+            CompleteSourceRewriteReservation {
+                source_segment_ids,
+                job_id,
+                segment_id,
+                target_level,
+            },
+            compacted,
+            &cf_options,
+            started,
+            Some((&protected_cfs, retained_protected_versions)),
+        )?;
+        if rewritten != 1 {
+            return Err(PraxisError::InvalidConfig(
+                "protected rewrite produced no installed segment".into(),
+            ));
+        }
+        #[cfg(test)]
+        reclaim_hooks::cut_phase(reclaim_hooks::Phase::AfterIndexSwapBeforeGc);
+        // The installed manifest is authoritative before either validation or
+        // GC; an error here represents uncertain maintenance progress.
+        self.verify()?;
+        Ok(RecordHistoryReclaimReport {
+            rewrite_performed: true,
+            protected_versions_removed: removed,
+            gc: self.garbage_collect()?,
+        })
+    }
+
+    /// Shared complete-source install path for ordinary and requested rewrites.
+    /// Call only while the reentrant maintenance guard is held.
+    fn install_complete_source_rewrite(
+        &self,
+        reservation: CompleteSourceRewriteReservation,
+        compacted: Vec<crate::segments::block::SegmentEntry>,
+        cf_options: &BTreeMap<String, ColumnFamilyOptions>,
+        started: std::time::Instant,
+        protected_expectation: Option<(&BTreeSet<String>, usize)>,
+    ) -> Result<u64> {
+        let CompleteSourceRewriteReservation {
+            source_segment_ids,
+            job_id,
+            segment_id,
+            target_level,
+        } = reservation;
         if compacted.is_empty() {
             let _writer = self.inner.write_serialization.lock();
             self.inner.group_commit.ensure_writable()?;
@@ -1326,14 +1613,18 @@ impl PraxisEngine {
             return Ok(0);
         }
         let path = self.inner.layout.segment_path(target_level, segment_id);
+        #[cfg(test)]
+        if protected_expectation.is_some() {
+            reclaim_hooks::try_phase(reclaim_hooks::Phase::BeforeReplacementWrite)?;
+        }
         crate::io::create_dir_all_durable(path.parent().expect("segment path has parent"))?;
         let mut value_log = ValueLog::open(self.inner.layout.value_log_path(segment_id))?;
         let mut compaction_limiter =
             IoRateLimiter::new(self.inner.config.compaction_rate_limit_bytes_per_sec);
         compaction_limiter.consume(compacted.len() * 256);
-        let partitioned_bloom = infer_partitioned_bloom(&compacted, &cf_options);
+        let partitioned_bloom = infer_partitioned_bloom(&compacted, cf_options);
         let compression =
-            effective_segment_compression(&compacted, &cf_options, self.inner.config.compression);
+            effective_segment_compression(&compacted, cf_options, self.inner.config.compression);
         let metadata = SegmentWriter::write(
             SegmentWriteOptions {
                 path: &path,
@@ -1349,6 +1640,10 @@ impl PraxisEngine {
             },
             compacted,
         )?;
+        #[cfg(test)]
+        if protected_expectation.is_some() {
+            reclaim_hooks::try_phase(reclaim_hooks::Phase::AfterReplacementWrite(path.clone()))?;
+        }
         let compacted_entries = metadata.entries;
         let loaded = SegmentReader::read(
             &path,
@@ -1361,6 +1656,24 @@ impl PraxisEngine {
                 .entry((entry.cf, entry.key))
                 .or_insert_with(Vec::new)
                 .push(entry.version);
+        }
+        if let Some((protected, expected)) = protected_expectation {
+            let mut actual = 0;
+            for ((cf, _), versions) in &rebuilt {
+                if protected.contains(&cf.0) {
+                    actual += versions.len();
+                }
+            }
+            if actual != expected {
+                return Err(PraxisError::Corrupt {
+                    path: path.clone(),
+                    reason: "rewritten protected version count differs from candidate".into(),
+                });
+            }
+        }
+        #[cfg(test)]
+        if protected_expectation.is_some() {
+            reclaim_hooks::try_phase(reclaim_hooks::Phase::AfterReplacementValidated)?;
         }
         let _writer = self.inner.write_serialization.lock();
         self.inner.group_commit.ensure_writable()?;
@@ -1381,6 +1694,10 @@ impl PraxisEngine {
             self.inner
                 .manifest_store
                 .save_with_policy(&installed, self.inner.config.direct_io)?;
+            #[cfg(test)]
+            if protected_expectation.is_some() {
+                reclaim_hooks::cut_phase(reclaim_hooks::Phase::AfterManifestSave);
+            }
             *self.inner.segment_index.write() = rebuilt;
             *manifest = installed;
         }
@@ -1432,23 +1749,56 @@ impl PraxisEngine {
         planner::pick_compaction_plan(strategy, &manifest.segments)
     }
 
+    /// Only an admitted v3 authority with all four exact manifest bindings
+    /// may override Tiered's ordinary keep-every-version policy.
+    fn bound_record_cfs(&self, manifest: &Manifest) -> Result<BTreeSet<String>> {
+        let Some(authority) = &manifest.record_authority else {
+            return Ok(BTreeSet::new());
+        };
+        authority.validate(manifest, &self.inner.layout.manifest_path())?;
+        Ok(authority
+            .roles
+            .iter()
+            .map(|binding| binding.column_family.clone())
+            .collect())
+    }
+
     fn compaction_retained_versions(
         &self,
         cf: &ColumnFamily,
         key: &Key,
         versions: &[VersionedValue],
-        latest_sequence: SequenceNumber,
-        pinned_snapshots: &[SequenceNumber],
+        retained_views: &[SequenceNumber],
         strategy: crate::config::CompactionStrategy,
+        bound_record_role: bool,
     ) -> Vec<crate::segments::block::SegmentEntry> {
         // Keep complete operand chains for current and pinned views. An expired
         // value is still a deletion barrier, so never filter it before resolution.
+        let tiered_keep_all =
+            matches!(strategy, crate::config::CompactionStrategy::Tiered) && !bound_record_role;
+        // Current flush and segment rebuild paths order each key's chain.
+        // Normalize an older unsorted source in a private copy so release
+        // builds still select the true latest version at every view. The
+        // stable sort preserves input order for same-sequence operations.
+        let sorted_versions = (!tiered_keep_all
+            && !versions
+                .windows(2)
+                .all(|pair| pair[0].sequence <= pair[1].sequence))
+        .then(|| {
+            let mut sorted = versions.to_vec();
+            sorted.sort_by_key(|version| version.sequence);
+            sorted
+        });
+        let versions = sorted_versions.as_deref().unwrap_or(versions);
         let mut keep = std::collections::BTreeSet::new();
-        if matches!(strategy, crate::config::CompactionStrategy::Tiered) {
+        if tiered_keep_all {
             keep.extend(0..versions.len());
         } else {
-            for snapshot in std::iter::once(&latest_sequence).chain(pinned_snapshots.iter()) {
-                let Some(mut index) = versions.iter().rposition(|v| v.sequence <= *snapshot) else {
+            for snapshot in retained_views {
+                let Some(mut index) = versions
+                    .partition_point(|version| version.sequence <= *snapshot)
+                    .checked_sub(1)
+                else {
                     continue;
                 };
                 loop {
