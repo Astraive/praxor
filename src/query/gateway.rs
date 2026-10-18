@@ -1,4 +1,4 @@
-//! Scan-only, retained-view query gateway for a controlled v1 fixture root.
+//! Retained-view query gateway for a controlled v1 fixture root.
 
 use super::compile::{
     BoundSelect, CompileInput, CompiledStatement, ExplainV1, ProjectedRow, QueryCatalogAuthority,
@@ -49,8 +49,51 @@ pub struct QueryGateway {
     catalog: QueryCatalogAuthority,
     identity: Arc<()>,
     limits: GatewayLimits,
+    acceleration: Arc<dyn QueryAccelerationBackend>,
     #[cfg(test)]
     test_hooks: GatewayTestHooks,
+}
+
+// The production backend has no Ready variant. Only private unit tests may
+// substitute a synthetic backend for a complete-scan equivalence proof.
+trait QueryAccelerationBackend: Send + Sync {
+    fn complete_collection_at(
+        &self,
+        gateway: &QueryGateway,
+        view: &QueryReadView,
+        bound: &BoundSelect,
+        request_identity: &Arc<()>,
+    ) -> Result<Acceleration, QueryReadError>;
+}
+
+struct UnavailableBackend;
+
+impl QueryAccelerationBackend for UnavailableBackend {
+    fn complete_collection_at(
+        &self,
+        _gateway: &QueryGateway,
+        _view: &QueryReadView,
+        _bound: &BoundSelect,
+        _request_identity: &Arc<()>,
+    ) -> Result<Acceleration, QueryReadError> {
+        Ok(Acceleration::Unavailable)
+    }
+}
+
+enum Acceleration {
+    Unavailable,
+    #[cfg(test)]
+    Ready(ReadyCertificate),
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ReadyCertificate {
+    read_identity: Arc<()>,
+    request_identity: Arc<()>,
+    collection: String,
+    ordered: Vec<(CoreRecordId, Record)>,
+    pinned_payload_bytes: u64,
 }
 
 /// Opaque retained row/catalog capability; clones share one core pin.
@@ -59,7 +102,8 @@ pub struct QueryReadView {
     core: CoreRecordSnapshot,
     catalog: QueryCatalogView,
     identity: Arc<()>,
-    // Clones carry the same read identity for Stage 3d's synthetic certificate.
+    // Clones carry the same read identity for the test-only certificate.
+    #[cfg(test)]
     read_identity: Arc<()>,
 }
 
@@ -104,12 +148,18 @@ pub enum QueryReadError {
     DuplicateLogicalId { core_rid: CoreRecordId },
     #[error("query resource limit exceeded: {code}")]
     ResourceLimit { code: &'static str },
+    #[error("query acceleration invariant failed: {code}")]
+    AccelerationInvariant { code: &'static str },
 }
 
 #[cfg(test)]
 #[derive(Default)]
 struct GatewayTestHooks {
     scan_calls: std::sync::atomic::AtomicUsize,
+    backend_calls: std::sync::atomic::AtomicUsize,
+    ready_selected: std::sync::atomic::AtomicUsize,
+    certificate_scans: std::sync::atomic::AtomicUsize,
+    fallback_scans: std::sync::atomic::AtomicUsize,
     before_final: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
@@ -210,6 +260,7 @@ impl QueryGateway {
             catalog: QueryCatalogAuthority::new(catalog),
             identity: Arc::new(()),
             limits: GatewayLimits::default(),
+            acceleration: Arc::new(UnavailableBackend),
             #[cfg(test)]
             test_hooks: GatewayTestHooks::default(),
         })
@@ -224,6 +275,7 @@ impl QueryGateway {
                 .map_err(QueryReadError::Storage)?,
             catalog: self.catalog.view(),
             identity: Arc::clone(&self.identity),
+            #[cfg(test)]
             read_identity: Arc::new(()),
         };
         self.validate(&view, None, false)?;
@@ -260,15 +312,51 @@ impl QueryGateway {
         bound: &BoundSelect,
     ) -> Result<Vec<ProjectedRow>, QueryReadError> {
         self.validate(view, Some(bound), false)?;
-        let rows = self.scan_collection(view, bound.collection())?;
-        self.check_logical_output_budget(
-            bound,
-            &rows.records,
-            rows.pinned_payload_bytes,
-            rows.requested_pair_bytes,
-        )?;
-        let projected = execute_in_memory(&self.catalog, bound, &rows.records)
-            .map_err(QueryReadError::Compile)?;
+        let request_identity = Arc::new(());
+        #[cfg(test)]
+        self.test_hooks
+            .backend_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let rows =
+            match self
+                .acceleration
+                .complete_collection_at(self, view, bound, &request_identity)?
+            {
+                Acceleration::Unavailable => {
+                    self.scan_collection(view, bound.collection(), ScanPurpose::Fallback)?
+                }
+                #[cfg(test)]
+                Acceleration::Ready(certificate) => {
+                    self.test_hooks
+                        .ready_selected
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if !Arc::ptr_eq(&certificate.read_identity, &view.read_identity) {
+                        return Err(QueryReadError::AccelerationInvariant {
+                            code: "read_identity",
+                        });
+                    }
+                    if !Arc::ptr_eq(&certificate.request_identity, &request_identity) {
+                        return Err(QueryReadError::AccelerationInvariant {
+                            code: "request_identity",
+                        });
+                    }
+                    if certificate.collection != bound.collection() {
+                        return Err(QueryReadError::AccelerationInvariant { code: "collection" });
+                    }
+                    ScannedCollection {
+                        ordered: certificate.ordered,
+                        pinned_payload_bytes: certificate.pinned_payload_bytes,
+                    }
+                }
+            };
+        self.check_logical_output_budget(bound, &rows.ordered, rows.pinned_payload_bytes)?;
+        let records = rows
+            .ordered
+            .into_iter()
+            .map(|(_, record)| record)
+            .collect::<Vec<_>>();
+        let projected =
+            execute_in_memory(&self.catalog, bound, &records).map_err(QueryReadError::Compile)?;
         self.validate(view, Some(bound), true)?;
         Ok(projected)
     }
@@ -290,9 +378,6 @@ impl QueryGateway {
         }
         #[cfg(not(test))]
         let _ = final_check;
-        // The shared read identity is intentionally opaque until Stage 3d binds
-        // a synthetic candidate certificate to it.
-        let _ = &view.read_identity;
         if !Arc::ptr_eq(&self.identity, &view.identity) {
             return Err(QueryReadError::ForeignGateway);
         }
@@ -314,20 +399,31 @@ impl QueryGateway {
         &self,
         view: &QueryReadView,
         requested_collection: &str,
-    ) -> Result<CompleteCollectionRows, QueryReadError> {
+        purpose: ScanPurpose,
+    ) -> Result<ScannedCollection, QueryReadError> {
         #[cfg(test)]
-        self.test_hooks
-            .scan_calls
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.test_hooks.scan_calls.fetch_add(1, Relaxed);
+            match purpose {
+                ScanPurpose::Fallback => {
+                    self.test_hooks.fallback_scans.fetch_add(1, Relaxed);
+                }
+                ScanPurpose::Certification => {
+                    self.test_hooks.certificate_scans.fetch_add(1, Relaxed);
+                }
+            }
+        }
+        #[cfg(not(test))]
+        let _ = purpose;
         let physical_rows = self
             .records
             .scan_live_at_snapshot(&view.core, RecordScanLimits::fixture_v1())
             .map_err(scanner_error)?;
         let mut decoded_attribute_entries = 0usize;
         let mut pinned_payload_bytes = 0u64;
-        let mut requested_pair_bytes = 0u64;
         let mut logical_ids = BTreeSet::<LogicalRecordId>::new();
-        let mut records = Vec::new();
+        let mut ordered = Vec::new();
         for (core_rid, payload) in physical_rows {
             let payload_bytes =
                 u64::try_from(payload.len()).map_err(|_| QueryReadError::ResourceLimit {
@@ -363,36 +459,60 @@ impl QueryGateway {
                 if !logical_ids.insert(record.id.clone()) {
                     return Err(QueryReadError::DuplicateLogicalId { core_rid });
                 }
-                let pair_bytes = record
-                    .id
-                    .collection
-                    .len()
-                    .checked_add(record.id.key.len())
-                    .and_then(|bytes| u64::try_from(bytes).ok())
-                    .ok_or(QueryReadError::ResourceLimit {
-                        code: "logical_output_bytes",
-                    })?;
-                requested_pair_bytes = requested_pair_bytes.checked_add(pair_bytes).ok_or(
-                    QueryReadError::ResourceLimit {
-                        code: "logical_output_bytes",
-                    },
-                )?;
-                records.push(record);
+                ordered.push((core_rid, record));
             }
         }
-        Ok(CompleteCollectionRows {
-            records,
+        Ok(ScannedCollection {
+            ordered,
             pinned_payload_bytes,
-            requested_pair_bytes,
         })
+    }
+
+    /// Construct a one-call synthetic certificate from a fresh held-view oracle.
+    /// Canonical scan, output budget and Q1 all-row failures take precedence over
+    /// a bad candidate. The backend cannot provide a payload estimate.
+    #[cfg(test)]
+    fn certify_ready_candidate(
+        &self,
+        view: &QueryReadView,
+        bound: &BoundSelect,
+        request_identity: &Arc<()>,
+        candidate: Vec<(CoreRecordId, Record)>,
+    ) -> Result<Acceleration, QueryReadError> {
+        self.records
+            .validate_snapshot(&view.core)
+            .map_err(QueryReadError::Storage)?;
+        let oracle = self.scan_collection(view, bound.collection(), ScanPurpose::Certification)?;
+        self.check_logical_output_budget(bound, &oracle.ordered, oracle.pinned_payload_bytes)?;
+        let canonical_records = oracle
+            .ordered
+            .iter()
+            .map(|(_, record)| record.clone())
+            .collect::<Vec<_>>();
+        execute_in_memory(&self.catalog, bound, &canonical_records)
+            .map_err(QueryReadError::Compile)?;
+        if candidate != oracle.ordered {
+            return Err(QueryReadError::AccelerationInvariant {
+                code: "candidate_mismatch",
+            });
+        }
+        self.records
+            .validate_snapshot(&view.core)
+            .map_err(QueryReadError::Storage)?;
+        Ok(Acceleration::Ready(ReadyCertificate {
+            read_identity: Arc::clone(&view.read_identity),
+            request_identity: Arc::clone(request_identity),
+            collection: bound.collection().to_owned(),
+            ordered: oracle.ordered,
+            pinned_payload_bytes: oracle.pinned_payload_bytes,
+        }))
     }
 
     fn check_logical_output_budget(
         &self,
         bound: &BoundSelect,
-        records: &[Record],
+        ordered: &[(CoreRecordId, Record)],
         pinned_payload_bytes: u64,
-        requested_pair_bytes: u64,
     ) -> Result<(), QueryReadError> {
         fn limit() -> QueryReadError {
             QueryReadError::ResourceLimit {
@@ -406,7 +526,17 @@ impl QueryGateway {
                 .ok_or_else(limit)
         })?;
         let field_count = u64::try_from(projection.len()).map_err(|_| limit())?;
-        let row_count = u64::try_from(records.len()).map_err(|_| limit())?;
+        let row_count = u64::try_from(ordered.len()).map_err(|_| limit())?;
+        let requested_pair_bytes = ordered.iter().try_fold(0u64, |total, (_, record)| {
+            let bytes = record
+                .id
+                .collection
+                .len()
+                .checked_add(record.id.key.len())
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .ok_or_else(limit)?;
+            total.checked_add(bytes).ok_or_else(limit)
+        })?;
         let per_row = field_count
             .checked_mul(64)
             .and_then(|bytes| bytes.checked_add(64))
@@ -424,12 +554,22 @@ impl QueryGateway {
     }
 }
 
-struct CompleteCollectionRows {
-    records: Vec<Record>,
+struct ScannedCollection {
+    ordered: Vec<(CoreRecordId, Record)>,
     pinned_payload_bytes: u64,
-    requested_pair_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+enum ScanPurpose {
+    Fallback,
+    #[cfg(test)]
+    Certification,
 }
 
 #[cfg(test)]
 #[path = "gateway_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "gateway_ready_tests.rs"]
+mod ready_tests;
