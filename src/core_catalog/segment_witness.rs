@@ -2585,7 +2585,7 @@ fn scan_compressed_opened_pass(
 /// authenticated bounded parser rather than changing the established first
 /// and Bloom passes; the caller must discard its rows on any late error.
 #[allow(clippy::too_many_arguments)]
-fn scan_lz4_opened_owned_pass(
+fn scan_compressed_opened_owned_pass(
     file: &mut File,
     path: &Path,
     expected_identity: SegmentPhysicalId,
@@ -2594,9 +2594,15 @@ fn scan_lz4_opened_owned_pass(
     pass: CompressedPassContext,
     first: AuthenticatedLz4Pass,
     len: u64,
+    codec: Compression,
     source: SegmentSource,
     mut visit: impl FnMut(ObservedSegmentRow) -> Result<()>,
 ) -> Result<AuthenticatedLz4Pass> {
+    let (tag, tag_error) = match codec {
+        Compression::Lz4 => (1, "compressed v4 pass expected LZ4 tag"),
+        Compression::Zstd => (2, "compressed v4 pass expected Zstd tag"),
+        _ => return Err(unsupported("compressed v4 pass codec is not supported")),
+    };
     let mut scratch = ScratchLedger::new(work.profile);
 
     // The index is provisional until the later, contiguous read hashes and
@@ -2665,8 +2671,8 @@ fn scan_lz4_opened_owned_pass(
     if header_reader.read_u32()? != SEGMENT_MAGIC || header_reader.read_u32()? != SEGMENT_VERSION {
         return Err(corrupt(path, "bad compressed v4 segment magic or version"));
     }
-    if header_reader.read_u8()? != 1 {
-        return Err(corrupt(path, "compressed v4 pass expected LZ4 tag"));
+    if header_reader.read_u8()? != tag {
+        return Err(corrupt(path, tag_error));
     }
     if header_reader.read_u32()? != meta.level || header_reader.read_u64()? != meta.id {
         return Err(corrupt(path, "compressed v4 header level or id mismatch"));
@@ -2724,7 +2730,7 @@ fn scan_lz4_opened_owned_pass(
         reader.read_hashed(&mut encoded)?;
         facts = decode_bounded_block(
             BlockFrame {
-                codec: Compression::Lz4,
+                codec,
                 encoded: &encoded,
                 checksum,
                 decoded_len,
@@ -2904,13 +2910,15 @@ pub(super) fn scan_lz4_pass2(
 
 /// Private owned-row pass. Its rows remain provisional until the caller has
 /// authenticated the complete stream and performed the final namespace check.
-pub(super) fn scan_lz4_pass3(
+#[allow(clippy::too_many_arguments)]
+fn scan_compressed_pass3(
     path: &Path,
     expected_identity: SegmentPhysicalId,
     meta: &SegmentMetadata,
     source: SegmentSource,
     work: &WorkLedger,
     first: AuthenticatedLz4Pass,
+    codec: Compression,
     visit: impl FnMut(ObservedSegmentRow) -> Result<()>,
 ) -> Result<AuthenticatedLz4Pass> {
     if source.level != meta.level || source.id != meta.id {
@@ -2937,7 +2945,7 @@ pub(super) fn scan_lz4_pass3(
         ));
     }
     let pass = work.replay_pass(first.work)?;
-    scan_lz4_opened_owned_pass(
+    scan_compressed_opened_owned_pass(
         &mut file,
         path,
         expected_identity,
@@ -2946,26 +2954,56 @@ pub(super) fn scan_lz4_pass3(
         pass,
         first,
         len,
+        codec,
         source,
         visit,
     )
 }
 
-/// Private test-first seam for Zstd owned replay. No public tag-2 visitor or
-/// installed-owner authority is granted until a separately reviewed cut.
+/// Private LZ4 owned-row replay remains provisional until final caller checks.
+pub(super) fn scan_lz4_pass3(
+    path: &Path,
+    expected_identity: SegmentPhysicalId,
+    meta: &SegmentMetadata,
+    source: SegmentSource,
+    work: &WorkLedger,
+    first: AuthenticatedLz4Pass,
+    visit: impl FnMut(ObservedSegmentRow) -> Result<()>,
+) -> Result<AuthenticatedLz4Pass> {
+    scan_compressed_pass3(
+        path,
+        expected_identity,
+        meta,
+        source,
+        work,
+        first,
+        Compression::Lz4,
+        visit,
+    )
+}
+
+/// Private Zstd owned replay grants no public tag-2 visitor or installed-owner
+/// authority until a separately reviewed cut.
 #[allow(dead_code)]
 pub(super) fn scan_zstd_pass3(
-    _path: &Path,
-    _expected_identity: SegmentPhysicalId,
-    _meta: &SegmentMetadata,
-    _source: SegmentSource,
-    _work: &WorkLedger,
-    _first: AuthenticatedZstdPass,
-    _visit: impl FnMut(ObservedSegmentRow) -> Result<()>,
+    path: &Path,
+    expected_identity: SegmentPhysicalId,
+    meta: &SegmentMetadata,
+    source: SegmentSource,
+    work: &WorkLedger,
+    first: AuthenticatedZstdPass,
+    visit: impl FnMut(ObservedSegmentRow) -> Result<()>,
 ) -> Result<AuthenticatedZstdPass> {
-    Err(unsupported(
-        "private Zstd owned replay is not yet authenticated",
-    ))
+    scan_compressed_pass3(
+        path,
+        expected_identity,
+        meta,
+        source,
+        work,
+        first,
+        Compression::Zstd,
+        visit,
+    )
 }
 
 struct ScannedSegment {
