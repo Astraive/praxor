@@ -1852,6 +1852,146 @@ fn private_lz4_pass1_compares_the_preread_trailer_to_hashed_bytes() {
 }
 
 #[test]
+fn bounded_zstd_helper_decodes_writer_frames_across_two_blocks() {
+    let (_dir, _config, _lease, metadata) = two_segments(Compression::Zstd, false);
+    let path = Path::new(&metadata[0].path);
+    let bytes = fs::read(path).unwrap();
+    assert_eq!(bytes[8], 2);
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    work.admit_compressed_file(bytes.len() as u64, path)
+        .unwrap();
+    let pass = work.first_pass();
+    let mut scratch = ScratchLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let mut decoded = Vec::new();
+    let mut facts = CompressedWorkFacts::default();
+    for (ordinal, offset) in two_block_offsets(path).into_iter().enumerate() {
+        let (encoded, decoded_len, checksum) = writer_block_frame(&bytes, offset);
+        assert_eq!(encoded.get(..4), Some(&[0x28, 0xb5, 0x2f, 0xfd][..]));
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(encoded).unwrap(),
+            Some(decoded_len)
+        );
+        facts = decode_bounded_block(
+            BlockFrame {
+                codec: Compression::Zstd,
+                encoded,
+                checksum,
+                decoded_len,
+            },
+            &work,
+            facts,
+            pass,
+            &mut decoded,
+            &mut scratch,
+            path,
+        )
+        .unwrap();
+        let rows = decode_entries(&decoded, path).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entry.cf.0, CATALOG_CF);
+        assert_eq!(rows[0].entry.key.as_ref(), &[ordinal as u8]);
+        facts = work.check_next_row(facts, pass, path).unwrap();
+    }
+    assert_eq!(facts.blocks, 2);
+    assert_eq!(facts.rows, 2);
+    assert_eq!(work.accepted(), CompressedWorkFacts::default());
+    assert_eq!(scratch.live_bytes(), decoded.capacity());
+}
+
+#[test]
+fn bounded_zstd_helper_rejects_repaired_inner_frames_and_wrong_outer_length() {
+    let (_dir, _config, _lease, metadata) = two_segments(Compression::Zstd, false);
+    let path = Path::new(&metadata[0].path);
+    let bytes = fs::read(path).unwrap();
+    let (encoded, decoded_len, checksum) = writer_block_frame(&bytes, 21);
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    work.admit_compressed_file(bytes.len() as u64, path)
+        .unwrap();
+    let pass = work.first_pass();
+    let mut scratch = ScratchLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let mut decoded = Vec::new();
+
+    // The frame is writer-valid, but its declared content size disagrees
+    // with the segment block header's outer length.
+    let error = decode_bounded_block(
+        BlockFrame {
+            codec: Compression::Zstd,
+            encoded,
+            checksum,
+            decoded_len: decoded_len + 1,
+        },
+        &work,
+        CompressedWorkFacts::default(),
+        pass,
+        &mut decoded,
+        &mut scratch,
+        path,
+    )
+    .unwrap_err();
+    assert!(matches!(error, PraxisError::Corrupt { .. }), "{error}");
+    assert_eq!(decoded.capacity(), 0);
+
+    // Repair the outer CRC after changing the encoded bytes, so rejection
+    // must come from the single-standard-frame policy, not the block CRC.
+    let mut concatenated = encoded.to_vec();
+    concatenated.extend_from_slice(encoded);
+    let error = decode_bounded_block(
+        BlockFrame {
+            codec: Compression::Zstd,
+            encoded: &concatenated,
+            checksum: crc32c(&concatenated),
+            decoded_len,
+        },
+        &work,
+        CompressedWorkFacts::default(),
+        pass,
+        &mut decoded,
+        &mut scratch,
+        path,
+    )
+    .unwrap_err();
+    assert!(matches!(error, PraxisError::Corrupt { .. }), "{error}");
+    assert_eq!(decoded.capacity(), 0);
+    assert_eq!(scratch.live_bytes(), 0);
+    assert_eq!(work.accepted(), CompressedWorkFacts::default());
+}
+
+#[test]
+fn bounded_zstd_helper_rejects_over_profile_claim_before_output_allocation() {
+    let (_dir, _config, _lease, metadata) = two_segments(Compression::Zstd, false);
+    let path = Path::new(&metadata[0].path);
+    let bytes = fs::read(path).unwrap();
+    let (encoded, _decoded_len, checksum) = writer_block_frame(&bytes, 21);
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    work.admit_compressed_file(bytes.len() as u64, path)
+        .unwrap();
+    let mut scratch = ScratchLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let mut decoded = Vec::new();
+    let error = decode_bounded_block(
+        BlockFrame {
+            codec: Compression::Zstd,
+            encoded,
+            checksum,
+            decoded_len: PRODUCTION_COMPRESSED_PROOF_PROFILE.max_decoded_block_bytes + 1,
+        },
+        &work,
+        CompressedWorkFacts::default(),
+        work.first_pass(),
+        &mut decoded,
+        &mut scratch,
+        path,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        PraxisError::UnsupportedCatalogFeature { feature } if feature.contains("decoded block")
+    ));
+    assert_eq!(decoded.capacity(), 0);
+    assert_eq!(scratch.live_bytes(), 0);
+    assert_eq!(work.accepted(), CompressedWorkFacts::default());
+}
+
+#[test]
 fn compressed_work_ledger_checks_file_and_visit_caps_at_exact_claims() {
     let (_dir, _config, _lease, metadata) = two_segments(Compression::Lz4, false);
     let first_path = Path::new(&metadata[0].path);
