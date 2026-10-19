@@ -53,7 +53,6 @@ pub(super) struct ProofProfile {
     pub(super) max_zstd_native_workspace_bytes: usize,
 }
 
-#[allow(dead_code)] // The compressed tag remains fenced until the streaming scanner is proved.
 pub(super) const PRODUCTION_COMPRESSED_PROOF_PROFILE: ProofProfile = ProofProfile {
     max_physical_file_bytes: 128 * 1024 * 1024,
     max_physical_visit_bytes: 512 * 1024 * 1024,
@@ -85,7 +84,6 @@ pub(super) struct CompressedPassContext {
     authenticated_file: Option<CompressedWorkFacts>,
 }
 
-#[allow(dead_code)] // The later streaming scanner calls this after its integrated digest.
 impl CompressedPassContext {
     pub(super) fn require_exact_replay(
         self,
@@ -103,14 +101,12 @@ impl CompressedPassContext {
 }
 
 /// Only authenticated first-pass facts are committed to the visit totals.
-#[allow(dead_code)] // Wired to the private streaming visitor in the next cut.
 pub(super) struct WorkLedger {
     profile: ProofProfile,
     compressed_physical_bytes: u64,
     accepted: CompressedWorkFacts,
 }
 
-#[allow(dead_code)] // Direct helper tests exercise these checks before visitor admission.
 impl WorkLedger {
     pub(super) fn new(profile: ProofProfile) -> Self {
         Self {
@@ -120,10 +116,12 @@ impl WorkLedger {
         }
     }
 
+    #[allow(dead_code)] // Private diagnostics read these counters in direct tests.
     pub(super) fn compressed_physical_bytes(&self) -> u64 {
         self.compressed_physical_bytes
     }
 
+    #[allow(dead_code)] // Private diagnostics read these counters in direct tests.
     pub(super) fn accepted(&self) -> CompressedWorkFacts {
         self.accepted
     }
@@ -2108,10 +2106,8 @@ pub(super) fn scan_zstd_pass2(
     ))
 }
 
-/// Private, callback-free first pass. The visitor remains fenced until the
-/// separate Bloom and provisional row passes have been proved. A later caller
-/// may commit `work` only after this function returns its integrated digest.
-#[allow(dead_code)]
+/// Callback-free first pass. Its work can be committed only after the
+/// integrated digest has authenticated the parser-consumed bytes.
 pub(super) fn scan_lz4_pass1(
     path: &Path,
     expected_identity: SegmentPhysicalId,
@@ -2726,9 +2722,7 @@ fn scan_lz4_opened_owned_pass(
     })
 }
 
-/// Private second pass rebuilds the writer Bloom from authenticated rows but
-/// exposes neither provisional rows nor the filter to the fenced visitor.
-#[allow(dead_code)]
+/// Second pass rebuilds the writer Bloom without exposing provisional rows.
 pub(super) fn scan_lz4_pass2(
     path: &Path,
     expected_identity: SegmentPhysicalId,
@@ -2773,7 +2767,6 @@ pub(super) fn scan_lz4_pass2(
 
 /// Private owned-row pass. Its rows remain provisional until the caller has
 /// authenticated the complete stream and performed the final namespace check.
-#[allow(dead_code)]
 pub(super) fn scan_lz4_pass3(
     path: &Path,
     expected_identity: SegmentPhysicalId,
@@ -2825,6 +2818,35 @@ struct ScannedSegment {
     len: u64,
     digest: blake3::Hash,
     observed_rows: u64,
+}
+
+/// This bounded read selects a scanner; it does not authenticate the file.
+/// Each selected scanner reopens the file and hashes the bytes it parses.
+fn discover_segment_compression(locator: &SegmentLocator) -> Result<u8> {
+    let path = &locator.path;
+    let expected_identity = locator
+        .identity
+        .ok_or_else(|| corrupt(path, "v4 segment lacks admitted physical identity"))?;
+    check_real(path)?;
+    let mut file = File::open(path)?;
+    if !file.metadata()?.is_file() || physical_id(&file, path)? != expected_identity {
+        return Err(corrupt(
+            path,
+            "v4 segment identity changed before discovery",
+        ));
+    }
+    let mut header = [0_u8; SEGMENT_HEADER_BYTES];
+    file.read_exact(&mut header)
+        .map_err(|_| corrupt(path, "short v4 segment header"))?;
+    let mut reader = BinaryReader::new(&header, path);
+    if reader.read_u32()? != SEGMENT_MAGIC || reader.read_u32()? != SEGMENT_VERSION {
+        return Err(corrupt(path, "bad v4 segment magic or version"));
+    }
+    let compression = reader.read_u8()?;
+    if reader.read_u32()? != locator.source.level || reader.read_u64()? != locator.source.id {
+        return Err(corrupt(path, "v4 segment header level or id mismatch"));
+    }
+    Ok(compression)
 }
 
 fn scan_literal_segment(
@@ -3017,9 +3039,49 @@ fn visit_v4_segments_with_receipt(
     let mut attempt = WitnessAttempt::new(root, budget);
     let mut admitted = inventory(root, manifest, &mut attempt)?;
     let (locators, witnesses) = (&mut admitted.locators, &mut admitted.witnesses);
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
     for locator in locators {
         let meta = &manifest.segments[locator.source.manifest_ordinal];
-        let scanned = scan_literal_segment(locator, meta, &mut visit)?;
+        let scanned = match discover_segment_compression(locator)? {
+            0 => scan_literal_segment(locator, meta, &mut visit)?,
+            1 => {
+                let expected_identity = locator.identity.ok_or_else(|| {
+                    corrupt(&locator.path, "v4 segment lacks admitted physical identity")
+                })?;
+                let first =
+                    scan_lz4_pass1(&locator.path, expected_identity, meta, &mut work, |_| {})?;
+                let first_pass = work.first_pass();
+                work.accept_authenticated_file(first_pass, first.work, &locator.path)?;
+                let second =
+                    scan_lz4_pass2(&locator.path, expected_identity, meta, &work, first, |_| {})?;
+                if second != first {
+                    return Err(corrupt(&locator.path, "compressed v4 replay changed"));
+                }
+                let third = scan_lz4_pass3(
+                    &locator.path,
+                    expected_identity,
+                    meta,
+                    locator.source,
+                    &work,
+                    first,
+                    &mut visit,
+                )?;
+                if third != first || third != second {
+                    return Err(corrupt(&locator.path, "compressed v4 owned replay changed"));
+                }
+                ScannedSegment {
+                    len: third.len,
+                    digest: third.digest,
+                    observed_rows: third.work.rows,
+                }
+            }
+            2 => {
+                return Err(unsupported(
+                    "compressed v4 segments need a bounded proof profile",
+                ));
+            }
+            _ => return Err(corrupt(&locator.path, "unknown v4 segment compression tag")),
+        };
         if witnesses.len() == witnesses.capacity() {
             return Err(budget_error(&locator.path));
         }
