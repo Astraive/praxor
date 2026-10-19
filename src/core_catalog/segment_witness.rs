@@ -2255,6 +2255,23 @@ pub(super) fn scan_lz4_pass2(
     )
 }
 
+/// Private third-pass API remains fenced until owned rows and replay are proven.
+#[allow(dead_code)]
+pub(super) fn scan_lz4_pass3(
+    path: &Path,
+    expected_identity: SegmentPhysicalId,
+    meta: &SegmentMetadata,
+    source: SegmentSource,
+    work: &WorkLedger,
+    first: AuthenticatedLz4Pass,
+    visit: impl FnMut(ObservedSegmentRow) -> Result<()>,
+) -> Result<AuthenticatedLz4Pass> {
+    let _ = (path, expected_identity, meta, source, work, first, visit);
+    Err(unsupported(
+        "compressed v4 LZ4 owned row pass is not proven",
+    ))
+}
+
 struct ScannedSegment {
     len: u64,
     digest: blake3::Hash,

@@ -6,7 +6,8 @@ use super::segment_witness::{
     PhysicalRowClass, ProofProfile, ProtectedRole, ProtectedStage, ProtectedStageLimits,
     ScratchLedger, ScratchSlot, SegmentFileWitness, SegmentSource, WorkLedger,
     collect_protected_segment_candidate, collect_protected_segment_candidate_for_test,
-    decode_bounded_block, physical_id, scan_lz4_pass1, scan_lz4_pass2, visit_v4_segments,
+    decode_bounded_block, physical_id, scan_lz4_pass1, scan_lz4_pass2, scan_lz4_pass3,
+    visit_v4_segments,
 };
 use crate::accel::cpu::scalar::CpuAccelerator;
 use crate::config::{Compression, PraxisConfig};
@@ -1678,6 +1679,358 @@ fn private_lz4_pass2_rebuilds_writer_blooms_without_charging_two_files_twice() {
         );
     }
     assert_eq!(work.accepted().rows, 4);
+}
+
+#[test]
+fn private_lz4_pass3_emits_owned_rows_without_recharging_two_files() {
+    let (dir, _config, lease, metadata) = two_segments(Compression::Lz4, true);
+    let root = lease.root();
+    let manifest_path = DiskLayout::at(root).manifest_path();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    assert_eq!(
+        manifest
+            .segments
+            .iter()
+            .map(|meta| meta.id)
+            .collect::<Vec<_>>(),
+        [2, 1]
+    );
+    let before = snapshot(dir.path());
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let mut rows = Vec::new();
+    let mut expected_rows = Vec::new();
+    let mut expected_physical = 0;
+    let mut expected_decoded = 0;
+
+    for (index, meta) in metadata.iter().enumerate() {
+        let path = Path::new(&meta.path);
+        let bytes = fs::read(path).unwrap();
+        let offsets = two_block_offsets(path);
+        let expected_file_decoded: u64 = offsets
+            .into_iter()
+            .map(|offset| writer_block_frame(&bytes, offset).1)
+            .sum();
+        let opened = File::open(path).unwrap();
+        let identity = physical_id(&opened, path).unwrap();
+        drop(opened);
+        let source = SegmentSource {
+            level: meta.level,
+            id: meta.id,
+            manifest_ordinal: 1 - index,
+        };
+        assert_eq!(manifest.segments[source.manifest_ordinal].id, meta.id);
+        assert_eq!(manifest.segments[source.manifest_ordinal].path, meta.path);
+        assert_eq!(meta.file_digest, blake3::hash(&bytes).to_hex().to_string());
+
+        let first = scan_lz4_pass1(path, identity, meta, &mut work, |_| {}).unwrap();
+        assert_eq!(first.len, bytes.len() as u64);
+        assert_eq!(first.digest, blake3::hash(&bytes));
+        assert_eq!(
+            first.work,
+            CompressedWorkFacts {
+                decoded_bytes: expected_file_decoded,
+                blocks: 2,
+                rows: 2,
+            }
+        );
+        let first_context = work.first_pass();
+        work.accept_authenticated_file(first_context, first.work, path)
+            .unwrap();
+        expected_physical += bytes.len() as u64;
+        expected_decoded += expected_file_decoded;
+        let replay = scan_lz4_pass2(path, identity, meta, &work, first, |_| {}).unwrap();
+        assert_eq!(replay, first);
+        let accepted_before_pass3 = work.accepted();
+        let physical_before_pass3 = work.compressed_physical_bytes();
+        if index == 1 {
+            assert_eq!(accepted_before_pass3.rows, 4);
+            assert!(accepted_before_pass3.rows > first.work.rows);
+        }
+
+        let third = scan_lz4_pass3(path, identity, meta, source, &work, first, |row| {
+            rows.push(row);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(third, first);
+        assert_eq!(work.accepted(), accepted_before_pass3);
+        assert_eq!(work.compressed_physical_bytes(), physical_before_pass3);
+        let reopened = File::open(path).unwrap();
+        assert_eq!(physical_id(&reopened, path).unwrap(), identity);
+        assert_eq!(fs::read(path).unwrap(), bytes);
+
+        expected_rows.push(expected_row(
+            source,
+            offsets[0],
+            0,
+            ObservedSegmentValue::Put(vec![0xca, 0xfe]),
+        ));
+        expected_rows.push(expected_row(
+            source,
+            offsets[1],
+            if index == 0 { 1 } else { 2 },
+            if index == 0 {
+                ObservedSegmentValue::Delete
+            } else {
+                ObservedSegmentValue::Merge(vec![0x22])
+            },
+        ));
+    }
+
+    assert_eq!(rows, expected_rows);
+    let (ObservedSegmentValue::Put(first), ObservedSegmentValue::Put(second)) =
+        (&rows[0].value, &rows[2].value)
+    else {
+        panic!("both files must contribute owned Put values")
+    };
+    assert_ne!(first.as_ptr(), second.as_ptr());
+    assert_eq!(work.compressed_physical_bytes(), expected_physical);
+    assert_eq!(
+        work.accepted(),
+        CompressedWorkFacts {
+            decoded_bytes: expected_decoded,
+            blocks: 4,
+            rows: 4,
+        }
+    );
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn private_lz4_pass3_emits_writer_valid_inline_put_over_one_mebibyte() {
+    let (dir, _config, lease, metadata) = two_segments(Compression::Lz4, false);
+    let root = lease.root();
+    let path = Path::new(&metadata[0].path);
+    let mut value = vec![0_u8; 1_100_000];
+    blake3::Hasher::new().finalize_xof().fill(&mut value);
+    let value_path = DiskLayout::at(root).value_log_path(1);
+    let mut value_log = ValueLog::open(&value_path).unwrap();
+    let meta = SegmentWriter::write(
+        SegmentWriteOptions {
+            path,
+            id: 1,
+            level: 0,
+            compression: Compression::Lz4,
+            accelerator: &CpuAccelerator,
+            value_log: &mut value_log,
+            large_value_threshold: value.len() + 1,
+            block_size: 4096,
+            partitioned_bloom: None,
+            direct_io: false,
+        },
+        vec![row(0, StoredValue::Put(value.clone()))],
+    )
+    .unwrap();
+    drop(value_log);
+    let before = snapshot(dir.path());
+    let bytes = fs::read(path).unwrap();
+    assert!(bytes.len() > 1_048_576);
+    assert!(writer_block_frame(&bytes, 21).1 > 1_048_576);
+    let opened = File::open(path).unwrap();
+    let identity = physical_id(&opened, path).unwrap();
+    drop(opened);
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let first = scan_lz4_pass1(path, identity, &meta, &mut work, |_| {}).unwrap();
+    assert_eq!(first.len, bytes.len() as u64);
+    assert_eq!(first.digest, blake3::hash(&bytes));
+    assert_eq!(first.work.rows, 1);
+    assert_eq!(first.work.blocks, 1);
+    let first_context = work.first_pass();
+    work.accept_authenticated_file(first_context, first.work, path)
+        .unwrap();
+    let second = scan_lz4_pass2(path, identity, &meta, &work, first, |_| {}).unwrap();
+    assert_eq!(second, first);
+    let accepted = work.accepted();
+    let physical = work.compressed_physical_bytes();
+    let source = SegmentSource {
+        level: 0,
+        id: 1,
+        manifest_ordinal: 0,
+    };
+    let mut rows = Vec::new();
+    let third = scan_lz4_pass3(path, identity, &meta, source, &work, first, |row| {
+        rows.push(row);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(third, first);
+    assert_eq!(
+        rows,
+        [expected_row(
+            source,
+            21,
+            0,
+            ObservedSegmentValue::Put(value)
+        )]
+    );
+    assert_eq!(work.accepted(), accepted);
+    assert_eq!(work.compressed_physical_bytes(), physical);
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn private_lz4_pass3_rejects_byte_identical_replacement_before_callbacks() {
+    let (_dir, _config, lease, metadata) = two_segments(Compression::Lz4, false);
+    let root = lease.root();
+    let path = Path::new(&metadata[0].path);
+    let original = fs::read(path).unwrap();
+    let manifest_path = DiskLayout::at(root).manifest_path();
+    let original_manifest = fs::read(&manifest_path).unwrap();
+    let opened = File::open(path).unwrap();
+    let original_identity = physical_id(&opened, path).unwrap();
+    drop(opened);
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let first = scan_lz4_pass1(path, original_identity, &metadata[0], &mut work, |_| {}).unwrap();
+    assert_eq!(first.digest, blake3::hash(&original));
+    let first_context = work.first_pass();
+    work.accept_authenticated_file(first_context, first.work, path)
+        .unwrap();
+    assert_eq!(
+        scan_lz4_pass2(path, original_identity, &metadata[0], &work, first, |_| {}).unwrap(),
+        first
+    );
+
+    // Create B while A still exists so the replacement has a distinct file ID.
+    let replacement = path.with_extension("pass3-replacement");
+    fs::write(&replacement, &original).unwrap();
+    let replacement_file = File::open(&replacement).unwrap();
+    assert_ne!(
+        physical_id(&replacement_file, &replacement).unwrap(),
+        original_identity
+    );
+    drop(replacement_file);
+    fs::remove_file(path).unwrap();
+    fs::rename(&replacement, path).unwrap();
+    assert_eq!(fs::read(path).unwrap(), original);
+    assert_eq!(fs::read(&manifest_path).unwrap(), original_manifest);
+    let manifest = Manifest::decode(&original_manifest, &manifest_path).unwrap();
+    assert_eq!(manifest.format_version, 4);
+    assert_eq!(manifest.segments[0].path, metadata[0].path);
+    assert_eq!(manifest.segments[0].file_digest, metadata[0].file_digest);
+    assert_eq!(
+        manifest.segments[0].file_digest,
+        blake3::hash(&original).to_hex().to_string()
+    );
+    let current = File::open(path).unwrap();
+    assert_ne!(physical_id(&current, path).unwrap(), original_identity);
+    drop(current);
+
+    let accepted = work.accepted();
+    let physical = work.compressed_physical_bytes();
+    let mut callbacks = 0;
+    let source = SegmentSource {
+        level: 0,
+        id: 1,
+        manifest_ordinal: 0,
+    };
+    let error = scan_lz4_pass3(
+        path,
+        original_identity,
+        &metadata[0],
+        source,
+        &work,
+        first,
+        |_| {
+            callbacks += 1;
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&error, PraxisError::Corrupt { path: error_path, reason }
+        if error_path.as_path() == path && reason.contains("identity") && reason.contains("changed")),
+        "{error}"
+    );
+    assert_eq!(callbacks, 0);
+    assert_eq!(work.accepted(), accepted);
+    assert_eq!(work.compressed_physical_bytes(), physical);
+    assert_eq!(fs::read(path).unwrap(), original);
+    assert_eq!(fs::read(manifest_path).unwrap(), original_manifest);
+}
+
+#[test]
+fn private_lz4_pass3_rejects_parser_integrated_digest_after_first_callback_aba() {
+    let (_dir, _config, _lease, metadata) = two_segments(Compression::Lz4, false);
+    let path = Path::new(&metadata[0].path);
+    let original = fs::read(path).unwrap();
+    let changed = same_length_lz4_value_variant(&original, path);
+    assert_eq!(changed.len(), original.len());
+    assert_ne!(changed, original);
+    let decoded_b = decode_segment(&changed, path, &CpuAccelerator).unwrap();
+    assert_eq!(decoded_b.blocks.len(), 2);
+    let expected_b_value = match &decoded_b.blocks[0][0].entry.version.value {
+        StoredValue::Put(value) => value.clone(),
+        other => panic!("variant must hold an inline Put, got {other:?}"),
+    };
+    assert_ne!(expected_b_value, [0xca, 0xfe]);
+    assert_eq!(
+        metadata[0].file_digest,
+        blake3::hash(&original).to_hex().to_string()
+    );
+    let opened = File::open(path).unwrap();
+    let identity = physical_id(&opened, path).unwrap();
+    drop(opened);
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let first = scan_lz4_pass1(path, identity, &metadata[0], &mut work, |_| {}).unwrap();
+    assert_eq!(first.digest, blake3::hash(&original));
+    let first_context = work.first_pass();
+    work.accept_authenticated_file(first_context, first.work, path)
+        .unwrap();
+    assert_eq!(
+        scan_lz4_pass2(path, identity, &metadata[0], &work, first, |_| {}).unwrap(),
+        first
+    );
+    let accepted = work.accepted();
+    let physical = work.compressed_physical_bytes();
+    let mut writer = OpenOptions::new().write(true).open(path).unwrap();
+    writer.seek(SeekFrom::Start(0)).unwrap();
+    writer.write_all(&changed).unwrap();
+    writer.sync_all().unwrap();
+    assert_eq!(fs::read(path).unwrap(), changed);
+    let changed_handle = File::open(path).unwrap();
+    assert_eq!(physical_id(&changed_handle, path).unwrap(), identity);
+    drop(changed_handle);
+
+    let source = SegmentSource {
+        level: 0,
+        id: 1,
+        manifest_ordinal: 0,
+    };
+    let mut saw_b = false;
+    let error = scan_lz4_pass3(path, identity, &metadata[0], source, &work, first, |row| {
+        if !saw_b {
+            assert_eq!(row.source, source);
+            assert_eq!(row.block_offset, 21);
+            assert_eq!(row.row_ordinal, 0);
+            assert_eq!(row.key, [0]);
+            assert_eq!(
+                row.value,
+                ObservedSegmentValue::Put(expected_b_value.clone())
+            );
+            saw_b = true;
+            writer.seek(SeekFrom::Start(0)).unwrap();
+            writer.write_all(&original).unwrap();
+            writer.sync_all().unwrap();
+            assert_eq!(fs::read(path).unwrap(), original);
+        }
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(
+        saw_b,
+        "pass 3 did not callback with the independently decoded B row: {error}"
+    );
+    assert!(
+        matches!(&error, PraxisError::Corrupt { path: error_path, reason }
+        if error_path.as_path() == path && reason.contains("integrated") && reason.contains("digest")),
+        "{error}"
+    );
+    assert_eq!(work.accepted(), accepted);
+    assert_eq!(work.compressed_physical_bytes(), physical);
+    drop(writer);
+    assert_eq!(fs::read(path).unwrap(), original);
+    let restored = File::open(path).unwrap();
+    assert_eq!(physical_id(&restored, path).unwrap(), identity);
 }
 
 #[test]
