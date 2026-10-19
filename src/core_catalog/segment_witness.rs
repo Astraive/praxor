@@ -1143,7 +1143,6 @@ struct SegmentLocator {
 struct SegmentInventory {
     locators: Vec<SegmentLocator>,
     witnesses: Vec<SegmentFileWitness>,
-    charged_bytes: usize,
     retained_witness_bytes: usize,
 }
 
@@ -1162,42 +1161,81 @@ fn checked_double(path: &Path, count: usize) -> Result<usize> {
     count.checked_mul(2).ok_or_else(|| budget_error(path))
 }
 
-fn debit(
-    budget: &mut PhysicalWitnessBudget,
-    charged: &mut usize,
-    path: &Path,
-    bytes: usize,
-) -> Result<()> {
-    let total = charged
-        .checked_add(bytes)
-        .ok_or_else(|| budget_error(path))?;
-    budget.charge(path, bytes)?;
-    *charged = total;
-    Ok(())
+/// Own the witness-budget debit for the entire physical attempt, including
+/// inventory and callbacks. The exclusively borrowed budget cannot be changed
+/// without updating this tally while the guard is armed.
+struct WitnessAttempt<'budget, 'root> {
+    budget: &'budget mut PhysicalWitnessBudget,
+    root: &'root Path,
+    charged: usize,
+    armed: bool,
 }
 
-fn refund(
-    budget: &mut PhysicalWitnessBudget,
-    charged: &mut usize,
-    path: &Path,
-    bytes: usize,
-) -> Result<()> {
-    let total = charged
-        .checked_sub(bytes)
-        .ok_or_else(|| budget_error(path))?;
-    budget.release(path, bytes)?;
-    *charged = total;
-    Ok(())
+impl<'budget, 'root> WitnessAttempt<'budget, 'root> {
+    fn new(root: &'root Path, budget: &'budget mut PhysicalWitnessBudget) -> Self {
+        Self {
+            budget,
+            root,
+            charged: 0,
+            armed: true,
+        }
+    }
+
+    fn charged(&self) -> usize {
+        self.charged
+    }
+
+    fn charge(&mut self, path: &Path, bytes: usize) -> Result<()> {
+        let total = self
+            .charged
+            .checked_add(bytes)
+            .ok_or_else(|| budget_error(path))?;
+        self.budget.charge(path, bytes)?;
+        self.charged = total;
+        Ok(())
+    }
+
+    fn release(&mut self, path: &Path, bytes: usize) -> Result<()> {
+        let total = self
+            .charged
+            .checked_sub(bytes)
+            .ok_or_else(|| budget_error(path))?;
+        self.budget.release(path, bytes)?;
+        self.charged = total;
+        Ok(())
+    }
+
+    /// The returned witness vector takes over this still-live debit. Only the
+    /// caller's discard path may release it after those witnesses are dropped.
+    fn transfer_retained(&mut self, expected: usize) -> Result<()> {
+        if self.charged != expected {
+            return Err(budget_error(self.root));
+        }
+        self.charged = 0;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for WitnessAttempt<'_, '_> {
+    fn drop(&mut self) {
+        if self.armed && self.charged != 0 {
+            // No other mutable budget borrower exists, so underflow here is an
+            // internal invariant failure. Never panic while unwinding.
+            if self.budget.release(self.root, self.charged).is_err() {
+                std::process::abort();
+            }
+        }
+    }
 }
 
 fn reserved_vec<T>(
     count: usize,
     path: &Path,
-    budget: &mut PhysicalWitnessBudget,
-    charged: &mut usize,
+    attempt: &mut WitnessAttempt<'_, '_>,
 ) -> Result<(Vec<T>, usize)> {
     let allowance = vector_charge::<T>(path, checked_double(path, count)?)?;
-    debit(budget, charged, path, allowance)?;
+    attempt.charge(path, allowance)?;
     let mut values = Vec::new();
     values
         .try_reserve_exact(count)
@@ -1211,15 +1249,14 @@ fn reserved_vec<T>(
 fn reserved_set<T: Eq + Hash>(
     count: usize,
     path: &Path,
-    budget: &mut PhysicalWitnessBudget,
-    charged: &mut usize,
+    attempt: &mut WitnessAttempt<'_, '_>,
 ) -> Result<(HashSet<T>, usize)> {
     let prospective = count
         .checked_mul(4)
         .map(|count| count.max(16))
         .ok_or_else(|| budget_error(path))?;
     let allowance = physical_set_charge::<T>(path, prospective)?;
-    debit(budget, charged, path, allowance)?;
+    attempt.charge(path, allowance)?;
     let mut values = HashSet::new();
     values
         .try_reserve(count)
@@ -1337,7 +1374,7 @@ fn parse_segment_id(path: &Path) -> Result<u64> {
 fn inventory(
     root: &Path,
     manifest: &Manifest,
-    budget: &mut PhysicalWitnessBudget,
+    attempt: &mut WitnessAttempt<'_, '_>,
 ) -> Result<SegmentInventory> {
     if root.as_os_str().as_encoded_bytes().len() > MAX_ROOT_ENCODED_BYTES || root.to_str().is_none()
     {
@@ -1355,8 +1392,7 @@ fn inventory(
         return Err(corrupt(root, "v4 segment listed-file limit exceeded"));
     }
 
-    let mut charged = 0;
-    let result = (|| -> Result<SegmentInventory> {
+    (|| -> Result<SegmentInventory> {
         let layout = DiskLayout::at(root);
         let segment_root = layout.segment_root();
         check_real(&segment_root)?;
@@ -1365,9 +1401,8 @@ fn inventory(
         }
 
         let count = manifest.segments.len();
-        let (mut locators, _) = reserved_vec::<SegmentLocator>(count, root, budget, &mut charged)?;
-        let (mut global_ids, global_set_charge) =
-            reserved_set::<u64>(count, root, budget, &mut charged)?;
+        let (mut locators, _) = reserved_vec::<SegmentLocator>(count, root, attempt)?;
+        let (mut global_ids, global_set_charge) = reserved_set::<u64>(count, root, attempt)?;
         for (manifest_ordinal, meta) in manifest.segments.iter().enumerate() {
             if meta.id == 0 || !global_ids.insert(meta.id) {
                 return Err(corrupt(root, "duplicate or zero v4 segment global id"));
@@ -1385,7 +1420,7 @@ fn inventory(
             if path.capacity() > path_bytes {
                 return Err(budget_error(&path));
             }
-            debit(budget, &mut charged, &path, path_bytes)?;
+            attempt.charge(&path, path_bytes)?;
             locators.push(SegmentLocator {
                 source: SegmentSource {
                     level: meta.level,
@@ -1400,12 +1435,12 @@ fn inventory(
         }
         locators.sort_unstable_by_key(|item| (item.source.level, item.source.id));
         drop(global_ids);
-        refund(budget, &mut charged, root, global_set_charge)?;
+        attempt.release(root, global_set_charge)?;
 
-        let (mut seen, seen_charge) = reserved_vec::<u8>(count, root, budget, &mut charged)?;
+        let (mut seen, seen_charge) = reserved_vec::<u8>(count, root, attempt)?;
         seen.resize(count, 0);
         let (mut physical_ids, physical_set_charge) =
-            reserved_set::<SegmentPhysicalId>(count, root, budget, &mut charged)?;
+            reserved_set::<SegmentPhysicalId>(count, root, attempt)?;
         let mut observed = 0;
         for (levels, level_entry) in fs::read_dir(&segment_root)?.enumerate() {
             if levels == MAX_SEGMENT_LEVELS {
@@ -1468,33 +1503,26 @@ fn inventory(
         }
 
         drop(physical_ids);
-        refund(budget, &mut charged, root, physical_set_charge)?;
+        attempt.release(root, physical_set_charge)?;
         drop(seen);
-        refund(budget, &mut charged, root, seen_charge)?;
+        attempt.release(root, seen_charge)?;
 
-        let (witnesses, witness_charge) =
-            reserved_vec::<SegmentFileWitness>(count, root, budget, &mut charged)?;
+        let (witnesses, witness_charge) = reserved_vec::<SegmentFileWitness>(count, root, attempt)?;
         let mut retained_witness_bytes = witness_charge;
         for locator in &mut locators {
             let path_bytes = path_charge(&locator.path)?;
             retained_witness_bytes = retained_witness_bytes
                 .checked_add(path_bytes)
                 .ok_or_else(|| budget_error(&locator.path))?;
-            debit(budget, &mut charged, &locator.path, path_bytes)?;
+            attempt.charge(&locator.path, path_bytes)?;
             locator.witness_path = Some(clone_witness_path(&locator.path)?);
         }
         Ok(SegmentInventory {
             locators,
             witnesses,
-            charged_bytes: charged,
             retained_witness_bytes,
         })
-    })();
-    if result.is_err() {
-        // All allocations owned by the failed closure have been dropped.
-        budget.release(root, charged)?;
-    }
-    result
+    })()
 }
 
 #[derive(Clone, Copy)]
@@ -2418,54 +2446,44 @@ fn visit_v4_segments_with_receipt(
     budget: &mut PhysicalWitnessBudget,
     mut visit: impl FnMut(ObservedSegmentRow) -> Result<()>,
 ) -> Result<(Vec<SegmentFileWitness>, usize)> {
-    let mut admitted = inventory(root, manifest, budget)?;
-    let result = (|| -> Result<()> {
-        let (locators, witnesses) = (&mut admitted.locators, &mut admitted.witnesses);
-        for locator in locators {
-            let meta = &manifest.segments[locator.source.manifest_ordinal];
-            let scanned = scan_literal_segment(locator, meta, &mut visit)?;
-            if witnesses.len() == witnesses.capacity() {
-                return Err(budget_error(&locator.path));
-            }
-            let path = locator.witness_path.take().ok_or_else(|| {
-                corrupt(&locator.path, "v4 segment witness path was not precharged")
-            })?;
-            witnesses.push(SegmentFileWitness {
-                source: locator.source,
-                path,
-                identity: locator.identity.ok_or_else(|| {
-                    corrupt(&locator.path, "v4 segment witness has no physical identity")
-                })?,
-                len: scanned.len,
-                digest: scanned.digest,
-                observed_rows: scanned.observed_rows,
-            });
+    // This guard starts before inventory. On every Err or Rust unwind, later
+    // locals and their backing allocations drop before its budget refund.
+    let mut attempt = WitnessAttempt::new(root, budget);
+    let mut admitted = inventory(root, manifest, &mut attempt)?;
+    let (locators, witnesses) = (&mut admitted.locators, &mut admitted.witnesses);
+    for locator in locators {
+        let meta = &manifest.segments[locator.source.manifest_ordinal];
+        let scanned = scan_literal_segment(locator, meta, &mut visit)?;
+        if witnesses.len() == witnesses.capacity() {
+            return Err(budget_error(&locator.path));
         }
-        recheck_namespace(root, &mut admitted)
-    })();
-    let charged = admitted.charged_bytes;
-    match result {
-        Ok(()) => {
-            let retained = admitted.retained_witness_bytes;
-            let temporary = match charged.checked_sub(retained) {
-                Some(temporary) => temporary,
-                None => {
-                    drop(admitted);
-                    budget.release(root, charged)?;
-                    return Err(budget_error(root));
-                }
-            };
-            let witnesses = std::mem::take(&mut admitted.witnesses);
-            drop(admitted);
-            budget.release(root, temporary)?;
-            Ok((witnesses, retained))
-        }
-        Err(error) => {
-            drop(admitted);
-            budget.release(root, charged)?;
-            Err(error)
-        }
+        let path = locator
+            .witness_path
+            .take()
+            .ok_or_else(|| corrupt(&locator.path, "v4 segment witness path was not precharged"))?;
+        witnesses.push(SegmentFileWitness {
+            source: locator.source,
+            path,
+            identity: locator.identity.ok_or_else(|| {
+                corrupt(&locator.path, "v4 segment witness has no physical identity")
+            })?,
+            len: scanned.len,
+            digest: scanned.digest,
+            observed_rows: scanned.observed_rows,
+        });
     }
+    recheck_namespace(root, &mut admitted)?;
+
+    let retained = admitted.retained_witness_bytes;
+    let temporary = attempt
+        .charged()
+        .checked_sub(retained)
+        .ok_or_else(|| budget_error(root))?;
+    let witnesses = std::mem::take(&mut admitted.witnesses);
+    drop(admitted);
+    attempt.release(root, temporary)?;
+    attempt.transfer_retained(retained)?;
+    Ok((witnesses, retained))
 }
 
 #[cfg(test)]
