@@ -15,6 +15,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Assert frozen source
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          git rev-parse HEAD^{tree}
+          test -z "$(git status --porcelain)"
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rustfmt, clippy
@@ -23,6 +32,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Verify catalog evidence parser fixtures
+        run: python -m unittest -v scripts.test_ci_catalog_evidence
+
       - name: Verify vendored Zstd source
         run: python scripts/verify_zstd_vendor.py
 
@@ -30,19 +42,33 @@ jobs:
         run: cargo fmt --check
 
       - name: Check tests and benches
-        run: cargo check --locked --benches --tests
+        run: cargo check --locked --jobs 2 --benches --tests
 
       - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --jobs 2 --all-targets -- -D warnings
 
       - name: Verify bounded Zstd native workspace
         run: |
-          cargo test --locked --jobs 2 --lib -- --list |
-            grep -Fx 'core_catalog::segment_witness_tests::bounded_zstd_native_workspace_is_aligned_and_refused_before_output_reserve: test'
-          cargo test --locked --jobs 2 --lib core_catalog::segment_witness_tests::bounded_zstd_native_workspace_is_aligned_and_refused_before_output_reserve -- --exact --nocapture
+          set -euo pipefail
+          cargo test --locked --jobs 2 --lib -- --list 2>&1 | tee "$RUNNER_TEMP/praxor-lib-list.log"
+          cargo test --locked --jobs 2 --lib core_catalog::segment_witness_tests::bounded_zstd_native_workspace_is_aligned_and_refused_before_output_reserve -- --exact --nocapture --test-threads 1 2>&1 | tee "$RUNNER_TEMP/praxor-native-run.log"
+          python scripts/ci_catalog_evidence.py exact --list "$RUNNER_TEMP/praxor-lib-list.log" --run "$RUNNER_TEMP/praxor-native-run.log" --name core_catalog::segment_witness_tests::bounded_zstd_native_workspace_is_aligned_and_refused_before_output_reserve --output "$RUNNER_TEMP/praxor-native-evidence.json"
 
-      - name: Test
-        run: cargo test --locked --all
+      - name: Focused catalog witness inventory and test
+        run: |
+          set -euo pipefail
+          cargo test --locked --jobs 2 --lib core_catalog::segment_witness_tests:: -- --list 2>&1 | tee "$RUNNER_TEMP/praxor-focused-list.log"
+          cargo test --locked --jobs 2 --lib core_catalog::segment_witness_tests:: -- --list --ignored 2>&1 | tee "$RUNNER_TEMP/praxor-focused-ignored-list.log"
+          cargo test --locked --jobs 2 --lib core_catalog::segment_witness_tests:: -- --test-threads 2 2>&1 | tee "$RUNNER_TEMP/praxor-focused-run.log"
+          python scripts/ci_catalog_evidence.py focused --library-list "$RUNNER_TEMP/praxor-lib-list.log" --list "$RUNNER_TEMP/praxor-focused-list.log" --ignored-list "$RUNNER_TEMP/praxor-focused-ignored-list.log" --run "$RUNNER_TEMP/praxor-focused-run.log" --prefix core_catalog::segment_witness_tests:: --output "$RUNNER_TEMP/praxor-focused-evidence.json"
+
+      - name: Full test inventory and run
+        run: |
+          set -euo pipefail
+          cargo test --locked --jobs 2 --all -- --list 2>&1 | tee "$RUNNER_TEMP/praxor-full-list.log"
+          cargo test --locked --jobs 2 --all -- --list --ignored 2>&1 | tee "$RUNNER_TEMP/praxor-full-ignored-list.log"
+          cargo test --locked --jobs 2 --all -- --test-threads 2 2>&1 | tee "$RUNNER_TEMP/praxor-full-run.log"
+          python scripts/ci_catalog_evidence.py full --list "$RUNNER_TEMP/praxor-full-list.log" --ignored-list "$RUNNER_TEMP/praxor-full-ignored-list.log" --run "$RUNNER_TEMP/praxor-full-run.log" --focused-list "$RUNNER_TEMP/praxor-focused-list.log" --output "$RUNNER_TEMP/praxor-full-evidence.json"
 
       - name: Storage slog gate
         shell: pwsh
@@ -51,6 +77,66 @@ jobs:
       - name: Storage boundary gate
         shell: pwsh
         run: ./scripts/verify_storage_boundary.ps1
+
+      - name: Assert frozen source after tests
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test -z "$(git status --porcelain)"
+          for name in lib-list native-run focused-list focused-ignored-list focused-run full-list full-ignored-list full-run; do
+            test -s "$RUNNER_TEMP/praxor-$name.log"
+          done
+          for name in native focused full; do
+            test -s "$RUNNER_TEMP/praxor-$name-evidence.json"
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: catalog-linux-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/praxor-*.log
+            ${{ runner.temp }}/praxor-*-evidence.json
+          if-no-files-found: error
+
+  catalog-platform-windows:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-2025
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Assert frozen source
+        shell: pwsh
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if ((git rev-parse HEAD).Trim() -ne $env:EXPECTED_HEAD) { throw 'Checkout differs from event head' }
+          git rev-parse 'HEAD^{tree}'
+          if (git status --porcelain) { throw 'Checkout has changes' }
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Frozen-head Windows catalog platform gate
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python scripts/ci_catalog_platform_windows.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: catalog-windows-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/p80-${{ github.run_id }}-${{ github.run_attempt }}/logs/
+          if-no-files-found: error
 
   feature-matrix:
     runs-on: ubuntu-latest
@@ -65,6 +151,15 @@ jobs:
           - gpu-cuda,gpu-vulkan,gpu-metal,gpu-wgpu
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Assert frozen source
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          git rev-parse HEAD^{tree}
+          test -z "$(git status --porcelain)"
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
@@ -75,12 +170,28 @@ jobs:
         run: python scripts/verify_zstd_vendor.py --features "${{ matrix.features }}"
 
       - name: Check GPU fallback feature set
-        run: cargo check --locked --benches --tests --features "${{ matrix.features }}"
+        run: cargo check --locked --jobs 2 --benches --tests --features "${{ matrix.features }}"
+
+      - name: Assert frozen source after check
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test -z "$(git status --porcelain)"
 
   benchmark-smoke:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Assert frozen source
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          git rev-parse HEAD^{tree}
+          test -z "$(git status --porcelain)"
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
@@ -91,16 +202,23 @@ jobs:
         run: python scripts/verify_zstd_vendor.py
 
       - name: Accel smoke benchmark
-        run: cargo bench --locked --bench accel_gpu_crc -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+        run: cargo bench --locked --jobs 2 --bench accel_gpu_crc -- --sample-size 10 --warm-up-time 1 --measurement-time 1
 
       - name: Graph smoke benchmark
-        run: cargo bench --locked --bench graph_adjacency_traversal -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+        run: cargo bench --locked --jobs 2 --bench graph_adjacency_traversal -- --sample-size 10 --warm-up-time 1 --measurement-time 1
 
       - name: Vector smoke benchmark
-        run: cargo bench --locked --bench vector_ivf_search -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+        run: cargo bench --locked --jobs 2 --bench vector_ivf_search -- --sample-size 10 --warm-up-time 1 --measurement-time 1
 
       - name: Search smoke benchmark
-        run: cargo bench --locked --bench search_inverted_index -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+        run: cargo bench --locked --jobs 2 --bench search_inverted_index -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+
+      - name: Assert frozen source after benchmarks
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test -z "$(git status --porcelain)"
 
   ignored-stress:
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
@@ -108,6 +226,15 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Assert frozen source
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          git rev-parse HEAD^{tree}
+          test -z "$(git status --porcelain)"
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
@@ -118,7 +245,14 @@ jobs:
         run: python scripts/verify_zstd_vendor.py
 
       - name: Ignored concurrency benchmark
-        run: cargo test --locked --test concurrency_benchmark_integration test_phase3b_concurrent_benchmark -- --ignored --exact --test-threads=1
+        run: cargo test --locked --jobs 2 --test concurrency_benchmark_integration test_phase3b_concurrent_benchmark -- --ignored --exact --test-threads=1
 
       - name: Ignored stress workloads
-        run: cargo test --locked --test concurrency_stress -- --ignored --test-threads=1
+        run: cargo test --locked --jobs 2 --test concurrency_stress -- --ignored --test-threads=1
+
+      - name: Assert frozen source after stress
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test -z "$(git status --porcelain)"
