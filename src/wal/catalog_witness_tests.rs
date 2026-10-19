@@ -1,8 +1,8 @@
 use super::catalog_witness::{
-    ReservationKind, WalCut, charged_existing_witness_bytes_for_test, recheck_v4_wals,
-    scan_v4_wals, scan_v4_wals_with_budget, scan_v4_wals_with_budget_limit,
-    set_recheck_final_open_hook, set_reservation_failure, set_scan_before_first_open_hook,
-    set_second_pass_hook,
+    ReservationKind, WalCut, charged_existing_witness_bytes_for_test, path_charge,
+    physical_set_charge, recheck_v4_wals, reserve_physical_set, reserve_vector, scan_v4_wals,
+    scan_v4_wals_with_budget, scan_v4_wals_with_budget_limit, set_recheck_final_open_hook,
+    set_reservation_failure, set_scan_before_first_open_hook, set_second_pass_hook, vector_charge,
 };
 use super::record::{CoreWalRecord, WalRecord};
 use crate::errors::PraxisError;
@@ -10,6 +10,7 @@ use crate::io::crc32c;
 use crate::transactions::WriteBatch;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 
@@ -387,6 +388,67 @@ fn wal_witness_budget_remaining_accounts_for_retained_proofs() {
     assert_eq!(budget.remaining_bytes(), 0);
     let error = budget.charge(root.path(), 1).unwrap_err();
     assert!(matches!(error, PraxisError::Corrupt { .. }));
+}
+
+#[test]
+fn charged_wal_budget_can_fund_and_release_segment_style_metadata() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("wal")).unwrap();
+    write(root.path(), 1, BOOTSTRAP);
+    let (witnesses, mut budget) =
+        scan_v4_wals_with_budget(root.path(), cut(0, 1, 2), |_, _, _, _| Ok(())).unwrap();
+    assert_eq!(witnesses.len(), 1);
+    let retained_remaining = budget.remaining_bytes();
+    assert!(retained_remaining < 64 * 1024 * 1024);
+
+    let segment_path = root.path().join("segments/0/00000000000000000001.tseg");
+    let path_bytes = path_charge(&segment_path).unwrap();
+    budget.charge(&segment_path, path_bytes).unwrap();
+    let mut locators = Vec::<u64>::new();
+    reserve_vector(
+        &mut locators,
+        ReservationKind::Listed,
+        &segment_path,
+        &mut budget,
+    )
+    .unwrap();
+    locators.push(1);
+    let vector_bytes = vector_charge::<u64>(&segment_path, locators.capacity()).unwrap();
+    let mut ids = HashSet::<u64>::new();
+    reserve_physical_set(&mut ids, &segment_path, &mut budget).unwrap();
+    assert!(ids.insert(1));
+    let set_bytes = physical_set_charge::<u64>(&segment_path, ids.capacity()).unwrap();
+    assert_eq!(
+        budget.remaining_bytes(),
+        retained_remaining - path_bytes - vector_bytes - set_bytes
+    );
+
+    drop(ids);
+    budget.release(&segment_path, set_bytes).unwrap();
+    drop(locators);
+    budget.release(&segment_path, vector_bytes).unwrap();
+    drop(segment_path);
+    budget.release(root.path(), path_bytes).unwrap();
+    assert_eq!(budget.remaining_bytes(), retained_remaining);
+
+    budget.charge(root.path(), retained_remaining).unwrap();
+    let mut refused = Vec::<u64>::new();
+    assert!(
+        reserve_vector(
+            &mut refused,
+            ReservationKind::Listed,
+            root.path(),
+            &mut budget,
+        )
+        .is_err()
+    );
+    assert!(refused.is_empty());
+    assert_eq!(refused.capacity(), 0);
+    assert_eq!(budget.remaining_bytes(), 0);
+    budget.release(root.path(), retained_remaining).unwrap();
+    assert_eq!(budget.remaining_bytes(), retained_remaining);
+    assert!(budget.release(root.path(), 64 * 1024 * 1024 + 1).is_err());
+    assert_eq!(budget.remaining_bytes(), retained_remaining);
 }
 
 #[test]

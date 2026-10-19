@@ -145,14 +145,15 @@ impl PhysicalWitnessBudget {
         Ok(())
     }
 
-    fn release(&mut self, path: &Path, bytes: usize) -> Result<()> {
+    /// Release a temporary charge only after its backing allocation is dropped.
+    pub(crate) fn release(&mut self, path: &Path, bytes: usize) -> Result<()> {
         self.used = budget_arithmetic(path, self.used.checked_sub(bytes))?;
         Ok(())
     }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-pub(super) enum ReservationKind {
+pub(crate) enum ReservationKind {
     Listed,
     Physical,
     Witness,
@@ -166,7 +167,7 @@ fn budget_arithmetic<T>(path: &Path, value: Option<T>) -> Result<T> {
     value.ok_or_else(|| budget_error(path))
 }
 
-fn path_charge(path: &Path) -> Result<usize> {
+pub(crate) fn path_charge(path: &Path) -> Result<usize> {
     // Windows native paths may use two bytes per encoded ASCII byte. Allow
     // additional capacity and allocator slack for every retained path and
     // cloned witness path, rather than charging only the logical filename.
@@ -174,7 +175,7 @@ fn path_charge(path: &Path) -> Result<usize> {
     budget_arithmetic(path, encoded.checked_mul(6).and_then(|n| n.checked_add(64)))
 }
 
-fn vector_charge<T>(path: &Path, capacity: usize) -> Result<usize> {
+pub(crate) fn vector_charge<T>(path: &Path, capacity: usize) -> Result<usize> {
     if capacity == 0 {
         return Ok(0);
     }
@@ -187,7 +188,7 @@ fn vector_charge<T>(path: &Path, capacity: usize) -> Result<usize> {
     )
 }
 
-fn physical_set_charge(path: &Path, capacity: usize) -> Result<usize> {
+pub(crate) fn physical_set_charge<T>(path: &Path, capacity: usize) -> Result<usize> {
     if capacity == 0 {
         return Ok(0);
     }
@@ -196,7 +197,7 @@ fn physical_set_charge(path: &Path, capacity: usize) -> Result<usize> {
     budget_arithmetic(
         path,
         capacity
-            .checked_mul(std::mem::size_of::<PhysicalId>() + 8)
+            .checked_mul(std::mem::size_of::<T>() + 8)
             .and_then(|n| n.checked_mul(2))
             .and_then(|n| n.checked_add(64)),
     )
@@ -231,7 +232,7 @@ fn check_reservation(kind: ReservationKind, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn reserve_vector<T>(
+pub(crate) fn reserve_vector<T>(
     vec: &mut Vec<T>,
     kind: ReservationKind,
     path: &Path,
@@ -263,23 +264,23 @@ fn reserve_vector<T>(
     Ok(())
 }
 
-fn reserve_physical_set(
-    set: &mut HashSet<PhysicalId>,
+pub(crate) fn reserve_physical_set<T: Eq + std::hash::Hash>(
+    set: &mut HashSet<T>,
     path: &Path,
     budget: &mut PhysicalWitnessBudget,
 ) -> Result<()> {
     if set.len() < set.capacity() {
         return Ok(());
     }
-    let old_charge = physical_set_charge(path, set.capacity())?;
+    let old_charge = physical_set_charge::<T>(path, set.capacity())?;
     let target = next_capacity(path, set.capacity())?;
     let prospective = budget_arithmetic(path, target.checked_mul(2))?;
-    let reserved_charge = physical_set_charge(path, prospective)?;
+    let reserved_charge = physical_set_charge::<T>(path, prospective)?;
     budget.charge(path, reserved_charge)?;
     check_reservation(ReservationKind::Physical, path)?;
     set.try_reserve(target - set.len())
         .map_err(|_| corrupt(path, "v4 WAL physical witness budget reservation failed"))?;
-    let actual_charge = physical_set_charge(path, set.capacity())?;
+    let actual_charge = physical_set_charge::<T>(path, set.capacity())?;
     if actual_charge > reserved_charge {
         return Err(budget_error(path));
     }
@@ -402,7 +403,7 @@ fn inventory(root: &Path, cut: WalCut, budget: &mut PhysicalWitnessBudget) -> Re
         &wal_dir,
         retained_path_bytes.checked_add(vector_charge::<ListedFile>(&wal_dir, listed.capacity())?),
     )?;
-    let physical_bytes = physical_set_charge(&wal_dir, physical.capacity())?;
+    let physical_bytes = physical_set_charge::<PhysicalId>(&wal_dir, physical.capacity())?;
     drop(physical);
     budget.release(&wal_dir, physical_bytes)?;
     Ok(Inventory {
@@ -686,7 +687,7 @@ fn scan_before_first_open_hook() {
     });
 }
 
-fn clone_witness_path(path: &Path) -> Result<PathBuf> {
+pub(crate) fn clone_witness_path(path: &Path) -> Result<PathBuf> {
     let mut copy = PathBuf::new();
     let native_capacity = budget_arithmetic(
         path,
