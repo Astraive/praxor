@@ -12,11 +12,15 @@ mod database;
 mod frame;
 #[allow(dead_code)] // Private read-only physical proof is not yet a public owner.
 mod physical;
+#[allow(dead_code)] // #80 starts with a compiling behavioral RED for this private reader.
+mod segment_witness;
 
 #[cfg(test)]
 mod frame_tests;
 #[cfg(test)]
 mod physical_tests;
+#[cfg(test)]
+mod segment_witness_tests;
 
 pub(crate) use control::CatalogControl;
 
