@@ -7,6 +7,9 @@ on:
   schedule:
     - cron: "0 3 * * 1"
 
+env:
+  CARGO_BUILD_JOBS: "2"
+
 jobs:
   storage-kernel:
     runs-on: ubuntu-latest
@@ -16,6 +19,12 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify vendored Zstd source
+        run: python scripts/verify_zstd_vendor.py
 
       - name: Format
         run: cargo fmt --check
@@ -25,6 +34,12 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Verify bounded Zstd native workspace
+        run: |
+          cargo test --locked --jobs 2 --lib -- --list |
+            grep -Fx 'core_catalog::segment_witness_tests::bounded_zstd_native_workspace_is_aligned_and_refused_before_output_reserve: test'
+          cargo test --locked --jobs 2 --lib core_catalog::segment_witness_tests::bounded_zstd_native_workspace_is_aligned_and_refused_before_output_reserve -- --exact --nocapture
 
       - name: Test
         run: cargo test --locked --all
@@ -52,6 +67,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify vendored Zstd source
+        run: python scripts/verify_zstd_vendor.py --features "${{ matrix.features }}"
 
       - name: Check GPU fallback feature set
         run: cargo check --locked --benches --tests --features "${{ matrix.features }}"
@@ -62,6 +83,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify vendored Zstd source
+        run: python scripts/verify_zstd_vendor.py
 
       - name: Accel smoke benchmark
         run: cargo bench --locked --bench accel_gpu_crc -- --sample-size 10 --warm-up-time 1 --measurement-time 1
@@ -83,6 +110,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify vendored Zstd source
+        run: python scripts/verify_zstd_vendor.py
 
       - name: Ignored concurrency benchmark
         run: cargo test --locked --test concurrency_benchmark_integration test_phase3b_concurrent_benchmark -- --ignored --exact --test-threads=1
