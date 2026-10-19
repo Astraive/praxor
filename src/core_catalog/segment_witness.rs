@@ -2073,9 +2073,8 @@ pub(super) enum Lz4PassProbe {
     AfterContiguousRead { digest: blake3::Hash },
 }
 
-// The Zstd passes use the same authenticated framing as LZ4, but do not yet
-// grant either visitor or installed-owner authority.
-#[allow(dead_code)] // Exercised by private tests; visitor admission is a later cut.
+// Zstd and LZ4 passes share authenticated facts. Admission to the bounded
+// visitor does not grant installed-owner authority.
 pub(super) type AuthenticatedZstdPass = AuthenticatedLz4Pass;
 
 #[allow(dead_code)]
@@ -2144,7 +2143,6 @@ impl CompressedPassProbe {
     }
 }
 
-#[allow(dead_code)] // Exercised by private tests; visitor admission is a later cut.
 pub(super) fn scan_zstd_pass1(
     path: &Path,
     expected_identity: SegmentPhysicalId,
@@ -2177,7 +2175,6 @@ pub(super) fn scan_zstd_pass1(
     )
 }
 
-#[allow(dead_code)] // Exercised by private tests; visitor admission is a later cut.
 pub(super) fn scan_zstd_pass2(
     path: &Path,
     expected_identity: SegmentPhysicalId,
@@ -2908,7 +2905,7 @@ pub(super) fn scan_lz4_pass2(
     )
 }
 
-/// Private owned-row pass. Its rows remain provisional until the caller has
+/// Owned-row replay. Its rows remain provisional until the visitor has
 /// authenticated the complete stream and performed the final namespace check.
 #[allow(clippy::too_many_arguments)]
 fn scan_compressed_pass3(
@@ -2960,7 +2957,7 @@ fn scan_compressed_pass3(
     )
 }
 
-/// Private LZ4 owned-row replay remains provisional until final caller checks.
+/// LZ4 owned-row replay remains provisional until final visitor checks.
 pub(super) fn scan_lz4_pass3(
     path: &Path,
     expected_identity: SegmentPhysicalId,
@@ -2982,9 +2979,8 @@ pub(super) fn scan_lz4_pass3(
     )
 }
 
-/// Private Zstd owned replay grants no public tag-2 visitor or installed-owner
-/// authority until a separately reviewed cut.
-#[allow(dead_code)]
+/// Zstd owned replay remains provisional until the visitor's final checks;
+/// it does not grant installed-owner authority.
 pub(super) fn scan_zstd_pass3(
     path: &Path,
     expected_identity: SegmentPhysicalId,
@@ -3266,29 +3262,49 @@ fn visit_v4_segments_with_receipt_inner(
         let meta = &manifest.segments[locator.source.manifest_ordinal];
         let scanned = match discover_segment_compression(locator)? {
             0 => scan_literal_segment(locator, meta, &mut visit)?,
-            1 => {
-                on_lz4_discovered(&locator.path)?;
+            tag @ (1 | 2) => {
+                if tag == 1 {
+                    on_lz4_discovered(&locator.path)?;
+                }
                 let expected_identity = locator.identity.ok_or_else(|| {
                     corrupt(&locator.path, "v4 segment lacks admitted physical identity")
                 })?;
-                let first =
-                    scan_lz4_pass1(&locator.path, expected_identity, meta, &mut work, |_| {})?;
+                let first = if tag == 1 {
+                    scan_lz4_pass1(&locator.path, expected_identity, meta, &mut work, |_| {})?
+                } else {
+                    scan_zstd_pass1(&locator.path, expected_identity, meta, &mut work, |_| {})?
+                };
                 let first_pass = work.first_pass();
                 work.accept_authenticated_file(first_pass, first.work, &locator.path)?;
-                let second =
-                    scan_lz4_pass2(&locator.path, expected_identity, meta, &work, first, |_| {})?;
+                let second = if tag == 1 {
+                    scan_lz4_pass2(&locator.path, expected_identity, meta, &work, first, |_| {})?
+                } else {
+                    scan_zstd_pass2(&locator.path, expected_identity, meta, &work, first, |_| {})?
+                };
                 if second != first {
                     return Err(corrupt(&locator.path, "compressed v4 replay changed"));
                 }
-                let third = scan_lz4_pass3(
-                    &locator.path,
-                    expected_identity,
-                    meta,
-                    locator.source,
-                    &work,
-                    first,
-                    &mut visit,
-                )?;
+                let third = if tag == 1 {
+                    scan_lz4_pass3(
+                        &locator.path,
+                        expected_identity,
+                        meta,
+                        locator.source,
+                        &work,
+                        first,
+                        &mut visit,
+                    )?
+                } else {
+                    scan_zstd_pass3(
+                        &locator.path,
+                        expected_identity,
+                        meta,
+                        locator.source,
+                        &work,
+                        first,
+                        &mut visit,
+                    )?
+                };
                 if third != first || third != second {
                     return Err(corrupt(&locator.path, "compressed v4 owned replay changed"));
                 }
@@ -3297,11 +3313,6 @@ fn visit_v4_segments_with_receipt_inner(
                     digest: third.digest,
                     observed_rows: third.work.rows,
                 }
-            }
-            2 => {
-                return Err(unsupported(
-                    "compressed v4 segments need a bounded proof profile",
-                ));
             }
             _ => return Err(corrupt(&locator.path, "unknown v4 segment compression tag")),
         };
