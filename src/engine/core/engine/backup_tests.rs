@@ -1,7 +1,98 @@
 use super::*;
 use crate::engine::core::backup::{Phase, hooks};
+use crate::wal::WalRecord;
 use std::sync::mpsc;
 use std::time::Duration;
+
+fn byte_tree(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    fn visit(root: &Path, at: &Path, files: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
+        for child in fs::read_dir(at).unwrap() {
+            let child = child.unwrap();
+            let path = child.path();
+            let relative = path.strip_prefix(root).unwrap().to_path_buf();
+            let kind = child.file_type().unwrap();
+            assert!(!kind.is_symlink());
+            if kind.is_dir() {
+                files.insert(relative, None);
+                visit(root, &path, files);
+            } else {
+                assert!(kind.is_file());
+                files.insert(relative, Some(fs::read(path).unwrap()));
+            }
+        }
+    }
+    let mut files = BTreeMap::new();
+    visit(root, root, &mut files);
+    files
+}
+
+#[test]
+fn staged_wal_digest_refuses_equal_length_hardlink_rewrite_before_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let live = dir.path().join("live");
+    let target = dir.path().join("previous-backup");
+    let alias = dir.path().join("external-wal-alias");
+    let source = PraxisEngine::open(PraxisConfig::new(&live)).unwrap();
+    source.put("key", "old").unwrap();
+    {
+        let previous = PraxisEngine::open(PraxisConfig::new(&target)).unwrap();
+        previous.put("prior", "retained").unwrap();
+        previous.flush().unwrap();
+    }
+    let before = byte_tree(&target);
+    let wal = live.join("wal/00000000000000000001.wal");
+    fs::hard_link(&wal, &alias).unwrap();
+    let mut batch = WriteBatch::new();
+    batch.put_default(Bytes::from_static(b"key"), Bytes::from_static(b"new"));
+    let new_frame = WalRecord { sequence: 1, batch }.encode();
+    assert_eq!(
+        fs::metadata(&wal).unwrap().len(),
+        16 + new_frame.len() as u64
+    );
+    let _hook = hooks::install(move |phase| {
+        if phase == Phase::Captured {
+            let mut rewritten = fs::read(&alias)?;
+            rewritten[16..].copy_from_slice(&new_frame);
+            fs::write(&alias, rewritten)?;
+        }
+        Ok(())
+    });
+    let error = source.backup_to(&target).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            PraxisError::Corrupt { reason, .. }
+                if reason == "staged WAL differs from preflighted prefix"
+        ),
+        "{error:?}"
+    );
+    assert!(byte_tree(&target) == before, "previous backup was changed");
+    assert!(!target.join(super::super::backup::INCOMPLETE).exists());
+}
+
+#[test]
+fn torn_active_wal_in_existing_destination_refuses_before_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let live = dir.path().join("live");
+    let target = dir.path().join("previous-backup");
+    let source = PraxisEngine::open(PraxisConfig::new(&live)).unwrap();
+    source.put("new", "value").unwrap();
+    {
+        let previous = PraxisEngine::open(PraxisConfig::new(&target)).unwrap();
+        previous.put("prior", "retained").unwrap();
+        previous.flush().unwrap();
+    }
+    let active = target.join("wal/00000000000000000002.wal");
+    let mut bytes = fs::read(&active).unwrap();
+    bytes.extend_from_slice(&crate::wal::record::WAL_V2_MAGIC.to_le_bytes());
+    fs::write(&active, bytes).unwrap();
+    let before = byte_tree(&target);
+
+    let error = source.backup_to(&target).unwrap_err();
+    assert!(matches!(error, PraxisError::Corrupt { .. }), "{error:?}");
+    assert_eq!(byte_tree(&target), before, "destination changed on refusal");
+    assert!(!target.join(super::super::backup::INCOMPLETE).exists());
+}
 
 #[test]
 fn capture_excludes_later_clone_writes_and_holds_files_against_gc() {

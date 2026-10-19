@@ -1,6 +1,7 @@
 use crate::types::{ColumnFamily, Key, Value};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::collections::TryReserveError;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BatchOp {
@@ -118,6 +119,20 @@ impl WriteBatch {
     /// Used by nested transactions to merge child batches.
     pub fn push_op(&mut self, op: BatchOp) {
         self.ops.push(op);
+    }
+
+    pub(crate) fn try_reserve_ops(&mut self, additional: usize) -> Result<(), TryReserveError> {
+        self.ops.try_reserve_exact(additional)
+    }
+
+    /// A v4 decoded batch calls this only after reserving all declared ops.
+    /// A mismatched count returns false without another allocation.
+    pub(crate) fn try_push_reserved_op(&mut self, op: BatchOp) -> bool {
+        if self.ops.len() == self.ops.capacity() {
+            return false;
+        }
+        self.ops.push(op);
+        true
     }
 }
 

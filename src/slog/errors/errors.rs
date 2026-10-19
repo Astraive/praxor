@@ -12,6 +12,10 @@ pub enum PraxisError {
     RecordAuthorityOpenRequired { path: PathBuf },
     #[error("record-authority WAL requires the typed core recovery decoder: {path}")]
     RecordAuthorityWalRequired { path: PathBuf },
+    #[error("catalog-authority WAL requires the typed catalog recovery decoder: {path}")]
+    CatalogAuthorityWalRequired { path: PathBuf },
+    #[error("unsupported WAL control tag {tag} in {path}")]
+    UnsupportedWalControl { path: PathBuf, tag: u8 },
     #[error("protected record column family is unavailable to public KV operations: {0}")]
     ProtectedRecordColumnFamily(String),
     #[error("storage format mismatch at {path}: requested {expected}, detected {detected:?}")]
@@ -53,6 +57,8 @@ pub enum PraxisError {
         "index {index} does not support raw sequence snapshot reads; register a plugin with an explicit snapshot capability"
     )]
     UnsupportedIndexSnapshotRead { index: String },
+    #[error("unsupported catalog feature: {feature}")]
+    UnsupportedCatalogFeature { feature: &'static str },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("serialization error: {0}")]

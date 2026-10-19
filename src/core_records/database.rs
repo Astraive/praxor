@@ -70,10 +70,19 @@ impl CoreDatabase {
     pub fn open(config: PraxisConfig) -> Result<Self> {
         config.validate()?;
         let lease = WriterLease::acquire(&config.data_dir)?;
-        inspect_storage_root(lease.root(), InspectionOptions::for_admission())?
-            .require_compatible(RootOwner::Core)?;
+        let report = inspect_storage_root(lease.root(), InspectionOptions::for_admission())?;
+        report.require_compatible(RootOwner::Core)?;
+        report.reject_catalog_for_legacy_core()?;
         let source = lease.root().join("MANIFEST");
         let manifest = Manifest::decode(&std::fs::read(&source)?, &source)?;
+        if manifest.format_version == 4 || manifest.catalog_authority.is_some() {
+            return Err(
+                crate::storage::root_format::unsupported_catalog_for_legacy_core(
+                    lease.root(),
+                    &source,
+                ),
+            );
+        }
         if manifest.record_authority.is_none() {
             return Err(PraxisError::InvalidConfig(
                 "CoreDatabase::open requires an existing v3 record authority".into(),
