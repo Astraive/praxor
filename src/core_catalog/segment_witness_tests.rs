@@ -1332,7 +1332,7 @@ fn oversized_lz4_outer_decoded_claim_is_refused_before_allocation() {
 
 #[test]
 fn bounded_lz4_helper_decodes_writer_blocks_and_charges_direct_fixture_work_once() {
-    let (_dir, _config, lease, metadata) = two_segments(Compression::Lz4, false);
+    let (_dir, _config, _lease, metadata) = two_segments(Compression::Lz4, false);
     let path = Path::new(&metadata[0].path);
     let bytes = fs::read(path).unwrap();
     let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
@@ -1401,7 +1401,7 @@ fn bounded_lz4_helper_decodes_writer_blocks_and_charges_direct_fixture_work_once
 
 #[test]
 fn bounded_lz4_helper_refuses_repaired_inner_size_and_outer_profile_before_output() {
-    let (_dir, _config, lease, metadata) = two_segments(Compression::Lz4, false);
+    let (_dir, _config, _lease, metadata) = two_segments(Compression::Lz4, false);
     let path = Path::new(&metadata[0].path);
     let bytes = fs::read(path).unwrap();
     let (encoded, outer, _checksum) = writer_block_frame(&bytes, 21);
