@@ -8,7 +8,7 @@ use super::segment_witness::{
     WorkLedger, ZstdPassProbe, collect_protected_segment_candidate,
     collect_protected_segment_candidate_for_test, decode_bounded_block, physical_id,
     scan_lz4_pass1, scan_lz4_pass2, scan_lz4_pass3, scan_zstd_pass1, scan_zstd_pass2,
-    visit_v4_segments, visit_v4_segments_with_profile_and_hook_for_test,
+    scan_zstd_pass3, visit_v4_segments, visit_v4_segments_with_profile_and_hook_for_test,
 };
 use crate::accel::cpu::scalar::CpuAccelerator;
 use crate::config::{Compression, PraxisConfig};
@@ -3225,6 +3225,813 @@ fn private_zstd_passes_authenticate_reversed_two_file_replay_without_double_char
         );
     }
     assert_eq!(work.accepted().rows, 4);
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn private_zstd_pass3_emits_four_owned_physical_rows_without_recharging() {
+    let (dir, _config, lease, metadata) = two_segments(Compression::Zstd, true);
+    let root = lease.root();
+    let manifest_path = DiskLayout::at(root).manifest_path();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    assert_eq!(manifest.format_version, 4);
+    assert_eq!(
+        manifest
+            .segments
+            .iter()
+            .map(|meta| meta.id)
+            .collect::<Vec<_>>(),
+        [2, 1]
+    );
+    let before = snapshot(dir.path());
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let mut rows = Vec::new();
+    let mut expected_rows = Vec::new();
+    let mut physical_total = 0;
+    let mut decoded_total = 0;
+
+    for (index, meta) in metadata.iter().enumerate() {
+        let path = Path::new(&meta.path);
+        let bytes = fs::read(path).unwrap();
+        assert_eq!(bytes[8], 2);
+        assert_eq!(meta.file_digest, blake3::hash(&bytes).to_hex().to_string());
+        let parsed = decode_segment(&bytes, path, &CpuAccelerator).unwrap();
+        assert_eq!(parsed.blocks.len(), 2);
+        assert!(parsed.blocks.iter().all(|block| block.len() == 1));
+        let offsets = two_block_offsets(path);
+        let decoded_file: u64 = offsets
+            .into_iter()
+            .map(|offset| writer_block_frame(&bytes, offset).1)
+            .sum();
+        let identity = physical_id(&File::open(path).unwrap(), path).unwrap();
+        let source = SegmentSource {
+            level: meta.level,
+            id: meta.id,
+            manifest_ordinal: 1 - index,
+        };
+        assert_eq!(manifest.segments[source.manifest_ordinal].path, meta.path);
+
+        let first = scan_zstd_pass1(path, identity, meta, &mut work, |_| {}).unwrap();
+        assert_eq!(first.len, bytes.len() as u64);
+        assert_eq!(first.digest, blake3::hash(&bytes));
+        assert_eq!(
+            first.work,
+            CompressedWorkFacts {
+                decoded_bytes: decoded_file,
+                blocks: 2,
+                rows: 2
+            }
+        );
+        work.accept_authenticated_file(work.first_pass(), first.work, path)
+            .unwrap();
+        physical_total += first.len;
+        decoded_total += decoded_file;
+        assert_eq!(
+            scan_zstd_pass2(path, identity, meta, &work, first, |_| {}).unwrap(),
+            first
+        );
+        let accepted = work.accepted();
+        let physical = work.compressed_physical_bytes();
+        assert_eq!(physical, physical_total);
+        if index == 1 {
+            assert!(accepted.rows > first.work.rows);
+        }
+
+        let third = scan_zstd_pass3(path, identity, meta, source, &work, first, |row| {
+            rows.push(row);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(third, first);
+        assert_eq!(work.accepted(), accepted);
+        assert_eq!(work.compressed_physical_bytes(), physical);
+        assert_eq!(fs::read(path).unwrap(), bytes);
+        assert_eq!(
+            physical_id(&File::open(path).unwrap(), path).unwrap(),
+            identity
+        );
+
+        expected_rows.push(expected_row(
+            source,
+            offsets[0],
+            0,
+            ObservedSegmentValue::Put(vec![0xca, 0xfe]),
+        ));
+        expected_rows.push(expected_row(
+            source,
+            offsets[1],
+            if index == 0 { 1 } else { 2 },
+            if index == 0 {
+                ObservedSegmentValue::Delete
+            } else {
+                ObservedSegmentValue::Merge(vec![0x22])
+            },
+        ));
+    }
+
+    assert_eq!(rows, expected_rows);
+    let (ObservedSegmentValue::Put(first), ObservedSegmentValue::Put(second)) =
+        (&rows[0].value, &rows[2].value)
+    else {
+        panic!("two physical copies must retain independently owned Put payloads")
+    };
+    assert_ne!(first.as_ptr(), second.as_ptr());
+    assert_eq!(work.compressed_physical_bytes(), physical_total);
+    assert_eq!(
+        work.accepted(),
+        CompressedWorkFacts {
+            decoded_bytes: decoded_total,
+            blocks: 4,
+            rows: 4
+        }
+    );
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn private_zstd_pass3_keeps_writer_valid_inline_put_above_one_mebibyte() {
+    let (dir, _config, lease, _) = two_segments(Compression::Zstd, false);
+    let root = lease.root();
+    let mut value = vec![0_u8; 1_100_000];
+    blake3::Hasher::new().finalize_xof().fill(&mut value);
+    let manifest = rewrite_first_segment(
+        root,
+        vec![row(0, StoredValue::Put(value.clone()))],
+        Compression::Zstd,
+        value.len() + 1,
+        4096,
+    );
+    assert_eq!(manifest.format_version, 4);
+    let meta = manifest.segments.iter().find(|meta| meta.id == 1).unwrap();
+    let path = Path::new(&meta.path);
+    let bytes = fs::read(path).unwrap();
+    assert_eq!(bytes[8], 2);
+    assert!(bytes.len() > 1_048_576);
+    let (frame, decoded_len, _) = writer_block_frame(&bytes, 21);
+    assert!(decoded_len > 1_048_576 && decoded_len <= 8 * 1024 * 1024);
+    let decoded = decode_block(Compression::Zstd, frame).unwrap();
+    assert_eq!(decoded.len() as u64, decoded_len);
+    let parsed = decode_segment(&bytes, path, &CpuAccelerator).unwrap();
+    assert_eq!(parsed.blocks.len(), 1);
+    assert_eq!(parsed.blocks[0].len(), 1);
+    assert_eq!(
+        parsed.blocks[0][0].entry.version.value,
+        StoredValue::Put(value.clone())
+    );
+    assert_eq!(meta.file_digest, blake3::hash(&bytes).to_hex().to_string());
+    let before = snapshot(dir.path());
+    let identity = physical_id(&File::open(path).unwrap(), path).unwrap();
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let first = scan_zstd_pass1(path, identity, meta, &mut work, |_| {}).unwrap();
+    assert_eq!(first.digest, blake3::hash(&bytes));
+    assert_eq!(first.work.rows, 1);
+    assert_eq!(first.work.blocks, 1);
+    work.accept_authenticated_file(work.first_pass(), first.work, path)
+        .unwrap();
+    assert_eq!(
+        scan_zstd_pass2(path, identity, meta, &work, first, |_| {}).unwrap(),
+        first
+    );
+    let accepted = work.accepted();
+    let physical = work.compressed_physical_bytes();
+    let source = SegmentSource {
+        level: meta.level,
+        id: meta.id,
+        manifest_ordinal: 0,
+    };
+    let mut stage = ProtectedStage::new(PROTECTED_STAGE_LIMITS);
+    let mut observed = Vec::new();
+    let third = scan_zstd_pass3(path, identity, meta, source, &work, first, |row| {
+        observed.push(row.clone());
+        stage.push(row)
+    })
+    .unwrap();
+    assert_eq!(third, first);
+    assert_eq!(stage.len(), 1);
+    assert_eq!(
+        observed,
+        [expected_row(
+            source,
+            21,
+            0,
+            ObservedSegmentValue::Put(value)
+        )]
+    );
+    assert!(stage.used_bytes() <= PROTECTED_STAGE_LIMITS.max_bytes);
+    assert_eq!(work.accepted(), accepted);
+    assert_eq!(work.compressed_physical_bytes(), physical);
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn private_zstd_pass3_rejects_byte_identical_path_replacement_before_callback() {
+    let (dir, _config, lease, metadata) = two_segments(Compression::Zstd, false);
+    let root = lease.root();
+    let path = Path::new(&metadata[0].path);
+    let original = fs::read(path).unwrap();
+    let manifest_path = DiskLayout::at(root).manifest_path();
+    let manifest_bytes = fs::read(&manifest_path).unwrap();
+    let manifest = Manifest::decode(&manifest_bytes, &manifest_path).unwrap();
+    assert_eq!(manifest.format_version, 4);
+    assert_eq!(
+        manifest.segments[0].file_digest,
+        blake3::hash(&original).to_hex().to_string()
+    );
+    let before = snapshot(dir.path());
+    let identity = physical_id(&File::open(path).unwrap(), path).unwrap();
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let first = scan_zstd_pass1(path, identity, &metadata[0], &mut work, |_| {}).unwrap();
+    work.accept_authenticated_file(work.first_pass(), first.work, path)
+        .unwrap();
+    assert_eq!(
+        scan_zstd_pass2(path, identity, &metadata[0], &work, first, |_| {}).unwrap(),
+        first
+    );
+    let accepted = work.accepted();
+    let physical = work.compressed_physical_bytes();
+
+    // Keep the original inode/file ID alive while the identical copy takes its path.
+    let replacement = path.with_extension("pass3-replacement");
+    let parked_original = path.with_extension("pass3-original");
+    fs::write(&replacement, &original).unwrap();
+    assert_ne!(
+        physical_id(&File::open(&replacement).unwrap(), &replacement).unwrap(),
+        identity
+    );
+    fs::rename(path, &parked_original).unwrap();
+    fs::rename(&replacement, path).unwrap();
+    assert_eq!(fs::read(path).unwrap(), original);
+    assert_ne!(
+        physical_id(&File::open(path).unwrap(), path).unwrap(),
+        identity
+    );
+    assert_eq!(fs::read(&manifest_path).unwrap(), manifest_bytes);
+    let source = SegmentSource {
+        level: metadata[0].level,
+        id: metadata[0].id,
+        manifest_ordinal: 0,
+    };
+    let mut callbacks = 0;
+    let error = scan_zstd_pass3(path, identity, &metadata[0], source, &work, first, |_| {
+        callbacks += 1;
+        Ok(())
+    })
+    .unwrap_err();
+    fs::remove_file(path).unwrap();
+    fs::rename(&parked_original, path).unwrap();
+    assert!(
+        matches!(&error, PraxisError::Corrupt { path: error_path, reason }
+        if error_path.as_path() == path && reason.contains("identity") && reason.contains("changed")),
+        "{error}"
+    );
+    assert_eq!(callbacks, 0);
+    assert_eq!(work.accepted(), accepted);
+    assert_eq!(work.compressed_physical_bytes(), physical);
+    assert_eq!(
+        physical_id(&File::open(path).unwrap(), path).unwrap(),
+        identity
+    );
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn private_zstd_pass3_rejects_wrong_source_id_and_level_before_callback() {
+    let (dir, _config, lease, metadata) = two_segments(Compression::Zstd, false);
+    let path = Path::new(&metadata[0].path);
+    let bytes = fs::read(path).unwrap();
+    assert_eq!(bytes[8], 2);
+    let before = snapshot(dir.path());
+    let identity = physical_id(&File::open(path).unwrap(), path).unwrap();
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let first = scan_zstd_pass1(path, identity, &metadata[0], &mut work, |_| {}).unwrap();
+    work.accept_authenticated_file(work.first_pass(), first.work, path)
+        .unwrap();
+    assert_eq!(
+        scan_zstd_pass2(path, identity, &metadata[0], &work, first, |_| {}).unwrap(),
+        first
+    );
+    let accepted = work.accepted();
+    let physical = work.compressed_physical_bytes();
+    let wrong_sources = [
+        SegmentSource {
+            level: metadata[0].level,
+            id: metadata[0].id + 1,
+            manifest_ordinal: 0,
+        },
+        SegmentSource {
+            level: metadata[0].level + 1,
+            id: metadata[0].id,
+            manifest_ordinal: 0,
+        },
+    ];
+    for source in wrong_sources {
+        let mut callbacks = 0;
+        let error = scan_zstd_pass3(path, identity, &metadata[0], source, &work, first, |_| {
+            callbacks += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&error, PraxisError::Corrupt { path: error_path, reason }
+            if error_path.as_path() == path && reason.contains("source") && reason.contains("MANIFEST")),
+            "{error}"
+        );
+        assert_eq!(callbacks, 0);
+        assert_eq!(work.accepted(), accepted);
+        assert_eq!(work.compressed_physical_bytes(), physical);
+    }
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn private_zstd_pass3_refuses_whole_block_row_cap_before_callbacks() {
+    let (dir, config, lease, _) = two_segments(Compression::Zstd, false);
+    let root = lease.root();
+    let manifest = rewrite_first_segment(
+        root,
+        vec![
+            row(0, StoredValue::Put(vec![1])),
+            row(1, StoredValue::Delete),
+        ],
+        Compression::Zstd,
+        config.large_value_threshold,
+        4096,
+    );
+    assert_eq!(manifest.format_version, 4);
+    let meta = manifest.segments.iter().find(|meta| meta.id == 1).unwrap();
+    let path = Path::new(&meta.path);
+    let bytes = fs::read(path).unwrap();
+    assert_eq!(bytes[8], 2);
+    let parsed = decode_segment(&bytes, path, &CpuAccelerator).unwrap();
+    assert_eq!(parsed.blocks.len(), 1);
+    assert_eq!(parsed.blocks[0].len(), 2);
+    assert_eq!(parsed.blocks[0][0].entry.key.as_ref(), &[0]);
+    assert_eq!(parsed.blocks[0][1].entry.key.as_ref(), &[1]);
+    assert_eq!(meta.file_digest, blake3::hash(&bytes).to_hex().to_string());
+    let before = snapshot(dir.path());
+    let identity = physical_id(&File::open(path).unwrap(), path).unwrap();
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let first = scan_zstd_pass1(path, identity, meta, &mut work, |_| {}).unwrap();
+    assert_eq!(first.work.rows, 2);
+    assert_eq!(first.work.blocks, 1);
+    work.accept_authenticated_file(work.first_pass(), first.work, path)
+        .unwrap();
+    assert_eq!(
+        scan_zstd_pass2(path, identity, meta, &work, first, |_| {}).unwrap(),
+        first
+    );
+    let accepted = work.accepted();
+    let physical = work.compressed_physical_bytes();
+    work.set_max_rows_file_for_test(1);
+    let source = SegmentSource {
+        level: meta.level,
+        id: meta.id,
+        manifest_ordinal: 0,
+    };
+    let mut callbacks = 0;
+    let error = scan_zstd_pass3(path, identity, meta, source, &work, first, |_| {
+        callbacks += 1;
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(
+        matches!(&error, PraxisError::UnsupportedCatalogFeature { feature }
+        if feature == "compressed v4 file row count exceeds proof profile"),
+        "{error}"
+    );
+    assert_eq!(callbacks, 0);
+    assert_eq!(work.accepted(), accepted);
+    assert_eq!(work.compressed_physical_bytes(), physical);
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn private_zstd_pass3_rejects_integrated_digest_after_first_callback_aba() {
+    let (dir, _config, _lease, metadata) = two_segments(Compression::Zstd, false);
+    let path = Path::new(&metadata[0].path);
+    let original = fs::read(path).unwrap();
+    let changed = same_length_zstd_value_variant(&original, path);
+    assert_eq!(changed.len(), original.len());
+    assert_ne!(changed, original);
+    let decoded_b = decode_segment(&changed, path, &CpuAccelerator).unwrap();
+    assert_eq!(decoded_b.blocks.len(), 2);
+    let expected_b_value = match &decoded_b.blocks[0][0].entry.version.value {
+        StoredValue::Put(value) => value.clone(),
+        other => panic!("variant must be a Put, got {other:?}"),
+    };
+    assert_ne!(expected_b_value, [0xca, 0xfe]);
+    assert_eq!(
+        metadata[0].file_digest,
+        blake3::hash(&original).to_hex().to_string()
+    );
+    let before = snapshot(dir.path());
+    let identity = physical_id(&File::open(path).unwrap(), path).unwrap();
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let first = scan_zstd_pass1(path, identity, &metadata[0], &mut work, |_| {}).unwrap();
+    work.accept_authenticated_file(work.first_pass(), first.work, path)
+        .unwrap();
+    assert_eq!(
+        scan_zstd_pass2(path, identity, &metadata[0], &work, first, |_| {}).unwrap(),
+        first
+    );
+    let accepted = work.accepted();
+    let physical = work.compressed_physical_bytes();
+    let first_frame_len = writer_block_frame(&original, 21).0.len() + 12;
+    let mut writer = OpenOptions::new().write(true).open(path).unwrap();
+    writer.seek(SeekFrom::Start(21)).unwrap();
+    writer
+        .write_all(&changed[21..21 + first_frame_len])
+        .unwrap();
+    writer.sync_data().unwrap();
+    assert_eq!(fs::read(path).unwrap(), changed);
+    assert_eq!(
+        physical_id(&File::open(path).unwrap(), path).unwrap(),
+        identity
+    );
+
+    let source = SegmentSource {
+        level: metadata[0].level,
+        id: metadata[0].id,
+        manifest_ordinal: 0,
+    };
+    let mut saw_b = false;
+    let error = scan_zstd_pass3(path, identity, &metadata[0], source, &work, first, |row| {
+        if !saw_b {
+            assert_eq!(row.source, source);
+            assert_eq!(row.block_offset, 21);
+            assert_eq!(row.row_ordinal, 0);
+            assert_eq!(row.key, [0]);
+            assert_eq!(
+                row.value,
+                ObservedSegmentValue::Put(expected_b_value.clone())
+            );
+            saw_b = true;
+            writer.seek(SeekFrom::Start(21)).unwrap();
+            writer
+                .write_all(&original[21..21 + first_frame_len])
+                .unwrap();
+            writer.sync_data().unwrap();
+            assert_eq!(fs::read(path).unwrap(), original);
+        }
+        Ok(())
+    })
+    .unwrap_err();
+    if !saw_b {
+        writer.seek(SeekFrom::Start(21)).unwrap();
+        writer
+            .write_all(&original[21..21 + first_frame_len])
+            .unwrap();
+        writer.sync_data().unwrap();
+    }
+    drop(writer);
+    assert!(
+        saw_b,
+        "pass 3 did not expose independently decoded B row: {error}"
+    );
+    assert!(
+        matches!(&error, PraxisError::Corrupt { path: error_path, reason }
+        if error_path.as_path() == path && reason.contains("integrated") && reason.contains("digest")),
+        "{error}"
+    );
+    assert_eq!(work.accepted(), accepted);
+    assert_eq!(work.compressed_physical_bytes(), physical);
+    assert_eq!(fs::read(path).unwrap(), original);
+    assert_eq!(
+        physical_id(&File::open(path).unwrap(), path).unwrap(),
+        identity
+    );
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn private_zstd_pass3_callback_error_releases_pending_row_and_retries() {
+    let (dir, _config, _lease, metadata) = two_segments(Compression::Zstd, false);
+    let path = Path::new(&metadata[0].path);
+    let bytes = fs::read(path).unwrap();
+    assert_eq!(
+        decode_segment(&bytes, path, &CpuAccelerator)
+            .unwrap()
+            .blocks
+            .len(),
+        2
+    );
+    let before = snapshot(dir.path());
+    let identity = physical_id(&File::open(path).unwrap(), path).unwrap();
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let first = scan_zstd_pass1(path, identity, &metadata[0], &mut work, |_| {}).unwrap();
+    work.accept_authenticated_file(work.first_pass(), first.work, path)
+        .unwrap();
+    assert_eq!(
+        scan_zstd_pass2(path, identity, &metadata[0], &work, first, |_| {}).unwrap(),
+        first
+    );
+    let accepted = work.accepted();
+    let physical = work.compressed_physical_bytes();
+    let source = SegmentSource {
+        level: metadata[0].level,
+        id: metadata[0].id,
+        manifest_ordinal: 0,
+    };
+    let mut callbacks = 0;
+    let error = scan_zstd_pass3(path, identity, &metadata[0], source, &work, first, |_| {
+        callbacks += 1;
+        Err(PraxisError::Corrupt {
+            path: path.to_path_buf(),
+            reason: "injected private Zstd owned callback error".into(),
+        })
+    })
+    .unwrap_err();
+    assert_eq!(
+        callbacks, 1,
+        "callback failure should follow one owned row: {error}"
+    );
+    assert!(
+        matches!(&error, PraxisError::Corrupt { path: error_path, reason }
+        if error_path.as_path() == path && reason == "injected private Zstd owned callback error"),
+        "{error}"
+    );
+    assert_eq!(work.accepted(), accepted);
+    assert_eq!(work.compressed_physical_bytes(), physical);
+
+    let mut rows = Vec::new();
+    assert_eq!(
+        scan_zstd_pass3(path, identity, &metadata[0], source, &work, first, |row| {
+            rows.push(row);
+            Ok(())
+        })
+        .unwrap(),
+        first
+    );
+    assert_eq!(
+        rows,
+        [
+            expected_row(source, 21, 0, ObservedSegmentValue::Put(vec![0xca, 0xfe])),
+            expected_row(
+                source,
+                two_block_offsets(path)[1],
+                1,
+                ObservedSegmentValue::Delete
+            ),
+        ]
+    );
+    assert_eq!(work.accepted(), accepted);
+    assert_eq!(work.compressed_physical_bytes(), physical);
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn private_zstd_pass3_callback_unwind_drops_stage_and_retries() {
+    let (dir, _config, _lease, metadata) = two_segments(Compression::Zstd, false);
+    let path = Path::new(&metadata[0].path);
+    let before = snapshot(dir.path());
+    let identity = physical_id(&File::open(path).unwrap(), path).unwrap();
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let first = scan_zstd_pass1(path, identity, &metadata[0], &mut work, |_| {}).unwrap();
+    work.accept_authenticated_file(work.first_pass(), first.work, path)
+        .unwrap();
+    assert_eq!(
+        scan_zstd_pass2(path, identity, &metadata[0], &work, first, |_| {}).unwrap(),
+        first
+    );
+    let accepted = work.accepted();
+    let physical = work.compressed_physical_bytes();
+    let source = SegmentSource {
+        level: metadata[0].level,
+        id: metadata[0].id,
+        manifest_ordinal: 0,
+    };
+    let mut callbacks = 0;
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut provisional = ProtectedStage::new(PROTECTED_STAGE_LIMITS);
+        scan_zstd_pass3(path, identity, &metadata[0], source, &work, first, |row| {
+            provisional.push(row)?;
+            callbacks += 1;
+            panic!("injected private Zstd owned callback unwind")
+        })
+    }));
+    assert!(
+        unwind.is_err(),
+        "owned callback must be reached before unwind"
+    );
+    assert_eq!(callbacks, 1);
+    assert_eq!(work.accepted(), accepted);
+    assert_eq!(work.compressed_physical_bytes(), physical);
+
+    let mut retry = ProtectedStage::new(PROTECTED_STAGE_LIMITS);
+    assert_eq!(
+        scan_zstd_pass3(path, identity, &metadata[0], source, &work, first, |row| {
+            retry.push(row)
+        })
+        .unwrap(),
+        first
+    );
+    assert_eq!(retry.len(), 2);
+    assert_eq!(work.accepted(), accepted);
+    assert_eq!(work.compressed_physical_bytes(), physical);
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn private_zstd_pass3_preserves_wire_values_roles_and_within_block_ordinals() {
+    let (dir, _config, lease, _) = two_segments(Compression::Zstd, false);
+    let root = lease.root();
+    let explicit = ValuePointer {
+        path: "unresolved-pointer".into(),
+        offset: 17,
+        len: 19,
+        checksum: 23,
+    };
+    let large_expiry_value = vec![0x5a; 64];
+    let manifest = rewrite_first_segment(
+        root,
+        vec![
+            row_in("default", b"d", 3, StoredValue::Put(vec![9])),
+            row_in("__praxor_record_unbound_v1", b"u", 4, StoredValue::Delete),
+            row_in(
+                "__praxor_record_state_v1",
+                b"s",
+                5,
+                StoredValue::Merge(vec![2]),
+            ),
+            row_in("__praxor_record_meta_v1", b"m", 6, StoredValue::Delete),
+            row_in(
+                "__praxor_record_payload_v1",
+                b"p",
+                7,
+                StoredValue::Put(vec![1]),
+            ),
+            row_in(
+                "__praxor_record_index_v1",
+                b"i",
+                8,
+                StoredValue::PutWithExpiry {
+                    value: vec![4, 5],
+                    expires_at_ms: 71,
+                },
+            ),
+            row_in(
+                CATALOG_CF,
+                b"x",
+                u64::MAX,
+                StoredValue::PutWithExpiry {
+                    value: large_expiry_value.clone(),
+                    expires_at_ms: 73,
+                },
+            ),
+            row_in(
+                CATALOG_CF,
+                b"e",
+                9,
+                StoredValue::BlobPointer(explicit.clone()),
+            ),
+        ],
+        Compression::Zstd,
+        8,
+        1_000_000,
+    );
+    assert_eq!(manifest.format_version, 4);
+    let meta = manifest.segments.iter().find(|meta| meta.id == 1).unwrap();
+    let path = Path::new(&meta.path);
+    let bytes = fs::read(path).unwrap();
+    assert_eq!(bytes[8], 2);
+    assert_eq!(meta.file_digest, blake3::hash(&bytes).to_hex().to_string());
+    let parsed = decode_segment(&bytes, path, &CpuAccelerator).unwrap();
+    assert_eq!(parsed.blocks.len(), 1);
+    assert_eq!(parsed.blocks[0].len(), 8);
+    let decoded = decode_block(Compression::Zstd, writer_block_frame(&bytes, 21).0).unwrap();
+    assert_eq!(decode_entries(&decoded, path).unwrap().len(), 8);
+    let converted = ValuePointer {
+        path: DiskLayout::at(root)
+            .value_log_path(1)
+            .to_string_lossy()
+            .into_owned(),
+        offset: 0,
+        len: large_expiry_value.len() as u64,
+        checksum: crc32c(&large_expiry_value),
+    };
+    assert_eq!(
+        parsed.blocks[0][0].entry.version.value,
+        StoredValue::BlobPointer(explicit.clone())
+    );
+    assert_eq!(parsed.blocks[0][0].blob_expiry, None);
+    assert_eq!(
+        parsed.blocks[0][1].entry.version.value,
+        StoredValue::BlobPointer(converted.clone())
+    );
+    assert_eq!(parsed.blocks[0][1].blob_expiry, Some(73));
+    let before = snapshot(dir.path());
+    let identity = physical_id(&File::open(path).unwrap(), path).unwrap();
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let first = scan_zstd_pass1(path, identity, meta, &mut work, |_| {}).unwrap();
+    assert_eq!(first.work.rows, 8);
+    assert_eq!(first.work.blocks, 1);
+    work.accept_authenticated_file(work.first_pass(), first.work, path)
+        .unwrap();
+    assert_eq!(
+        scan_zstd_pass2(path, identity, meta, &work, first, |_| {}).unwrap(),
+        first
+    );
+    let accepted = work.accepted();
+    let physical = work.compressed_physical_bytes();
+    let source = SegmentSource {
+        level: meta.level,
+        id: meta.id,
+        manifest_ordinal: 0,
+    };
+    let mut rows = Vec::new();
+    assert_eq!(
+        scan_zstd_pass3(path, identity, meta, source, &work, first, |row| {
+            rows.push(row);
+            Ok(())
+        })
+        .unwrap(),
+        first
+    );
+    let expected = [
+        (
+            PhysicalRowClass::BoundProtected(ProtectedRole::Catalog),
+            CATALOG_CF,
+            &b"e"[..],
+            9,
+            ObservedSegmentValue::Pointer {
+                pointer: explicit,
+                expires_at_ms: None,
+            },
+        ),
+        (
+            PhysicalRowClass::BoundProtected(ProtectedRole::Catalog),
+            CATALOG_CF,
+            &b"x"[..],
+            u64::MAX,
+            ObservedSegmentValue::Pointer {
+                pointer: converted,
+                expires_at_ms: Some(73),
+            },
+        ),
+        (
+            PhysicalRowClass::BoundProtected(ProtectedRole::Index),
+            "__praxor_record_index_v1",
+            &b"i"[..],
+            8,
+            ObservedSegmentValue::PutWithExpiry {
+                value: vec![4, 5],
+                expires_at_ms: 71,
+            },
+        ),
+        (
+            PhysicalRowClass::BoundProtected(ProtectedRole::Meta),
+            "__praxor_record_meta_v1",
+            &b"m"[..],
+            6,
+            ObservedSegmentValue::Delete,
+        ),
+        (
+            PhysicalRowClass::BoundProtected(ProtectedRole::Payload),
+            "__praxor_record_payload_v1",
+            &b"p"[..],
+            7,
+            ObservedSegmentValue::Put(vec![1]),
+        ),
+        (
+            PhysicalRowClass::BoundProtected(ProtectedRole::State),
+            "__praxor_record_state_v1",
+            &b"s"[..],
+            5,
+            ObservedSegmentValue::Merge(vec![2]),
+        ),
+        (
+            PhysicalRowClass::ReservedUnbound,
+            "__praxor_record_unbound_v1",
+            &b"u"[..],
+            4,
+            ObservedSegmentValue::Delete,
+        ),
+        (
+            PhysicalRowClass::Other,
+            "default",
+            &b"d"[..],
+            3,
+            ObservedSegmentValue::Put(vec![9]),
+        ),
+    ];
+    assert_eq!(rows.len(), expected.len());
+    for (ordinal, (classification, cf, key, sequence, value)) in expected.into_iter().enumerate() {
+        assert_eq!(
+            rows[ordinal],
+            ObservedSegmentRow {
+                source,
+                block_offset: 21,
+                row_ordinal: ordinal as u32,
+                classification,
+                cf: cf.into(),
+                key: key.to_vec(),
+                sequence,
+                value,
+            }
+        );
+    }
+    assert_eq!(work.accepted(), accepted);
+    assert_eq!(work.compressed_physical_bytes(), physical);
     assert_eq!(snapshot(dir.path()), before);
 }
 

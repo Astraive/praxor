@@ -134,6 +134,14 @@ impl WorkLedger {
         self.accepted
     }
 
+    /// Test only: isolate a later owned-pass row preflight after passes 1/2
+    /// have already authenticated a writer-valid file under production limits.
+    #[cfg(test)]
+    pub(super) fn set_max_rows_file_for_test(&mut self, max_rows: u64) {
+        assert!(max_rows <= PRODUCTION_COMPRESSED_PROOF_PROFILE.max_rows_file);
+        self.profile.max_rows_file = max_rows;
+    }
+
     pub(super) fn first_pass(&self) -> CompressedPassContext {
         CompressedPassContext {
             prior: self.accepted,
@@ -2941,6 +2949,23 @@ pub(super) fn scan_lz4_pass3(
         source,
         visit,
     )
+}
+
+/// Private test-first seam for Zstd owned replay. No public tag-2 visitor or
+/// installed-owner authority is granted until a separately reviewed cut.
+#[allow(dead_code)]
+pub(super) fn scan_zstd_pass3(
+    _path: &Path,
+    _expected_identity: SegmentPhysicalId,
+    _meta: &SegmentMetadata,
+    _source: SegmentSource,
+    _work: &WorkLedger,
+    _first: AuthenticatedZstdPass,
+    _visit: impl FnMut(ObservedSegmentRow) -> Result<()>,
+) -> Result<AuthenticatedZstdPass> {
+    Err(unsupported(
+        "private Zstd owned replay is not yet authenticated",
+    ))
 }
 
 struct ScannedSegment {
