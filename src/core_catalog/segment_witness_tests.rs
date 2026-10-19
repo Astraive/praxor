@@ -307,3 +307,103 @@ fn two_literal_segments_emit_owned_physical_copies_but_owner_refuses() {
         assert_eq!(snapshot(dir.path()), before);
     }
 }
+
+#[test]
+fn unlisted_canonical_segment_refuses_before_visiting_any_row() {
+    let (dir, config, lease, _) = two_literal_segments(false);
+    let root = lease.root();
+    let layout = DiskLayout::at(root);
+    let extra_path = layout.segment_path(0, 7);
+    let value_path = layout.value_log_path(1);
+    let mut value_log = ValueLog::open(&value_path).unwrap();
+    let extra = SegmentWriter::write(
+        SegmentWriteOptions {
+            path: &extra_path,
+            id: 7,
+            level: 0,
+            compression: Compression::None,
+            accelerator: &CpuAccelerator,
+            value_log: &mut value_log,
+            large_value_threshold: config.large_value_threshold,
+            block_size: 1,
+            partitioned_bloom: None,
+            direct_io: false,
+        },
+        vec![row(7, StoredValue::Put(vec![0x77]))],
+    )
+    .unwrap();
+    drop(value_log);
+    fs::remove_file(value_path).unwrap();
+    assert_eq!(extra.id, 7);
+    assert_eq!(Path::new(&extra.path), extra_path.as_path());
+    assert!(fs::metadata(&extra_path).unwrap().len() <= 1_048_576);
+
+    let manifest_path = layout.manifest_path();
+    let mut manifest =
+        Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    manifest.next_segment_id = 8;
+    ManifestStore::new(manifest_path.clone())
+        .save(&manifest)
+        .unwrap();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    assert_eq!(manifest.next_segment_id, 8);
+    assert_eq!(manifest.segments.len(), 2);
+    assert!(manifest.segments.iter().all(|segment| segment.id != 7));
+    let cut = WalCut {
+        flushed_sequence: manifest.flushed_sequence,
+        last_sequence: manifest.last_sequence,
+        flushed_wal_id: manifest.flushed_wal_id,
+        active_wal_id: manifest.active_wal_id,
+        next_wal_id: manifest.next_wal_id,
+    };
+    let (wal_witnesses, mut budget) =
+        scan_v4_wals_with_budget(root, cut, |_, _, _, _| Ok(())).unwrap();
+    assert_eq!(wal_witnesses.len(), 1);
+    let before = snapshot(dir.path());
+    let mut callbacks = 0;
+    let error = visit_v4_segments(root, &manifest, &mut budget, |_| {
+        callbacks += 1;
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(matches!(&error, PraxisError::Corrupt { .. }), "{error}");
+    assert_eq!(callbacks, 0);
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn charged_wal_budget_exhaustion_refuses_before_segment_callbacks() {
+    let (dir, _config, lease, _) = two_literal_segments(false);
+    let root = lease.root();
+    let manifest_path = DiskLayout::at(root).manifest_path();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    let cut = WalCut {
+        flushed_sequence: manifest.flushed_sequence,
+        last_sequence: manifest.last_sequence,
+        flushed_wal_id: manifest.flushed_wal_id,
+        active_wal_id: manifest.active_wal_id,
+        next_wal_id: manifest.next_wal_id,
+    };
+    let (wal_witnesses, mut budget) =
+        scan_v4_wals_with_budget(root, cut, |_, _, _, _| Ok(())).unwrap();
+    assert_eq!(wal_witnesses.len(), 1);
+    assert!(budget.remaining_bytes() < 64 * 1024 * 1024);
+    let remaining = budget.remaining_bytes();
+    budget.charge(root, remaining).unwrap();
+    assert_eq!(budget.remaining_bytes(), 0);
+
+    let before = snapshot(dir.path());
+    let mut callbacks = 0;
+    let error = visit_v4_segments(root, &manifest, &mut budget, |_| {
+        callbacks += 1;
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(
+        matches!(&error, PraxisError::Corrupt { reason, .. } if reason.contains("budget")),
+        "{error}"
+    );
+    assert_eq!(callbacks, 0);
+    assert_eq!(budget.remaining_bytes(), 0);
+    assert_eq!(snapshot(dir.path()), before);
+}
