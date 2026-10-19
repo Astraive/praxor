@@ -14,11 +14,14 @@ use crate::types::ValuePointer;
 use crate::wal::catalog_witness::{
     PhysicalWitnessBudget, clone_witness_path, path_charge, physical_set_charge, vector_charge,
 };
+use std::alloc::{Layout, alloc, dealloc};
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::hash::Hash;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
+use zstd::zstd_safe::zstd_sys as zstd_ffi;
 
 const MAX_SEGMENT_FILES: usize = 4_096;
 const MAX_SEGMENT_LEVELS: usize = 4_096;
@@ -46,6 +49,7 @@ pub(super) struct ProofProfile {
     pub(super) max_rows_file: u64,
     pub(super) max_rows_visit: u64,
     pub(super) max_parser_owned_peak_bytes: usize,
+    pub(super) max_zstd_native_workspace_bytes: usize,
 }
 
 #[allow(dead_code)] // The compressed tag remains fenced until the streaming scanner is proved.
@@ -62,6 +66,7 @@ pub(super) const PRODUCTION_COMPRESSED_PROOF_PROFILE: ProofProfile = ProofProfil
     max_rows_file: 4_194_304,
     max_rows_visit: 8_388_608,
     max_parser_owned_peak_bytes: 128 * 1024 * 1024,
+    max_zstd_native_workspace_bytes: 1024 * 1024,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -381,8 +386,9 @@ impl WorkLedger {
 
 /// Each slot represents one enrolled parser-owned Vec. On pinned Rust 1.99.0
 /// this models requested layouts and reported Vec capacities, including
-/// old/new growth overlap. It excludes allocator usable-size surplus,
-/// unenrolled buffers, native decoder workspace, OS commit and process RSS.
+/// old/new growth overlap. The Zstd static decoder's caller-owned workspace
+/// is separately charged. It excludes allocator usable-size surplus,
+/// unenrolled buffers, OS commit and process RSS.
 /// Re-audit the requested-layout behavior on a Rust toolchain upgrade.
 /// Bloom words need 128 bytes of allowance beyond 2x logical capacity.
 #[derive(Clone, Copy, Debug)]
@@ -427,10 +433,55 @@ impl ScratchSlot {
     }
 }
 
+/// Owns the original allocation pointer and layout; static Zstd contexts
+/// have no matching ZSTD_freeDCtx call.
+struct StaticZstdWorkspace {
+    pointer: NonNull<u8>,
+    layout: Layout,
+}
+
+impl Drop for StaticZstdWorkspace {
+    fn drop(&mut self) {
+        // SAFETY: pointer came from alloc with this exact layout and is owned
+        // once by this workspace for its entire static-context lifetime.
+        unsafe { dealloc(self.pointer.as_ptr(), self.layout) };
+    }
+}
+
+struct StaticZstdContext {
+    workspace: StaticZstdWorkspace,
+    context: NonNull<zstd_ffi::ZSTD_DCtx>,
+}
+
+/// A fresh native charge is refunded on allocation/init error or unwind.
+struct PendingZstdCharge<'a> {
+    scratch: &'a mut ScratchLedger,
+    previous_live: usize,
+    armed: bool,
+}
+
+impl PendingZstdCharge<'_> {
+    fn install(mut self, context: StaticZstdContext) {
+        self.scratch.native_zstd = Some(context);
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingZstdCharge<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.scratch.native_zstd_bytes = 0;
+            self.scratch.live_bytes = self.previous_live;
+        }
+    }
+}
+
 #[allow(dead_code)] // The private stream scanner will account its additional live Vecs here.
 pub(super) struct ScratchLedger {
     profile: ProofProfile,
     capacities: [usize; 9],
+    native_zstd: Option<StaticZstdContext>,
+    native_zstd_bytes: usize,
     live_bytes: usize,
     poisoned: bool,
 }
@@ -441,6 +492,8 @@ impl ScratchLedger {
         Self {
             profile,
             capacities: [0; 9],
+            native_zstd: None,
+            native_zstd_bytes: 0,
             live_bytes: 0,
             poisoned: false,
         }
@@ -448,6 +501,163 @@ impl ScratchLedger {
 
     pub(super) fn live_bytes(&self) -> usize {
         self.live_bytes
+    }
+
+    pub(super) fn native_zstd_bytes(&self) -> usize {
+        self.native_zstd_bytes
+    }
+
+    fn check_zstd_accounting(&mut self, decoded: &Vec<u8>) -> Result<()> {
+        let vec_bytes = self
+            .capacities
+            .iter()
+            .try_fold(0_usize, |sum, capacity| sum.checked_add(*capacity));
+        let expected = vec_bytes.and_then(|sum| sum.checked_add(self.native_zstd_bytes));
+        let native_valid = match self.native_zstd.as_ref() {
+            None => self.native_zstd_bytes == 0,
+            Some(native) => {
+                self.native_zstd_bytes > 0
+                    && self.native_zstd_bytes == native.workspace.layout.size()
+                    && native.workspace.layout.align() == 8
+                    && (native.workspace.pointer.as_ptr() as usize).is_multiple_of(8)
+                    && native.context.as_ptr().cast::<u8>() == native.workspace.pointer.as_ptr()
+                    && self.native_zstd_bytes <= self.profile.max_zstd_native_workspace_bytes
+            }
+        };
+        if self.poisoned
+            || self.capacities[ScratchSlot::Decoded.index()] != decoded.capacity()
+            || !native_valid
+            || expected != Some(self.live_bytes)
+            || self.live_bytes > self.profile.max_parser_owned_peak_bytes
+        {
+            self.poisoned = true;
+            return Err(unsupported(
+                "compressed v4 scratch accounting is inconsistent",
+            ));
+        }
+        Ok(())
+    }
+
+    /// No allocation occurs until the native cap and parser peak are known.
+    fn preflight_zstd_context(&mut self) -> Result<Option<Layout>> {
+        if self.poisoned {
+            return Err(unsupported(
+                "compressed v4 scratch accounting is inconsistent",
+            ));
+        }
+        if self.native_zstd.is_some() {
+            return Ok(None);
+        }
+        if self.native_zstd_bytes != 0 {
+            self.poisoned = true;
+            return Err(unsupported(
+                "compressed v4 scratch accounting is inconsistent",
+            ));
+        }
+        let estimate = unsafe { zstd_ffi::ZSTD_estimateDCtxSize() };
+        if estimate == 0 {
+            return Err(unsupported(
+                "compressed v4 Zstd native workspace estimate is zero",
+            ));
+        }
+        let rounded = estimate
+            .checked_add(7)
+            .map(|size| size & !7)
+            .ok_or_else(|| unsupported("compressed v4 Zstd native workspace size overflow"))?;
+        let layout = Layout::from_size_align(rounded, 8)
+            .map_err(|_| unsupported("compressed v4 Zstd native workspace layout invalid"))?;
+        if layout.size() > self.profile.max_zstd_native_workspace_bytes {
+            return Err(unsupported(
+                "compressed v4 Zstd native workspace exceeds proof profile",
+            ));
+        }
+        let peak = self
+            .live_bytes
+            .checked_add(layout.size())
+            .ok_or_else(|| unsupported("compressed v4 Zstd native peak overflow"))?;
+        if peak > self.profile.max_parser_owned_peak_bytes {
+            return Err(unsupported(
+                "compressed v4 Zstd native peak exceeds proof profile",
+            ));
+        }
+        Ok(Some(layout))
+    }
+
+    fn ensure_zstd_context(&mut self, layout: Option<Layout>) -> Result<()> {
+        let Some(layout) = layout else {
+            return Ok(());
+        };
+        let previous_live = self.live_bytes;
+        let charged_live = previous_live
+            .checked_add(layout.size())
+            .ok_or_else(|| unsupported("compressed v4 Zstd native peak overflow"))?;
+        if self.poisoned
+            || self.native_zstd.is_some()
+            || self.native_zstd_bytes != 0
+            || layout.size() > self.profile.max_zstd_native_workspace_bytes
+            || charged_live > self.profile.max_parser_owned_peak_bytes
+        {
+            self.poisoned = true;
+            return Err(unsupported(
+                "compressed v4 scratch accounting is inconsistent",
+            ));
+        }
+        self.live_bytes = charged_live;
+        self.native_zstd_bytes = layout.size();
+        let pending = PendingZstdCharge {
+            scratch: self,
+            previous_live,
+            armed: true,
+        };
+        // SAFETY: the checked layout is nonzero and 8-byte aligned. A null
+        // return is handled without reserving any decoded output.
+        let pointer = NonNull::new(unsafe { alloc(layout) })
+            .ok_or_else(|| unsupported("compressed v4 Zstd native workspace allocation failed"))?;
+        let workspace = StaticZstdWorkspace { pointer, layout };
+        // SAFETY: workspace stays at its original pointer until the context
+        // is dropped; pinned libzstd never reallocates a static DCtx.
+        let context = NonNull::new(unsafe {
+            zstd_ffi::ZSTD_initStaticDCtx(pointer.as_ptr().cast(), layout.size())
+        })
+        .ok_or_else(|| unsupported("compressed v4 Zstd static context initialization failed"))?;
+        if context.as_ptr().cast::<u8>() != workspace.pointer.as_ptr() {
+            return Err(unsupported(
+                "compressed v4 Zstd static context moved workspace",
+            ));
+        }
+        pending.install(StaticZstdContext { workspace, context });
+        Ok(())
+    }
+
+    pub(super) fn release_zstd_context(&mut self) -> Result<()> {
+        let Some(native) = self.native_zstd.as_ref() else {
+            if self.native_zstd_bytes == 0 {
+                return Ok(());
+            }
+            self.poisoned = true;
+            return Err(unsupported(
+                "compressed v4 Zstd native charge is inconsistent",
+            ));
+        };
+        let bytes = self.native_zstd_bytes;
+        let remainder = self.live_bytes.checked_sub(bytes);
+        if bytes == 0
+            || bytes != native.workspace.layout.size()
+            || native.workspace.layout.align() != 8
+            || !(native.workspace.pointer.as_ptr() as usize).is_multiple_of(8)
+            || native.context.as_ptr().cast::<u8>() != native.workspace.pointer.as_ptr()
+            || remainder.is_none()
+        {
+            self.poisoned = true;
+            return Err(unsupported(
+                "compressed v4 Zstd native charge is inconsistent",
+            ));
+        }
+        let owner = self.native_zstd.take().expect("validated context exists");
+        self.native_zstd_bytes = 0;
+        self.live_bytes = remainder.expect("validated native charge subtraction");
+        drop(owner);
+        Ok(())
     }
 
     pub(super) fn reserve_vec(
@@ -498,25 +708,31 @@ impl ScratchLedger {
             return Err(corrupt(path, "compressed v4 scratch allocation failed"));
         }
         let new_capacity = buffer.capacity();
+        // A successful allocator call may increase capacity even when a
+        // later policy check rejects it. Retain that actual charge and poison
+        // the ledger so the caller must drop its scratch/output pair.
+        self.capacities[slot.index()] = new_capacity;
+        let live_bytes = self
+            .live_bytes
+            .checked_sub(old_capacity)
+            .and_then(|bytes| bytes.checked_add(new_capacity));
+        self.live_bytes = live_bytes.unwrap_or(usize::MAX);
+        let Some(live_bytes) = live_bytes else {
+            self.poisoned = true;
+            return Err(unsupported("compressed v4 scratch live counter overflow"));
+        };
         if new_capacity > allowance {
             self.poisoned = true;
             return Err(unsupported(
                 "compressed v4 scratch allocation exceeds proof profile",
             ));
         }
-        let live_bytes = self
-            .live_bytes
-            .checked_sub(old_capacity)
-            .and_then(|bytes| bytes.checked_add(new_capacity))
-            .ok_or_else(|| unsupported("compressed v4 scratch live counter overflow"))?;
         if live_bytes > self.profile.max_parser_owned_peak_bytes {
             self.poisoned = true;
             return Err(unsupported(
                 "compressed v4 scratch live bytes exceed proof profile",
             ));
         }
-        self.capacities[slot.index()] = new_capacity;
-        self.live_bytes = live_bytes;
         Ok(())
     }
 }
@@ -530,7 +746,7 @@ pub(super) struct BlockFrame<'a> {
 
 /// Bounded reusable block decoder for one enrolled output Vec. The caller
 /// must separately enroll its encoded/footer/row buffers. This helper does
-/// not authenticate a file digest. Zstd and visitor callbacks remain fenced.
+/// not authenticate a file digest. Visitor callbacks remain fenced.
 #[allow(dead_code)]
 pub(super) fn decode_bounded_block(
     frame: BlockFrame<'_>,
@@ -541,8 +757,11 @@ pub(super) fn decode_bounded_block(
     scratch: &mut ScratchLedger,
     path: &Path,
 ) -> Result<CompressedWorkFacts> {
+    if frame.codec == Compression::Zstd {
+        return decode_bounded_zstd_block(frame, work, current, pass, decoded, scratch, path);
+    }
     if frame.codec != Compression::Lz4 {
-        return Err(unsupported("compressed v4 Zstd decoder is not yet bounded"));
+        return Err(unsupported("compressed v4 block codec is not supported"));
     }
     if scratch.profile != work.profile {
         return Err(unsupported(
@@ -587,6 +806,154 @@ pub(super) fn decode_bounded_block(
             Err(corrupt(path, "invalid compressed v4 LZ4 block"))
         }
     }
+}
+
+/// Private single-frame Zstd decoder. Its native context is caller-owned,
+/// charged to ScratchLedger, and never creates owned rows or callbacks.
+fn decode_bounded_zstd_block(
+    frame: BlockFrame<'_>,
+    work: &WorkLedger,
+    current: CompressedWorkFacts,
+    pass: CompressedPassContext,
+    decoded: &mut Vec<u8>,
+    scratch: &mut ScratchLedger,
+    path: &Path,
+) -> Result<CompressedWorkFacts> {
+    // A second block must never expose bytes from a previously successful
+    // decode if any of the following fallible checks rejects it.
+    decoded.clear();
+    let result = (|| {
+        if scratch.profile != work.profile {
+            return Err(unsupported(
+                "compressed v4 scratch and work profiles disagree",
+            ));
+        }
+        scratch.check_zstd_accounting(decoded)?;
+        let next = work.check_next_block(current, frame.decoded_len, pass, path)?;
+        let encoded_len = u64::try_from(frame.encoded.len())
+            .map_err(|_| unsupported("compressed v4 encoded length exceeds platform range"))?;
+        if encoded_len > work.profile.max_encoded_block_bytes {
+            return Err(unsupported(
+                "compressed v4 encoded block exceeds proof profile",
+            ));
+        }
+        if frame.encoded.is_empty() {
+            return Err(corrupt(path, "empty compressed v4 encoded block"));
+        }
+        if crc32c(frame.encoded) != frame.checksum {
+            return Err(corrupt(path, "compressed v4 block checksum mismatch"));
+        }
+        if frame.encoded.get(..4) != Some(&[0x28, 0xb5, 0x2f, 0xfd][..]) {
+            return Err(corrupt(
+                path,
+                "compressed v4 Zstd standard frame magic missing",
+            ));
+        }
+
+        let mut header = std::mem::MaybeUninit::<zstd_ffi::ZSTD_FrameHeader>::uninit();
+        // SAFETY: the encoded slice is live and immutable through this call;
+        // pinned libzstd fills the header only when the result is zero.
+        let header_status = unsafe {
+            zstd_ffi::ZSTD_getFrameHeader(
+                header.as_mut_ptr(),
+                frame.encoded.as_ptr().cast(),
+                frame.encoded.len(),
+            )
+        };
+        if unsafe { zstd_ffi::ZSTD_isError(header_status) } != 0 || header_status != 0 {
+            return Err(corrupt(path, "invalid compressed v4 Zstd frame header"));
+        }
+        // SAFETY: ZSTD_getFrameHeader returned exactly zero above.
+        let header = unsafe { header.assume_init() };
+        if header.frameType != zstd_ffi::ZSTD_FrameType_e::ZSTD_frame {
+            return Err(corrupt(path, "compressed v4 Zstd frame is not ordinary"));
+        }
+        if header.frameContentSize == u64::MAX {
+            return Err(unsupported("compressed v4 Zstd content size is unknown"));
+        }
+        if header.frameContentSize == u64::MAX - 1 {
+            return Err(corrupt(path, "invalid compressed v4 Zstd content size"));
+        }
+        if header.frameContentSize > work.profile.max_decoded_block_bytes {
+            return Err(unsupported(
+                "compressed v4 Zstd content size exceeds proof profile",
+            ));
+        }
+        if header.windowSize > work.profile.max_decoded_block_bytes {
+            return Err(unsupported(
+                "compressed v4 Zstd window exceeds proof profile",
+            ));
+        }
+        if header.dictID != 0 {
+            return Err(unsupported(
+                "compressed v4 Zstd dictionary ID is not supported",
+            ));
+        }
+        if header.frameContentSize != frame.decoded_len {
+            return Err(corrupt(
+                path,
+                "compressed v4 Zstd inner and outer lengths disagree",
+            ));
+        }
+        // SAFETY: the source is a live immutable slice; the pinned API reads
+        // at most its supplied length to locate the first frame boundary.
+        let first_frame_size = unsafe {
+            zstd_ffi::ZSTD_findFrameCompressedSize(
+                frame.encoded.as_ptr().cast(),
+                frame.encoded.len(),
+            )
+        };
+        if unsafe { zstd_ffi::ZSTD_isError(first_frame_size) } != 0
+            || first_frame_size != frame.encoded.len()
+        {
+            return Err(corrupt(
+                path,
+                "compressed v4 Zstd block is not one complete frame",
+            ));
+        }
+
+        let target = usize::try_from(frame.decoded_len)
+            .map_err(|_| unsupported("compressed v4 decoded block exceeds platform range"))?;
+        let layout = scratch.preflight_zstd_context()?;
+        scratch.ensure_zstd_context(layout)?;
+        scratch.reserve_vec(ScratchSlot::Decoded, decoded, target, path)?;
+        decoded.resize(target, 0);
+        let native = scratch
+            .native_zstd
+            .as_ref()
+            .ok_or_else(|| unsupported("compressed v4 Zstd native context is missing"))?;
+        // SAFETY: the static context owns an aligned, fixed workspace for
+        // this call; src/dst slices are disjoint and have checked lengths.
+        let written = unsafe {
+            zstd_ffi::ZSTD_decompressDCtx(
+                native.context.as_ptr(),
+                decoded.as_mut_ptr().cast(),
+                target,
+                frame.encoded.as_ptr().cast(),
+                frame.encoded.len(),
+            )
+        };
+        if unsafe { zstd_ffi::ZSTD_isError(written) } != 0 {
+            let code = unsafe { zstd_ffi::ZSTD_getErrorCode(written) };
+            if matches!(
+                code,
+                zstd_ffi::ZSTD_ErrorCode::ZSTD_error_memory_allocation
+                    | zstd_ffi::ZSTD_ErrorCode::ZSTD_error_workSpace_tooSmall
+            ) {
+                return Err(unsupported("compressed v4 Zstd static workspace exhausted"));
+            }
+            return Err(corrupt(path, "invalid compressed v4 Zstd block"));
+        }
+        if written != target {
+            return Err(corrupt(path, "compressed v4 Zstd decoded length mismatch"));
+        }
+        Ok(next)
+    })();
+    if result.is_err() {
+        decoded.clear();
+        scratch.release_zstd_context()?;
+    }
+    result
 }
 
 /// This position is from the original, unsorted MANIFEST segment vector.

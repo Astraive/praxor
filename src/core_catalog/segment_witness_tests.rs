@@ -27,6 +27,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use zstd::zstd_safe::zstd_sys as zstd_ffi;
 
 const CATALOG_CF: &str = "__praxor_record_catalog_v1";
 
@@ -222,6 +223,29 @@ fn writer_block_frame(bytes: &[u8], offset: u64) -> (&[u8], u64, u32) {
     let end = start.checked_add(12 + encoded_len).unwrap();
     assert!(end <= bytes.len());
     (&bytes[start + 12..end], u64::from(decoded_len), checksum)
+}
+
+fn parsed_zstd_header(frame: &[u8]) -> zstd_ffi::ZSTD_FrameHeader {
+    let mut header = std::mem::MaybeUninit::<zstd_ffi::ZSTD_FrameHeader>::uninit();
+    // The pinned Zstd ABI initializes every header field only on a zero return.
+    let status = unsafe {
+        zstd_ffi::ZSTD_getFrameHeader(header.as_mut_ptr(), frame.as_ptr().cast(), frame.len())
+    };
+    assert_eq!(unsafe { zstd_ffi::ZSTD_isError(status) }, 0);
+    assert_eq!(status, 0, "incomplete test frame header");
+    unsafe { header.assume_init() }
+}
+
+fn zstd_frame_with_header(original: &[u8], replacement_header: &[u8]) -> Vec<u8> {
+    let old_header_len = parsed_zstd_header(original).headerSize as usize;
+    let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd];
+    frame.extend_from_slice(replacement_header);
+    frame.extend_from_slice(&original[old_header_len..]);
+    let first_size =
+        unsafe { zstd_ffi::ZSTD_findFrameCompressedSize(frame.as_ptr().cast(), frame.len()) };
+    assert_eq!(unsafe { zstd_ffi::ZSTD_isError(first_size) }, 0);
+    assert_eq!(first_size, frame.len());
+    frame
 }
 
 fn direct_lz4_pass1(
@@ -1864,6 +1888,7 @@ fn bounded_zstd_helper_decodes_writer_frames_across_two_blocks() {
     let mut scratch = ScratchLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
     let mut decoded = Vec::new();
     let mut facts = CompressedWorkFacts::default();
+    let mut native_charge = None;
     for (ordinal, offset) in two_block_offsets(path).into_iter().enumerate() {
         let (encoded, decoded_len, checksum) = writer_block_frame(&bytes, offset);
         assert_eq!(encoded.get(..4), Some(&[0x28, 0xb5, 0x2f, 0xfd][..]));
@@ -1891,11 +1916,20 @@ fn bounded_zstd_helper_decodes_writer_frames_across_two_blocks() {
         assert_eq!(rows[0].entry.cf.0, CATALOG_CF);
         assert_eq!(rows[0].entry.key.as_ref(), &[ordinal as u8]);
         facts = work.check_next_row(facts, pass, path).unwrap();
+        let current_charge = scratch.native_zstd_bytes();
+        assert!(current_charge > 0);
+        assert!(
+            current_charge <= PRODUCTION_COMPRESSED_PROOF_PROFILE.max_zstd_native_workspace_bytes
+        );
+        assert_eq!(*native_charge.get_or_insert(current_charge), current_charge);
     }
     assert_eq!(facts.blocks, 2);
     assert_eq!(facts.rows, 2);
     assert_eq!(work.accepted(), CompressedWorkFacts::default());
-    assert_eq!(scratch.live_bytes(), decoded.capacity());
+    assert_eq!(
+        scratch.live_bytes(),
+        decoded.capacity() + scratch.native_zstd_bytes()
+    );
 }
 
 #[test]
@@ -1988,6 +2022,393 @@ fn bounded_zstd_helper_rejects_over_profile_claim_before_output_allocation() {
     ));
     assert_eq!(decoded.capacity(), 0);
     assert_eq!(scratch.live_bytes(), 0);
+    assert_eq!(work.accepted(), CompressedWorkFacts::default());
+}
+
+#[test]
+fn bounded_zstd_native_workspace_is_aligned_and_refused_before_output_reserve() {
+    let estimate = unsafe { zstd_ffi::ZSTD_estimateDCtxSize() };
+    assert!(estimate > 1);
+    let rounded = estimate.checked_add(7).unwrap() & !7;
+    eprintln!("pinned Zstd static DCtx estimate={estimate} aligned_layout={rounded}");
+    assert!(rounded <= PRODUCTION_COMPRESSED_PROOF_PROFILE.max_zstd_native_workspace_bytes);
+    let mut words = vec![0_u64; rounded.div_ceil(8) + 2];
+    let aligned = words.as_mut_ptr().cast();
+    assert_eq!((aligned as usize) % 8, 0);
+    assert!(unsafe { zstd_ffi::ZSTD_initStaticDCtx(aligned, estimate - 1) }.is_null());
+    let unaligned = unsafe { words.as_mut_ptr().cast::<u8>().add(1) }.cast();
+    assert!(unsafe { zstd_ffi::ZSTD_initStaticDCtx(unaligned, estimate) }.is_null());
+
+    let (_dir, _config, _lease, metadata) = two_segments(Compression::Zstd, false);
+    let path = Path::new(&metadata[0].path);
+    let bytes = fs::read(path).unwrap();
+    let (encoded, decoded_len, checksum) = writer_block_frame(&bytes, 21);
+    for profile in [
+        ProofProfile {
+            max_zstd_native_workspace_bytes: rounded - 1,
+            ..PRODUCTION_COMPRESSED_PROOF_PROFILE
+        },
+        ProofProfile {
+            max_parser_owned_peak_bytes: rounded - 1,
+            ..PRODUCTION_COMPRESSED_PROOF_PROFILE
+        },
+    ] {
+        let work = WorkLedger::new(profile);
+        let mut scratch = ScratchLedger::new(profile);
+        let mut decoded = Vec::new();
+        let error = decode_bounded_block(
+            BlockFrame {
+                codec: Compression::Zstd,
+                encoded,
+                checksum,
+                decoded_len,
+            },
+            &work,
+            CompressedWorkFacts::default(),
+            work.first_pass(),
+            &mut decoded,
+            &mut scratch,
+            path,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, PraxisError::UnsupportedCatalogFeature { .. }),
+            "{error}"
+        );
+        assert_eq!(decoded.len(), 0);
+        assert_eq!(decoded.capacity(), 0);
+        assert_eq!(scratch.native_zstd_bytes(), 0);
+        assert_eq!(scratch.live_bytes(), 0);
+    }
+}
+
+#[test]
+fn bounded_zstd_rejects_valid_but_out_of_profile_frame_headers_without_allocating() {
+    let (_dir, _config, _lease, metadata) = two_segments(Compression::Zstd, false);
+    let path = Path::new(&metadata[0].path);
+    let bytes = fs::read(path).unwrap();
+    let (encoded, decoded_len, _) = writer_block_frame(&bytes, 21);
+    assert_eq!(parsed_zstd_header(encoded).checksumFlag, 0);
+    let known = u32::try_from(decoded_len).unwrap().to_le_bytes();
+    let over = (8_u32 * 1024 * 1024 + 1).to_le_bytes();
+    let cases: [(&str, Vec<u8>, u64, &str); 4] = [
+        (
+            "unknown content",
+            vec![0x00, 0x00],
+            decoded_len,
+            "content size",
+        ),
+        (
+            "oversized window",
+            [vec![0x80, 0x70], known.to_vec()].concat(),
+            decoded_len,
+            "window",
+        ),
+        (
+            "oversized content",
+            [vec![0x80, 0x68], over.to_vec()].concat(),
+            decoded_len,
+            "content size",
+        ),
+        (
+            "advertised dictionary",
+            [vec![0x81, 0x00, 7], known.to_vec()].concat(),
+            decoded_len,
+            "dictionary",
+        ),
+    ];
+    for (name, header, outer_len, reason_fragment) in cases {
+        let frame = zstd_frame_with_header(encoded, &header);
+        let parsed = parsed_zstd_header(&frame);
+        match name {
+            "unknown content" => assert_eq!(parsed.frameContentSize, u64::MAX),
+            "oversized window" => assert!(parsed.windowSize > 8 * 1024 * 1024),
+            "oversized content" => assert_eq!(parsed.frameContentSize, 8 * 1024 * 1024 + 1),
+            "advertised dictionary" => assert_eq!(parsed.dictID, 7),
+            _ => unreachable!(),
+        }
+        let work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+        let mut scratch = ScratchLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+        let mut decoded = Vec::new();
+        let error = decode_bounded_block(
+            BlockFrame {
+                codec: Compression::Zstd,
+                encoded: &frame,
+                checksum: crc32c(&frame),
+                decoded_len: outer_len,
+            },
+            &work,
+            CompressedWorkFacts::default(),
+            work.first_pass(),
+            &mut decoded,
+            &mut scratch,
+            path,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, PraxisError::UnsupportedCatalogFeature { feature } if feature.contains(reason_fragment)),
+            "{name}: {error}"
+        );
+        assert_eq!(decoded.capacity(), 0, "{name}");
+        assert_eq!(scratch.native_zstd_bytes(), 0, "{name}");
+        assert_eq!(scratch.live_bytes(), 0, "{name}");
+    }
+}
+
+#[test]
+fn bounded_zstd_rejects_malformed_single_frames_before_output_reserve() {
+    let (_dir, _config, _lease, metadata) = two_segments(Compression::Zstd, false);
+    let path = Path::new(&metadata[0].path);
+    let bytes = fs::read(path).unwrap();
+    let (encoded, decoded_len, _) = writer_block_frame(&bytes, 21);
+    let mut bad_magic = encoded.to_vec();
+    bad_magic[0] ^= 1;
+    let skip = [0x50, 0x2a, 0x4d, 0x18, 0, 0, 0, 0];
+    let mut prepended_skip = skip.to_vec();
+    prepended_skip.extend_from_slice(encoded);
+    let mut appended_skip = encoded.to_vec();
+    appended_skip.extend_from_slice(&skip);
+    let mut suffix = encoded.to_vec();
+    suffix.push(0x77);
+    let truncated = encoded[..encoded.len() - 1].to_vec();
+    let mut reserved_bit = encoded.to_vec();
+    reserved_bit[4] |= 0x08;
+    for (name, frame) in [
+        ("bad magic", bad_magic),
+        ("prepended skippable", prepended_skip),
+        ("appended skippable", appended_skip),
+        ("suffix", suffix),
+        ("truncated", truncated),
+        ("reserved bit", reserved_bit),
+    ] {
+        let work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+        let mut scratch = ScratchLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+        let mut decoded = Vec::new();
+        let error = decode_bounded_block(
+            BlockFrame {
+                codec: Compression::Zstd,
+                encoded: &frame,
+                checksum: crc32c(&frame),
+                decoded_len,
+            },
+            &work,
+            CompressedWorkFacts::default(),
+            work.first_pass(),
+            &mut decoded,
+            &mut scratch,
+            path,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, PraxisError::Corrupt { .. }),
+            "{name}: {error}"
+        );
+        assert_eq!(decoded.capacity(), 0, "{name}");
+        assert_eq!(scratch.native_zstd_bytes(), 0, "{name}");
+        assert_eq!(scratch.live_bytes(), 0, "{name}");
+    }
+}
+
+#[test]
+fn bounded_zstd_second_call_early_error_clears_output_and_refunds_context() {
+    let (_dir, _config, _lease, metadata) = two_segments(Compression::Zstd, false);
+    let path = Path::new(&metadata[0].path);
+    let bytes = fs::read(path).unwrap();
+    let (encoded, decoded_len, checksum) = writer_block_frame(&bytes, 21);
+    let work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let pass = work.first_pass();
+    let mut scratch = ScratchLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let mut decoded = Vec::new();
+    let first = decode_bounded_block(
+        BlockFrame {
+            codec: Compression::Zstd,
+            encoded,
+            checksum,
+            decoded_len,
+        },
+        &work,
+        CompressedWorkFacts::default(),
+        pass,
+        &mut decoded,
+        &mut scratch,
+        path,
+    )
+    .unwrap();
+    assert!(!decoded.is_empty());
+    assert!(scratch.native_zstd_bytes() > 0);
+    let error = decode_bounded_block(
+        BlockFrame {
+            codec: Compression::Zstd,
+            encoded,
+            checksum,
+            decoded_len: decoded_len + 1,
+        },
+        &work,
+        first,
+        pass,
+        &mut decoded,
+        &mut scratch,
+        path,
+    )
+    .unwrap_err();
+    assert!(matches!(&error, PraxisError::Corrupt { .. }), "{error}");
+    assert_eq!(decoded.len(), 0);
+    assert_eq!(scratch.native_zstd_bytes(), 0);
+    assert_eq!(scratch.live_bytes(), decoded.capacity());
+    assert_eq!(work.accepted(), CompressedWorkFacts::default());
+}
+
+#[test]
+fn bounded_zstd_checksum_error_after_reserve_clears_and_releases_context() {
+    let (_dir, _config, _lease, metadata) = two_segments(Compression::Zstd, false);
+    let path = Path::new(&metadata[0].path);
+    let bytes = fs::read(path).unwrap();
+    let (encoded, decoded_len, checksum) = writer_block_frame(&bytes, 21);
+    let work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let pass = work.first_pass();
+    let mut scratch = ScratchLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let mut decoded = Vec::new();
+    let first = decode_bounded_block(
+        BlockFrame {
+            codec: Compression::Zstd,
+            encoded,
+            checksum,
+            decoded_len,
+        },
+        &work,
+        CompressedWorkFacts::default(),
+        pass,
+        &mut decoded,
+        &mut scratch,
+        path,
+    )
+    .unwrap();
+    let payload = vec![0x5a_u8; 257];
+    let mut encoder = zstd::stream::Encoder::new(Vec::new(), 0).unwrap();
+    encoder.include_checksum(true).unwrap();
+    encoder
+        .set_pledged_src_size(Some(payload.len() as u64))
+        .unwrap();
+    encoder.write_all(&payload).unwrap();
+    let mut damaged = encoder.finish().unwrap();
+    assert_eq!(
+        parsed_zstd_header(&damaged).frameContentSize,
+        payload.len() as u64
+    );
+    assert_eq!(parsed_zstd_header(&damaged).checksumFlag, 1);
+    let first_size =
+        unsafe { zstd_ffi::ZSTD_findFrameCompressedSize(damaged.as_ptr().cast(), damaged.len()) };
+    assert_eq!(first_size, damaged.len());
+    *damaged.last_mut().unwrap() ^= 1;
+    // Header and frame boundaries still parse; only the inner checksum is invalid.
+    assert_eq!(
+        parsed_zstd_header(&damaged).frameContentSize,
+        payload.len() as u64
+    );
+    let first_size =
+        unsafe { zstd_ffi::ZSTD_findFrameCompressedSize(damaged.as_ptr().cast(), damaged.len()) };
+    assert_eq!(first_size, damaged.len());
+    let error = decode_bounded_block(
+        BlockFrame {
+            codec: Compression::Zstd,
+            encoded: &damaged,
+            checksum: crc32c(&damaged),
+            decoded_len: payload.len() as u64,
+        },
+        &work,
+        first,
+        pass,
+        &mut decoded,
+        &mut scratch,
+        path,
+    )
+    .unwrap_err();
+    assert!(matches!(&error, PraxisError::Corrupt { .. }), "{error}");
+    assert_eq!(decoded.len(), 0);
+    assert!(decoded.capacity() >= payload.len());
+    assert_eq!(scratch.native_zstd_bytes(), 0);
+    assert_eq!(scratch.live_bytes(), decoded.capacity());
+    assert_eq!(work.accepted(), CompressedWorkFacts::default());
+
+    // The retained Decoded Vec is still enrolled and safe for a new context.
+    let retry = decode_bounded_block(
+        BlockFrame {
+            codec: Compression::Zstd,
+            encoded,
+            checksum,
+            decoded_len,
+        },
+        &work,
+        CompressedWorkFacts::default(),
+        pass,
+        &mut decoded,
+        &mut scratch,
+        path,
+    )
+    .unwrap();
+    assert_eq!(retry.blocks, 1);
+    assert!(scratch.native_zstd_bytes() > 0);
+}
+
+#[test]
+fn bounded_zstd_exact_eight_mib_output_reuses_and_releases_native_charge() {
+    let payload = vec![0_u8; 8 * 1024 * 1024];
+    let encoded = zstd::bulk::compress(&payload, 0).unwrap();
+    assert!(encoded.len() <= 9 * 1024 * 1024);
+    assert_eq!(
+        parsed_zstd_header(&encoded).frameContentSize,
+        payload.len() as u64
+    );
+    let path = Path::new("bounded-zstd-direct-frame");
+    let work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let mut scratch = ScratchLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let mut decoded = Vec::new();
+    let first = decode_bounded_block(
+        BlockFrame {
+            codec: Compression::Zstd,
+            encoded: &encoded,
+            checksum: crc32c(&encoded),
+            decoded_len: payload.len() as u64,
+        },
+        &work,
+        CompressedWorkFacts::default(),
+        work.first_pass(),
+        &mut decoded,
+        &mut scratch,
+        path,
+    )
+    .unwrap();
+    assert_eq!(decoded, payload);
+    assert_eq!(first.decoded_bytes, 8 * 1024 * 1024);
+    let charge = scratch.native_zstd_bytes();
+    assert!(charge > 0);
+    assert_eq!(scratch.live_bytes(), decoded.capacity() + charge);
+    let small_payload = [0x72_u8; 19];
+    let small = zstd::bulk::compress(&small_payload, 0).unwrap();
+    let second = decode_bounded_block(
+        BlockFrame {
+            codec: Compression::Zstd,
+            encoded: &small,
+            checksum: crc32c(&small),
+            decoded_len: small_payload.len() as u64,
+        },
+        &work,
+        first,
+        work.first_pass(),
+        &mut decoded,
+        &mut scratch,
+        path,
+    )
+    .unwrap();
+    assert_eq!(decoded.as_slice(), &small_payload);
+    assert_eq!(
+        second.decoded_bytes,
+        payload.len() as u64 + small_payload.len() as u64
+    );
+    assert_eq!(scratch.native_zstd_bytes(), charge);
+    scratch.release_zstd_context().unwrap();
+    assert_eq!(scratch.native_zstd_bytes(), 0);
+    assert_eq!(scratch.live_bytes(), decoded.capacity());
     assert_eq!(work.accepted(), CompressedWorkFacts::default());
 }
 
