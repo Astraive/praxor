@@ -1527,7 +1527,7 @@ fn private_lz4_pass1_authenticates_writer_blocks_without_exposing_rows() {
     let (_dir, _config, _lease, metadata) = two_segments(Compression::Lz4, false);
     let path = Path::new(&metadata[0].path);
     let bytes = fs::read(path).unwrap();
-    let expected_decoded = two_block_offsets(path)
+    let expected_decoded: u64 = two_block_offsets(path)
         .into_iter()
         .map(|offset| writer_block_frame(&bytes, offset).1)
         .sum();
