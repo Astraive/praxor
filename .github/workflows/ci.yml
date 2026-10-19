@@ -217,8 +217,16 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
-          test -z "$(git status --porcelain)"
+          actual_head="$(git rev-parse HEAD)"
+          printf 'expected_head=%s actual_head=%s\n' "$EXPECTED_HEAD" "$actual_head"
+          test "$actual_head" = "$EXPECTED_HEAD"
+          status="$(git status --porcelain=v1 --untracked-files=all)"
+          if test -n "$status"; then
+            printf 'Checkout drift after benchmarks:\n%s\n' "$status"
+            git diff --name-status
+            git diff --cached --name-status
+            exit 1
+          fi
 
   ignored-stress:
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
