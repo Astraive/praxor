@@ -17,7 +17,7 @@ use crate::wal::catalog_witness::{
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::hash::Hash;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 const MAX_SEGMENT_FILES: usize = 4_096;
@@ -283,12 +283,24 @@ impl WorkLedger {
         &self,
         current: CompressedWorkFacts,
         pass: CompressedPassContext,
+        path: &Path,
+    ) -> Result<CompressedWorkFacts> {
+        self.check_next_rows(current, 1, pass, path)
+    }
+
+    /// Preview an entire decoded block before a later pass can call back or
+    /// allocate owned rows. The caller still accounts each parsed row.
+    pub(super) fn check_next_rows(
+        &self,
+        current: CompressedWorkFacts,
+        count: u64,
+        pass: CompressedPassContext,
         _path: &Path,
     ) -> Result<CompressedWorkFacts> {
         self.check_pass_context(pass)?;
         let rows = current
             .rows
-            .checked_add(1)
+            .checked_add(count)
             .ok_or_else(|| unsupported("compressed v4 file row counter overflow"))?;
         if rows > self.profile.max_rows_file {
             return Err(unsupported(
@@ -767,7 +779,7 @@ fn check_real(path: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn physical_id(file: &File, path: &Path) -> Result<SegmentPhysicalId> {
+pub(super) fn physical_id(file: &File, path: &Path) -> Result<SegmentPhysicalId> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, FILE_ID_INFO, FileIdInfo, GetFileInformationByHandle,
@@ -800,7 +812,7 @@ fn physical_id(file: &File, path: &Path) -> Result<SegmentPhysicalId> {
 }
 
 #[cfg(unix)]
-fn physical_id(file: &File, path: &Path) -> Result<SegmentPhysicalId> {
+pub(super) fn physical_id(file: &File, path: &Path) -> Result<SegmentPhysicalId> {
     use std::os::unix::fs::MetadataExt;
 
     let meta = file.metadata()?;
@@ -1315,6 +1327,314 @@ fn capture_literal(file: &mut File, path: &Path) -> Result<(Vec<u8>, u64)> {
         return Err(corrupt(path, "v4 segment length changed during capture"));
     }
     Ok((bytes, len))
+}
+
+/// A pass reads only from its admitted File. Every parsed byte is hashed as
+/// it is consumed, so a separately timed A/B/A rewrite cannot authenticate
+/// different parser input with the original MANIFEST digest.
+struct CompressedPassReader<'a> {
+    file: &'a mut File,
+    path: &'a Path,
+    expected_len: u64,
+    cursor: u64,
+    hasher: blake3::Hasher,
+}
+
+impl CompressedPassReader<'_> {
+    fn read_hashed(&mut self, bytes: &mut [u8]) -> Result<()> {
+        let end = self
+            .cursor
+            .checked_add(bytes.len() as u64)
+            .filter(|end| *end <= self.expected_len)
+            .ok_or_else(|| corrupt(self.path, "compressed v4 read exceeds opened length"))?;
+        self.file
+            .read_exact(bytes)
+            .map_err(|_| corrupt(self.path, "compressed v4 truncated during pass"))?;
+        self.hasher.update(bytes);
+        self.cursor = end;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct AuthenticatedLz4Pass {
+    pub(super) work: CompressedWorkFacts,
+    pub(super) digest: blake3::Hash,
+    pub(super) len: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Lz4PassProbe {
+    AfterFooterPreread,
+    AfterContiguousRead { digest: blake3::Hash },
+}
+
+/// Private, callback-free first pass. The visitor remains fenced until the
+/// separate Bloom and provisional row passes have been proved. A later caller
+/// may commit `work` only after this function returns its integrated digest.
+#[allow(dead_code)]
+pub(super) fn scan_lz4_pass1(
+    path: &Path,
+    expected_identity: SegmentPhysicalId,
+    meta: &SegmentMetadata,
+    work: &mut WorkLedger,
+    mut probe: impl FnMut(Lz4PassProbe),
+) -> Result<AuthenticatedLz4Pass> {
+    check_real(path)?;
+    let mut file = File::open(path)?;
+    if !file.metadata()?.is_file() || physical_id(&file, path)? != expected_identity {
+        return Err(corrupt(path, "compressed v4 identity changed before pass"));
+    }
+    let len = file.metadata()?.len();
+    if len < (SEGMENT_HEADER_BYTES + SEGMENT_TRAILER_BYTES) as u64 {
+        return Err(corrupt(path, "short compressed v4 segment"));
+    }
+    work.admit_compressed_file(len, path)?;
+    let pass = work.first_pass();
+    let mut scratch = ScratchLedger::new(work.profile);
+
+    // The index is provisional until the later, contiguous read hashes and
+    // compares every footer and trailer byte from this same opened handle.
+    file.seek(SeekFrom::End(-(SEGMENT_TRAILER_BYTES as i64)))?;
+    let mut trailer = [0_u8; SEGMENT_TRAILER_BYTES];
+    file.read_exact(&mut trailer)
+        .map_err(|_| corrupt(path, "compressed v4 trailer truncated"))?;
+    let footer_len = u64::from(u32::from_le_bytes(trailer[..4].try_into().unwrap()));
+    let footer_crc = u32::from_le_bytes(trailer[4..8].try_into().unwrap());
+    if u32::from_le_bytes(trailer[8..].try_into().unwrap()) != SEGMENT_FOOTER_MAGIC {
+        return Err(corrupt(path, "bad compressed v4 footer magic"));
+    }
+    let trailer_start = len - SEGMENT_TRAILER_BYTES as u64;
+    let footer_start = trailer_start
+        .checked_sub(footer_len)
+        .filter(|start| *start >= SEGMENT_HEADER_BYTES as u64)
+        .ok_or_else(|| corrupt(path, "compressed v4 footer out of bounds"))?;
+    if footer_len > work.profile.max_footer_bytes {
+        return Err(unsupported("compressed v4 footer exceeds proof profile"));
+    }
+    let footer_len_usize = usize::try_from(footer_len)
+        .map_err(|_| unsupported("compressed v4 footer exceeds platform range"))?;
+    let mut footer_bytes = Vec::new();
+    scratch.reserve_vec(
+        ScratchSlot::Footer,
+        &mut footer_bytes,
+        footer_len_usize,
+        path,
+    )?;
+    footer_bytes.resize(footer_len_usize, 0);
+    file.seek(SeekFrom::Start(footer_start))?;
+    file.read_exact(&mut footer_bytes)
+        .map_err(|_| corrupt(path, "compressed v4 footer truncated"))?;
+    if crc32c(&footer_bytes) != footer_crc {
+        return Err(corrupt(path, "compressed v4 footer checksum mismatch"));
+    }
+    let mut footer = BinaryReader::new(&footer_bytes, path);
+    let block_count = u64::from(footer.read_u32()?);
+    if block_count > (footer.remaining() / 24) as u64 {
+        return Err(corrupt(path, "compressed v4 block count exceeds footer"));
+    }
+    if block_count > work.profile.max_blocks_file
+        || pass
+            .prior
+            .blocks
+            .checked_add(block_count)
+            .is_none_or(|count| count > work.profile.max_blocks_visit)
+    {
+        return Err(unsupported(
+            "compressed v4 block count exceeds proof profile",
+        ));
+    }
+
+    probe(Lz4PassProbe::AfterFooterPreread);
+    file.seek(SeekFrom::Start(0))?;
+    let mut reader = CompressedPassReader {
+        file: &mut file,
+        path,
+        expected_len: len,
+        cursor: 0,
+        hasher: blake3::Hasher::new(),
+    };
+    let mut header = [0_u8; SEGMENT_HEADER_BYTES];
+    reader.read_hashed(&mut header)?;
+    let mut header_reader = BinaryReader::new(&header, path);
+    if header_reader.read_u32()? != SEGMENT_MAGIC || header_reader.read_u32()? != SEGMENT_VERSION {
+        return Err(corrupt(path, "bad compressed v4 segment magic or version"));
+    }
+    if header_reader.read_u8()? != 1 {
+        return Err(corrupt(path, "compressed v4 pass expected LZ4 tag"));
+    }
+    if header_reader.read_u32()? != meta.level || header_reader.read_u64()? != meta.id {
+        return Err(corrupt(path, "compressed v4 header level or id mismatch"));
+    }
+    if meta.partitioned_bloom_filter.is_some() {
+        return Err(unsupported(
+            "partitioned v4 segment Bloom is not yet proven",
+        ));
+    }
+
+    let mut facts = CompressedWorkFacts::default();
+    let mut encoded = Vec::new();
+    let mut decoded = Vec::new();
+    let mut previous = Vec::new();
+    let mut previous_cf_len = 0;
+    let mut previous_valid = false;
+    let mut first_seen = false;
+    let mut last_key_matches = meta.max_key.is_empty();
+    for _ in 0..block_count {
+        let first_key = footer.read_len_slice()?;
+        let last_key = footer.read_len_slice()?;
+        let offset = footer.read_u64()?;
+        let block_len = footer.read_u64()?;
+        let end = offset
+            .checked_add(block_len)
+            .ok_or_else(|| corrupt(path, "compressed v4 block offset overflow"))?;
+        if offset != reader.cursor || block_len < BLOCK_HEADER_BYTES as u64 || end > footer_start {
+            return Err(corrupt(path, "compressed v4 block is not contiguous"));
+        }
+        let mut block_header = [0_u8; BLOCK_HEADER_BYTES];
+        reader.read_hashed(&mut block_header)?;
+        let encoded_len = u64::from(u32::from_le_bytes(block_header[..4].try_into().unwrap()));
+        let decoded_len = u64::from(u32::from_le_bytes(block_header[4..8].try_into().unwrap()));
+        let checksum = u32::from_le_bytes(block_header[8..].try_into().unwrap());
+        if encoded_len
+            .checked_add(BLOCK_HEADER_BYTES as u64)
+            .filter(|total| *total == block_len)
+            .is_none()
+            || encoded_len == 0
+        {
+            return Err(corrupt(path, "compressed v4 block length mismatch"));
+        }
+        if encoded_len > work.profile.max_encoded_block_bytes {
+            return Err(unsupported(
+                "compressed v4 encoded block exceeds proof profile",
+            ));
+        }
+        // Refuse forged output claims before encoded or decoded allocation.
+        work.check_next_block(facts, decoded_len, pass, path)?;
+        let encoded_len_usize = usize::try_from(encoded_len)
+            .map_err(|_| unsupported("compressed v4 encoded block exceeds platform range"))?;
+        encoded.clear();
+        scratch.reserve_vec(ScratchSlot::Encoded, &mut encoded, encoded_len_usize, path)?;
+        encoded.resize(encoded_len_usize, 0);
+        reader.read_hashed(&mut encoded)?;
+        facts = decode_bounded_block(
+            BlockFrame {
+                codec: Compression::Lz4,
+                encoded: &encoded,
+                checksum,
+                decoded_len,
+            },
+            work,
+            facts,
+            pass,
+            &mut decoded,
+            &mut scratch,
+            path,
+        )?;
+        let mut rows = BinaryReader::new(&decoded, path);
+        let row_count = u64::from(rows.read_u32()?);
+        if row_count == 0 || row_count > (rows.remaining() / 17) as u64 {
+            return Err(corrupt(path, "compressed v4 row count exceeds block"));
+        }
+        work.check_next_rows(facts, row_count, pass, path)?;
+        let mut block_first = None;
+        let mut block_last: Option<(&str, &[u8])> = None;
+        for _ in 0..row_count {
+            let row = borrowed_row(&mut rows, path)?;
+            let prior = block_last.or_else(|| {
+                previous_valid.then(|| {
+                    let (cf, key) = previous.split_at(previous_cf_len);
+                    (
+                        std::str::from_utf8(cf).expect("previous family was validated"),
+                        key,
+                    )
+                })
+            });
+            if prior.is_some_and(|(cf, key)| (row.cf.as_bytes(), row.key) < (cf.as_bytes(), key)) {
+                return Err(corrupt(path, "compressed v4 rows are out of writer order"));
+            }
+            if !first_seen {
+                first_seen = true;
+                if row.key != meta.min_key.as_slice() {
+                    return Err(corrupt(
+                        path,
+                        "compressed v4 first key disagrees with MANIFEST",
+                    ));
+                }
+            }
+            last_key_matches = row.key == meta.max_key.as_slice();
+            block_first.get_or_insert(row.key);
+            block_last = Some((row.cf, row.key));
+            facts = work.check_next_row(facts, pass, path)?;
+        }
+        if rows.remaining() != 0
+            || block_first != Some(first_key)
+            || block_last.map(|(_, key)| key) != Some(last_key)
+        {
+            return Err(corrupt(
+                path,
+                "compressed v4 block key range or framing mismatch",
+            ));
+        }
+        let (last_cf, last_key) = block_last.expect("nonempty block was checked");
+        previous_cf_len = last_cf.len();
+        let previous_len = previous_cf_len
+            .checked_add(last_key.len())
+            .ok_or_else(|| unsupported("compressed v4 prior key length overflow"))?;
+        scratch.reserve_vec(ScratchSlot::Previous, &mut previous, previous_len, path)?;
+        previous.clear();
+        previous.extend_from_slice(last_cf.as_bytes());
+        previous.extend_from_slice(last_key);
+        previous_valid = true;
+    }
+    if footer.remaining() != 0 || reader.cursor != footer_start {
+        return Err(corrupt(path, "unconsumed compressed v4 framing bytes"));
+    }
+    if facts.rows != meta.entries || (!first_seen && !meta.min_key.is_empty()) || !last_key_matches
+    {
+        return Err(corrupt(
+            path,
+            "compressed v4 observed count or key range mismatch",
+        ));
+    }
+
+    let mut chunk = [0_u8; HASH_CHUNK_BYTES];
+    for expected in footer_bytes.chunks(HASH_CHUNK_BYTES) {
+        let actual = &mut chunk[..expected.len()];
+        reader.read_hashed(actual)?;
+        if actual != expected {
+            return Err(corrupt(path, "compressed v4 footer changed during pass"));
+        }
+    }
+    let mut reread_trailer = [0_u8; SEGMENT_TRAILER_BYTES];
+    reader.read_hashed(&mut reread_trailer)?;
+    if reread_trailer != trailer || reader.cursor != len {
+        return Err(corrupt(path, "compressed v4 trailer changed during pass"));
+    }
+    let mut extra = [0_u8; 1];
+    if reader.file.read(&mut extra)? != 0
+        || reader.file.metadata()?.len() != len
+        || physical_id(reader.file, path)? != expected_identity
+    {
+        return Err(corrupt(
+            path,
+            "compressed v4 length or identity changed during pass",
+        ));
+    }
+    let digest = reader.hasher.finalize();
+    probe(Lz4PassProbe::AfterContiguousRead { digest });
+    if digest.to_hex().as_str() != meta.file_digest.as_str() {
+        return Err(corrupt(
+            path,
+            "compressed v4 integrated pass digest mismatch",
+        ));
+    }
+    pass.require_exact_replay(facts, path)?;
+    Ok(AuthenticatedLz4Pass {
+        work: facts,
+        digest,
+        len,
+    })
 }
 
 struct ScannedSegment {

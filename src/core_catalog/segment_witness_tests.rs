@@ -1,20 +1,21 @@
 use super::physical::inspect_v4_owner;
 use super::physical_tests::flushed_create_fixture;
 use super::segment_witness::{
-    BlockFrame, CompressedWorkFacts, ObservedSegmentRow, ObservedSegmentValue,
-    PRODUCTION_COMPRESSED_PROOF_PROFILE, PROTECTED_STAGE_LIMITS, PhysicalRowClass, ProofProfile,
-    ProtectedRole, ProtectedStage, ProtectedStageLimits, ScratchLedger, ScratchSlot,
-    SegmentFileWitness, SegmentSource, WorkLedger, collect_protected_segment_candidate,
-    collect_protected_segment_candidate_for_test, decode_bounded_block, visit_v4_segments,
+    AuthenticatedLz4Pass, BlockFrame, CompressedWorkFacts, Lz4PassProbe, ObservedSegmentRow,
+    ObservedSegmentValue, PRODUCTION_COMPRESSED_PROOF_PROFILE, PROTECTED_STAGE_LIMITS,
+    PhysicalRowClass, ProofProfile, ProtectedRole, ProtectedStage, ProtectedStageLimits,
+    ScratchLedger, ScratchSlot, SegmentFileWitness, SegmentSource, WorkLedger,
+    collect_protected_segment_candidate, collect_protected_segment_candidate_for_test,
+    decode_bounded_block, physical_id, scan_lz4_pass1, visit_v4_segments,
 };
 use crate::accel::cpu::scalar::CpuAccelerator;
 use crate::config::{Compression, PraxisConfig};
 use crate::disk::DiskLayout;
 use crate::errors::PraxisError;
-use crate::io::{BinaryReader, crc32c};
+use crate::io::{BinaryReader, BinaryWriter, crc32c, decode_block};
 use crate::manifest::{Manifest, ManifestStore, SegmentMetadata};
 use crate::segments::block::SegmentEntry;
-use crate::segments::codec::{decode_entries, decode_segment};
+use crate::segments::codec::{decode_entries, decode_segment, encode_entries};
 use crate::segments::{BloomFilter, SegmentWriteOptions, SegmentWriter};
 use crate::types::{ColumnFamily, StoredValue, ValuePointer, VersionedValue};
 use crate::values::ValueLog;
@@ -23,7 +24,8 @@ use crate::wal::catalog_witness::{
 };
 use crate::writer_lease::{LOCK_FILE_NAME, WriterLease};
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const CATALOG_CF: &str = "__praxor_record_catalog_v1";
@@ -220,6 +222,71 @@ fn writer_block_frame(bytes: &[u8], offset: u64) -> (&[u8], u64, u32) {
     let end = start.checked_add(12 + encoded_len).unwrap();
     assert!(end <= bytes.len());
     (&bytes[start + 12..end], u64::from(decoded_len), checksum)
+}
+
+fn direct_lz4_pass1(
+    meta: &SegmentMetadata,
+    work: &mut WorkLedger,
+    probe: impl FnMut(Lz4PassProbe),
+) -> crate::errors::Result<AuthenticatedLz4Pass> {
+    let path = Path::new(&meta.path);
+    let file = File::open(path).unwrap();
+    let identity = physical_id(&file, path).unwrap();
+    drop(file);
+    scan_lz4_pass1(path, identity, meta, work, probe)
+}
+
+fn replace_lz4_footer(bytes: &[u8], footer: &[u8]) -> Vec<u8> {
+    let trailer_start = bytes.len() - 12;
+    let old_len =
+        u32::from_le_bytes(bytes[trailer_start..trailer_start + 4].try_into().unwrap()) as usize;
+    let footer_start = trailer_start - old_len;
+    let mut rewritten = bytes[..footer_start].to_vec();
+    rewritten.extend_from_slice(footer);
+    rewritten.extend_from_slice(&(footer.len() as u32).to_le_bytes());
+    rewritten.extend_from_slice(&crc32c(footer).to_le_bytes());
+    rewritten.extend_from_slice(&bytes[trailer_start + 8..]);
+    rewritten
+}
+
+fn same_length_lz4_value_variant(bytes: &[u8], path: &Path) -> Vec<u8> {
+    let (original, decoded_len, _) = writer_block_frame(bytes, 21);
+    let decoded = decode_block(Compression::Lz4, original).unwrap();
+    assert_eq!(decoded.len() as u64, decoded_len);
+    let original_entries = decode_entries(&decoded, path).unwrap();
+    assert_eq!(original_entries.len(), 1);
+    for replacement in 0_u8..=u8::MAX {
+        let candidate = [replacement, replacement ^ 0x5a];
+        if matches!(&original_entries[0].entry.version.value, StoredValue::Put(value) if value.as_slice() == candidate)
+        {
+            continue;
+        }
+        let mut entries = decode_entries(&decoded, path).unwrap();
+        entries[0].entry.version.value = StoredValue::Put(candidate.to_vec());
+        let candidate_decoded = encode_entries(&entries).unwrap();
+        assert_eq!(candidate_decoded.len(), decoded.len());
+        let encoded = lz4_flex::compress_prepend_size(&candidate_decoded);
+        if encoded.len() != original.len() {
+            continue;
+        }
+        let mut changed = bytes.to_vec();
+        changed[29..33].copy_from_slice(&crc32c(&encoded).to_le_bytes());
+        changed[33..33 + encoded.len()].copy_from_slice(&encoded);
+        assert_ne!(changed, bytes);
+        assert_eq!(changed.len(), bytes.len());
+        assert_eq!(
+            &changed[33 + encoded.len()..],
+            &bytes[33 + original.len()..]
+        );
+        let decoded_changed = decode_segment(&changed, path, &CpuAccelerator).unwrap();
+        assert_eq!(decoded_changed.blocks.len(), 2);
+        assert_eq!(
+            decoded_changed.blocks[0][0].entry.version.value,
+            StoredValue::Put(candidate.to_vec())
+        );
+        return changed;
+    }
+    panic!("no same-length, independently decodable LZ4 value variant");
 }
 
 fn expected_row(
@@ -1452,6 +1519,283 @@ fn bounded_lz4_helper_refuses_repaired_inner_size_and_outer_profile_before_outpu
     ));
     assert_eq!(decoded.capacity(), 0);
     assert_eq!(scratch.live_bytes(), 0);
+    assert_eq!(work.accepted(), CompressedWorkFacts::default());
+}
+
+#[test]
+fn private_lz4_pass1_authenticates_writer_blocks_without_exposing_rows() {
+    let (_dir, _config, _lease, metadata) = two_segments(Compression::Lz4, false);
+    let path = Path::new(&metadata[0].path);
+    let bytes = fs::read(path).unwrap();
+    let expected_decoded = two_block_offsets(path)
+        .into_iter()
+        .map(|offset| writer_block_frame(&bytes, offset).1)
+        .sum();
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let mut probes = Vec::new();
+    let pass = direct_lz4_pass1(&metadata[0], &mut work, |event| probes.push(event)).unwrap();
+    assert_eq!(pass.len, bytes.len() as u64);
+    assert_eq!(pass.digest, blake3::hash(&bytes));
+    assert_eq!(pass.work.decoded_bytes, expected_decoded);
+    assert_eq!(pass.work.blocks, 2);
+    assert_eq!(pass.work.rows, 2);
+    assert_eq!(work.accepted(), CompressedWorkFacts::default());
+    assert_eq!(work.compressed_physical_bytes(), pass.len);
+    assert_eq!(
+        probes,
+        vec![
+            Lz4PassProbe::AfterFooterPreread,
+            Lz4PassProbe::AfterContiguousRead {
+                digest: pass.digest
+            }
+        ]
+    );
+}
+
+#[test]
+fn private_lz4_pass1_accepts_writer_valid_block_and_file_over_one_mebibyte() {
+    let (_dir, _config, lease, metadata) = two_segments(Compression::Lz4, false);
+    let root = lease.root();
+    let path = Path::new(&metadata[0].path);
+    let mut value = vec![0_u8; 1_100_000];
+    blake3::Hasher::new().finalize_xof().fill(&mut value);
+    let value_path = DiskLayout::at(root).value_log_path(1);
+    let mut value_log = ValueLog::open(&value_path).unwrap();
+    let meta = SegmentWriter::write(
+        SegmentWriteOptions {
+            path,
+            id: 1,
+            level: 0,
+            compression: Compression::Lz4,
+            accelerator: &CpuAccelerator,
+            value_log: &mut value_log,
+            large_value_threshold: value.len() + 1,
+            block_size: 4096,
+            partitioned_bloom: None,
+            direct_io: false,
+        },
+        vec![row(0, StoredValue::Put(value))],
+    )
+    .unwrap();
+    drop(value_log);
+    let bytes = fs::read(path).unwrap();
+    assert!(bytes.len() > 1_048_576);
+    assert!(writer_block_frame(&bytes, 21).1 > 1_048_576);
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let pass = direct_lz4_pass1(&meta, &mut work, |_| {}).unwrap();
+    assert_eq!(pass.work.rows, 1);
+    assert_eq!(pass.work.blocks, 1);
+    assert_eq!(pass.digest, blake3::hash(&bytes));
+    assert_eq!(work.accepted(), CompressedWorkFacts::default());
+}
+
+#[test]
+fn private_lz4_pass1_distinguishes_impossible_footer_from_possible_overcap_count() {
+    let (_dir, _config, _lease, metadata) = two_segments(Compression::Lz4, false);
+    let path = Path::new(&metadata[0].path);
+    let original = fs::read(path).unwrap();
+    let trailer_start = original.len() - 12;
+    let footer_len = u32::from_le_bytes(
+        original[trailer_start..trailer_start + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let footer_start = trailer_start - footer_len;
+    let mut impossible = original[footer_start..trailer_start].to_vec();
+    impossible[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+    fs::write(path, replace_lz4_footer(&original, &impossible)).unwrap();
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    assert!(matches!(
+        direct_lz4_pass1(&metadata[0], &mut work, |_| {}),
+        Err(PraxisError::Corrupt { reason, .. }) if reason == "compressed v4 block count exceeds footer"
+    ));
+
+    let count = 65_537_u32;
+    let mut possible = vec![0_u8; 4 + count as usize * 24];
+    possible[..4].copy_from_slice(&count.to_le_bytes());
+    let enlarged = replace_lz4_footer(&original, &possible);
+    fs::write(path, &enlarged).unwrap();
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    assert!(matches!(
+        direct_lz4_pass1(&metadata[0], &mut work, |_| {}),
+        Err(PraxisError::UnsupportedCatalogFeature { feature })
+            if feature == "compressed v4 block count exceeds proof profile"
+    ));
+    assert!(enlarged.len() < 8 * 1024 * 1024);
+}
+
+#[test]
+fn private_lz4_pass1_refuses_outer_claim_before_decode_and_repaired_inner_size() {
+    let (_dir, _config, _lease, metadata) = two_segments(Compression::Lz4, false);
+    let path = Path::new(&metadata[0].path);
+    let original = fs::read(path).unwrap();
+    let mut outer = original.clone();
+    outer[25..29].copy_from_slice(&(8_u32 * 1024 * 1024 + 1).to_le_bytes());
+    fs::write(path, &outer).unwrap();
+    let mut meta = metadata[0].clone();
+    meta.file_digest = blake3::hash(&outer).to_hex().to_string();
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    assert!(matches!(
+        direct_lz4_pass1(&meta, &mut work, |_| {}),
+        Err(PraxisError::UnsupportedCatalogFeature { feature })
+            if feature.contains("decoded block")
+    ));
+    assert_eq!(work.accepted(), CompressedWorkFacts::default());
+
+    let mut inner = original;
+    let encoded_len = u32::from_le_bytes(inner[21..25].try_into().unwrap()) as usize;
+    let decoded_len = u32::from_le_bytes(inner[25..29].try_into().unwrap());
+    inner[33..37].copy_from_slice(&(decoded_len + 1).to_le_bytes());
+    let checksum = crc32c(&inner[33..33 + encoded_len]);
+    inner[29..33].copy_from_slice(&checksum.to_le_bytes());
+    fs::write(path, &inner).unwrap();
+    meta.file_digest = blake3::hash(&inner).to_hex().to_string();
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    assert!(matches!(
+        direct_lz4_pass1(&meta, &mut work, |_| {}),
+        Err(PraxisError::Corrupt { reason, .. })
+            if reason == "compressed v4 LZ4 inner and outer lengths disagree"
+    ));
+    assert_eq!(work.accepted(), CompressedWorkFacts::default());
+}
+
+#[test]
+fn private_lz4_pass1_rejects_repaired_offset_and_decoded_row_count() {
+    let (_dir, _config, _lease, metadata) = two_segments(Compression::Lz4, false);
+    let path = Path::new(&metadata[0].path);
+    let original = fs::read(path).unwrap();
+    let trailer_start = original.len() - 12;
+    let footer_len = u32::from_le_bytes(
+        original[trailer_start..trailer_start + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let footer_start = trailer_start - footer_len;
+    let mut footer = original[footer_start..trailer_start].to_vec();
+    let mut index = BinaryReader::new(&footer, path);
+    assert_eq!(index.read_u32().unwrap(), 2);
+    index.read_len_slice().unwrap();
+    index.read_len_slice().unwrap();
+    let offset_position = index.position();
+    drop(index);
+    footer[offset_position..offset_position + 8].copy_from_slice(&22_u64.to_le_bytes());
+    let changed = replace_lz4_footer(&original, &footer);
+    fs::write(path, &changed).unwrap();
+    let mut meta = metadata[0].clone();
+    meta.file_digest = blake3::hash(&changed).to_hex().to_string();
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    assert!(matches!(
+        direct_lz4_pass1(&meta, &mut work, |_| {}),
+        Err(PraxisError::Corrupt { reason, .. }) if reason == "compressed v4 block is not contiguous"
+    ));
+
+    let (encoded, _, _) = writer_block_frame(&original, 21);
+    let mut decoded = decode_block(Compression::Lz4, encoded).unwrap();
+    decoded[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+    let recompressed = lz4_flex::compress_prepend_size(&decoded);
+    let mut single = BinaryWriter::new();
+    single.write_bytes(&original[..21]);
+    single.write_u32(recompressed.len() as u32);
+    single.write_u32(decoded.len() as u32);
+    single.write_u32(crc32c(&recompressed));
+    single.write_bytes(&recompressed);
+    let mut one_footer = BinaryWriter::new();
+    one_footer.write_u32(1);
+    one_footer.write_len_bytes(&[0]);
+    one_footer.write_len_bytes(&[0]);
+    one_footer.write_u64(21);
+    one_footer.write_u64(12 + recompressed.len() as u64);
+    let one_footer = one_footer.into_inner();
+    single.write_bytes(&one_footer);
+    single.write_u32(one_footer.len() as u32);
+    single.write_u32(crc32c(&one_footer));
+    single.write_u32(crate::segments::format::SEGMENT_FOOTER_MAGIC);
+    let single = single.into_inner();
+    fs::write(path, &single).unwrap();
+    meta.entries = 1;
+    meta.max_key = vec![0];
+    meta.file_digest = blake3::hash(&single).to_hex().to_string();
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    assert!(matches!(
+        direct_lz4_pass1(&meta, &mut work, |_| {}),
+        Err(PraxisError::Corrupt { reason, .. }) if reason == "compressed v4 row count exceeds block"
+    ));
+}
+
+#[test]
+fn private_lz4_pass1_rejects_same_handle_aba_by_integrated_digest() {
+    let (dir, _config, _lease, metadata) = two_segments(Compression::Lz4, false);
+    let path = Path::new(&metadata[0].path);
+    let original = fs::read(path).unwrap();
+    let changed = same_length_lz4_value_variant(&original, path);
+    assert_eq!(original.len(), changed.len());
+    assert_ne!(blake3::hash(&original), blake3::hash(&changed));
+    assert_eq!(
+        metadata[0].file_digest,
+        blake3::hash(&original).to_hex().to_string()
+    );
+    let before = snapshot(dir.path());
+    let identity = file_id(path);
+    let mut writer = OpenOptions::new().write(true).open(path).unwrap();
+    let first_len = writer_block_frame(&original, 21).0.len() + 12;
+    let mut observed_digest = None;
+    let mut preread_count = 0;
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let error = direct_lz4_pass1(&metadata[0], &mut work, |event| match event {
+        Lz4PassProbe::AfterFooterPreread => {
+            preread_count += 1;
+            assert_eq!(fs::read(path).unwrap(), original);
+            writer.seek(SeekFrom::Start(21)).unwrap();
+            writer.write_all(&changed[21..21 + first_len]).unwrap();
+            writer.sync_data().unwrap();
+            assert_eq!(fs::read(path).unwrap(), changed);
+            assert_eq!(file_id(path), identity);
+        }
+        Lz4PassProbe::AfterContiguousRead { digest } => {
+            assert_eq!(digest, blake3::hash(&changed));
+            observed_digest = Some(digest);
+            writer.seek(SeekFrom::Start(21)).unwrap();
+            writer.write_all(&original[21..21 + first_len]).unwrap();
+            writer.sync_data().unwrap();
+            assert_eq!(fs::read(path).unwrap(), original);
+            assert_eq!(file_id(path), identity);
+        }
+    })
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        PraxisError::Corrupt { reason, .. }
+            if reason == "compressed v4 integrated pass digest mismatch"
+    ));
+    assert_eq!(preread_count, 1);
+    assert_eq!(observed_digest, Some(blake3::hash(&changed)));
+    assert_eq!(work.accepted(), CompressedWorkFacts::default());
+    assert_eq!(fs::read(path).unwrap(), original);
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn private_lz4_pass1_compares_the_preread_trailer_to_hashed_bytes() {
+    let (_dir, _config, _lease, metadata) = two_segments(Compression::Lz4, false);
+    let path = Path::new(&metadata[0].path);
+    let original = fs::read(path).unwrap();
+    let mut writer = OpenOptions::new().write(true).open(path).unwrap();
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let error = direct_lz4_pass1(&metadata[0], &mut work, |event| {
+        if event == Lz4PassProbe::AfterFooterPreread {
+            writer.seek(SeekFrom::End(-8)).unwrap();
+            writer
+                .write_all(&[original[original.len() - 8] ^ 1])
+                .unwrap();
+            writer.sync_data().unwrap();
+        }
+    })
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        PraxisError::Corrupt { reason, .. }
+            if reason == "compressed v4 trailer changed during pass"
+    ));
     assert_eq!(work.accepted(), CompressedWorkFacts::default());
 }
 
