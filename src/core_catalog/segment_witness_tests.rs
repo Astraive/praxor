@@ -1307,7 +1307,7 @@ fn retagged_literal_is_not_a_valid_lz4_segment() {
 }
 
 #[test]
-fn writer_valid_zstd_segments_remain_fenced_today() {
+fn writer_valid_zstd_segments_remain_fenced_from_public_owner() {
     let (dir, config, lease, metadata) = two_segments(Compression::Zstd, true);
     let root = lease.root();
     let manifest_path = DiskLayout::at(root).manifest_path();
@@ -1329,29 +1329,6 @@ fn writer_valid_zstd_segments_remain_fenced_today() {
         );
     }
     let before = snapshot(dir.path());
-    let mut staged = 0;
-    with_wal_budget(root, &manifest, |budget| {
-        let wal_balance = budget.remaining_bytes();
-        let error = collect_protected_segment_candidate_for_test(
-            root,
-            &manifest,
-            budget,
-            PROTECTED_STAGE_LIMITS,
-            |count| {
-                staged = count;
-                Ok(())
-            },
-        )
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            PraxisError::UnsupportedCatalogFeature {
-                feature: "compressed v4 segments need a bounded proof profile"
-            }
-        ));
-        assert_eq!(budget.remaining_bytes(), wal_balance);
-    });
-    assert_eq!(staged, 0);
     assert!(matches!(
         inspect_v4_owner(&lease, &config, &CpuAccelerator),
         Err(PraxisError::UnsupportedCatalogFeature {
@@ -1949,6 +1926,301 @@ fn literal_files_are_excluded_from_lz4_visitor_physical_cap() {
 #[test]
 fn writer_valid_zstd_segments_preserve_reversed_manifest_ordinals_when_admitted() {
     assert_compressed_segment_provenance(Compression::Zstd, true);
+}
+
+#[test]
+fn zstd_visitor_accepts_writer_valid_inline_put_over_one_mebibyte() {
+    let (dir, config, lease, _) = two_segments(Compression::Zstd, false);
+    let root = lease.root();
+    let mut value = vec![0_u8; 1_100_000];
+    blake3::Hasher::new().finalize_xof().fill(&mut value);
+    let manifest = rewrite_first_segment(
+        root,
+        vec![row(0, StoredValue::Put(value.clone()))],
+        Compression::Zstd,
+        value.len() + 1,
+        4096,
+    );
+    assert_eq!(manifest.format_version, 4);
+    let first = manifest.segments.iter().find(|meta| meta.id == 1).unwrap();
+    let path = Path::new(&first.path);
+    let bytes = fs::read(path).unwrap();
+    assert_eq!(bytes[8], 2);
+    assert!(bytes.len() > 1_048_576);
+    let (encoded, decoded_len, _) = writer_block_frame(&bytes, 21);
+    assert!(encoded.len() > 1_048_576);
+    assert!(decoded_len > 1_048_576 && decoded_len <= 8 * 1024 * 1024);
+    let parsed = decode_segment(&bytes, path, &CpuAccelerator).unwrap();
+    assert_eq!(parsed.blocks.len(), 1);
+    assert_eq!(parsed.blocks[0].len(), 1);
+    assert_eq!(
+        parsed.blocks[0][0].entry.version.value,
+        StoredValue::Put(value.clone())
+    );
+    assert_eq!(first.file_digest, blake3::hash(&bytes).to_hex().to_string());
+    let before = snapshot(dir.path());
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let candidate = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+        assert_eq!(candidate.witnesses.len(), 2);
+        assert_eq!(candidate.rows.len(), 3);
+        assert_eq!(candidate.witnesses[0].source.id, 1);
+        assert_eq!(candidate.witnesses[0].len, bytes.len() as u64);
+        assert_eq!(candidate.witnesses[0].digest, blake3::hash(&bytes));
+        assert_eq!(candidate.witnesses[0].observed_rows, 1);
+        assert_eq!(
+            candidate.rows[0],
+            expected_row(
+                SegmentSource {
+                    level: 0,
+                    id: 1,
+                    manifest_ordinal: 0,
+                },
+                21,
+                0,
+                ObservedSegmentValue::Put(value.clone()),
+            )
+        );
+        assert_eq!(
+            balance - budget.remaining_bytes(),
+            candidate.retained_witness_bytes()
+        );
+        candidate.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), balance);
+    });
+    assert!(matches!(
+        inspect_v4_owner(&lease, &config, &CpuAccelerator),
+        Err(PraxisError::UnsupportedCatalogFeature {
+            feature: "v4 installed cut beyond narrow D0 bootstrap"
+        })
+    ));
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn mixed_literal_lz4_zstd_share_one_compressed_visit_ledger() {
+    let (dir, config, lease, _) = two_segments(Compression::Lz4, false);
+    let root = lease.root();
+    let mut manifest = rewrite_first_segment(
+        root,
+        vec![
+            row(0, StoredValue::Put(vec![0xca, 0xfe])),
+            row(1, StoredValue::Delete),
+        ],
+        Compression::None,
+        config.large_value_threshold,
+        1,
+    );
+    let layout = DiskLayout::at(root);
+    let value_path = layout.value_log_path(1);
+    let mut value_log = ValueLog::open(&value_path).unwrap();
+    let third = SegmentWriter::write(
+        SegmentWriteOptions {
+            path: &layout.segment_path(1, 3),
+            id: 3,
+            level: 1,
+            compression: Compression::Zstd,
+            accelerator: &CpuAccelerator,
+            value_log: &mut value_log,
+            large_value_threshold: config.large_value_threshold,
+            block_size: 1,
+            partitioned_bloom: None,
+            direct_io: false,
+        },
+        vec![
+            row(0, StoredValue::Put(vec![0x33])),
+            row(3, StoredValue::Delete),
+        ],
+    )
+    .unwrap();
+    drop(value_log);
+    fs::remove_file(value_path).unwrap();
+    manifest.segments.push(third);
+    manifest.next_segment_id = 4;
+    let manifest = save_strict_manifest(root, &manifest);
+    assert_eq!(
+        manifest.segments.iter().map(|m| m.id).collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+
+    let paths = [
+        Path::new(&manifest.segments[0].path),
+        Path::new(&manifest.segments[1].path),
+        Path::new(&manifest.segments[2].path),
+    ];
+    let bytes = [
+        fs::read(paths[0]).unwrap(),
+        fs::read(paths[1]).unwrap(),
+        fs::read(paths[2]).unwrap(),
+    ];
+    assert_eq!([bytes[0][8], bytes[1][8], bytes[2][8]], [0, 1, 2]);
+    for (path, contents) in paths.into_iter().zip(&bytes) {
+        let parsed = decode_segment(contents, path, &CpuAccelerator).unwrap();
+        assert_eq!(parsed.blocks.len(), 2);
+        assert!(parsed.blocks.iter().all(|block| block.len() == 1));
+    }
+    let offsets = [
+        two_block_offsets(paths[0]),
+        two_block_offsets(paths[1]),
+        two_block_offsets(paths[2]),
+    ];
+    let lengths = [bytes[1].len() as u64, bytes[2].len() as u64];
+    let physical = lengths[0] + lengths[1];
+    let decoded_files = [1_usize, 2_usize].map(|index| {
+        offsets[index]
+            .into_iter()
+            .map(|offset| writer_block_frame(&bytes[index], offset).1)
+            .sum::<u64>()
+    });
+    let decoded = decoded_files[0] + decoded_files[1];
+    assert!(physical > 0 && decoded > 0);
+    let profile = ProofProfile {
+        max_physical_file_bytes: lengths[0].max(lengths[1]),
+        max_physical_visit_bytes: physical,
+        max_decoded_file_bytes: decoded_files[0].max(decoded_files[1]),
+        max_decoded_visit_bytes: decoded,
+        ..PRODUCTION_COMPRESSED_PROOF_PROFILE
+    };
+    let sources = [
+        SegmentSource {
+            level: 0,
+            id: 1,
+            manifest_ordinal: 0,
+        },
+        SegmentSource {
+            level: 1,
+            id: 2,
+            manifest_ordinal: 1,
+        },
+        SegmentSource {
+            level: 1,
+            id: 3,
+            manifest_ordinal: 2,
+        },
+    ];
+    let expected_rows = vec![
+        expected_row(
+            sources[0],
+            offsets[0][0],
+            0,
+            ObservedSegmentValue::Put(vec![0xca, 0xfe]),
+        ),
+        expected_row(sources[0], offsets[0][1], 1, ObservedSegmentValue::Delete),
+        expected_row(
+            sources[1],
+            offsets[1][0],
+            0,
+            ObservedSegmentValue::Put(vec![0xca, 0xfe]),
+        ),
+        expected_row(
+            sources[1],
+            offsets[1][1],
+            2,
+            ObservedSegmentValue::Merge(vec![0x22]),
+        ),
+        expected_row(
+            sources[2],
+            offsets[2][0],
+            0,
+            ObservedSegmentValue::Put(vec![0x33]),
+        ),
+        expected_row(sources[2], offsets[2][1], 3, ObservedSegmentValue::Delete),
+    ];
+    let before = snapshot(dir.path());
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let mut rows = Vec::new();
+        let error = visit_v4_segments_with_profile_and_hook_for_test(
+            root,
+            &manifest,
+            budget,
+            ProofProfile {
+                max_physical_visit_bytes: physical - 1,
+                ..profile
+            },
+            |_| Ok(()),
+            |row| {
+                rows.push(row);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            PraxisError::UnsupportedCatalogFeature {
+                feature: "compressed v4 visit physical bytes exceed proof profile"
+            }
+        ));
+        assert_eq!(rows, expected_rows[..4]);
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(snapshot(dir.path()), before);
+
+        rows.clear();
+        let error = visit_v4_segments_with_profile_and_hook_for_test(
+            root,
+            &manifest,
+            budget,
+            ProofProfile {
+                max_decoded_visit_bytes: decoded - 1,
+                ..profile
+            },
+            |_| Ok(()),
+            |row| {
+                rows.push(row);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            PraxisError::UnsupportedCatalogFeature {
+                feature: "compressed v4 visit decoded bytes exceed proof profile"
+            }
+        ));
+        assert_eq!(rows, expected_rows[..4]);
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(snapshot(dir.path()), before);
+
+        rows.clear();
+        let (witnesses, retained) = visit_v4_segments_with_profile_and_hook_for_test(
+            root,
+            &manifest,
+            budget,
+            profile,
+            |_| Ok(()),
+            |row| {
+                rows.push(row);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(rows, expected_rows);
+        assert_eq!(witnesses.len(), 3);
+        assert_eq!(
+            witnesses.iter().map(|w| w.source).collect::<Vec<_>>(),
+            sources
+        );
+        for (witness, meta) in witnesses.iter().zip(&manifest.segments) {
+            let path = Path::new(&meta.path);
+            let opened = File::open(path).unwrap();
+            let contents = fs::read(path).unwrap();
+            assert_eq!(witness.identity, physical_id(&opened, path).unwrap());
+            assert_eq!(witness.len, contents.len() as u64);
+            assert_eq!(witness.digest, blake3::hash(&contents));
+            assert_eq!(witness.observed_rows, 2);
+        }
+        assert_eq!(balance - budget.remaining_bytes(), retained);
+        drop(witnesses);
+        budget.release(root, retained).unwrap();
+        assert_eq!(budget.remaining_bytes(), balance);
+    });
+    assert!(matches!(
+        inspect_v4_owner(&lease, &config, &CpuAccelerator),
+        Err(PraxisError::UnsupportedCatalogFeature {
+            feature: "v4 installed cut beyond narrow D0 bootstrap"
+        })
+    ));
+    assert_eq!(snapshot(dir.path()), before);
 }
 
 #[test]
@@ -5890,6 +6162,94 @@ fn lz4_protected_stage_callback_error_refunds_and_retries_on_same_budget() {
 }
 
 #[test]
+fn zstd_protected_stage_error_and_unwind_refund_same_budget() {
+    let (dir, config, lease, metadata) = two_segments(Compression::Zstd, false);
+    let root = lease.root();
+    let manifest_path = DiskLayout::at(root).manifest_path();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    assert_eq!(manifest.segments.len(), 2);
+    assert!(
+        metadata
+            .iter()
+            .all(|meta| fs::read(&meta.path).unwrap()[8] == 2)
+    );
+    let before = snapshot(dir.path());
+
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let mut staged = 0;
+        let error = collect_protected_segment_candidate_for_test(
+            root,
+            &manifest,
+            budget,
+            PROTECTED_STAGE_LIMITS,
+            |count| {
+                staged = count;
+                Err(PraxisError::Corrupt {
+                    path: root.to_path_buf(),
+                    reason: "injected Zstd protected-stage callback error".into(),
+                })
+            },
+        )
+        .unwrap_err();
+        assert_eq!(staged, 1);
+        assert!(matches!(
+            error,
+            PraxisError::Corrupt { path, reason }
+                if path.as_path() == root && reason == "injected Zstd protected-stage callback error"
+        ));
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(snapshot(dir.path()), before);
+
+        let candidate = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+        assert_eq!(candidate.rows.len(), 4);
+        assert_eq!(candidate.witnesses.len(), 2);
+        assert_eq!(
+            balance - budget.remaining_bytes(),
+            candidate.retained_witness_bytes()
+        );
+        candidate.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), balance);
+
+        let mut reached = 0;
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = collect_protected_segment_candidate_for_test(
+                root,
+                &manifest,
+                budget,
+                PROTECTED_STAGE_LIMITS,
+                |count| {
+                    reached = count;
+                    assert_eq!(count, 1);
+                    panic!("injected Zstd after-stage panic");
+                },
+            );
+        }));
+        assert!(caught.is_err());
+        assert_eq!(reached, 1);
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(snapshot(dir.path()), before);
+
+        let candidate = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+        assert_eq!(candidate.rows.len(), 4);
+        assert_eq!(candidate.witnesses.len(), 2);
+        assert_eq!(
+            balance - budget.remaining_bytes(),
+            candidate.retained_witness_bytes()
+        );
+        candidate.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), balance);
+    });
+    assert!(matches!(
+        inspect_v4_owner(&lease, &config, &CpuAccelerator),
+        Err(PraxisError::UnsupportedCatalogFeature {
+            feature: "v4 installed cut beyond narrow D0 bootstrap"
+        })
+    ));
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
 fn lz4_protected_stage_row_cap_discards_one_provisional_row() {
     let (dir, _config, lease, metadata) = two_segments(Compression::Lz4, false);
     let root = lease.root();
@@ -6061,6 +6421,62 @@ fn later_file_corruption_discards_the_protected_candidate() {
 }
 
 #[test]
+fn zstd_later_file_corruption_discards_provisional_candidate() {
+    let (dir, _config, lease, metadata) = two_segments(Compression::Zstd, false);
+    let root = lease.root();
+    let first_path = Path::new(&metadata[0].path);
+    let first_bytes = fs::read(first_path).unwrap();
+    let second_bytes = fs::read(&metadata[1].path).unwrap();
+    assert_eq!(first_bytes[8], 2);
+    assert_eq!(second_bytes[8], 2);
+    assert_eq!(
+        decode_segment(&first_bytes, first_path, &CpuAccelerator)
+            .unwrap()
+            .blocks
+            .len(),
+        2
+    );
+    let mut corrupt_second = second_bytes;
+    corrupt_second[29] ^= 1; // Change only the first outer block CRC.
+    let manifest = replace_segment_bytes(root, 1, 2, &corrupt_second);
+    assert_eq!(fs::read(&metadata[1].path).unwrap()[8], 2);
+    assert_eq!(
+        manifest
+            .segments
+            .iter()
+            .find(|meta| meta.id == 2)
+            .unwrap()
+            .file_digest,
+        blake3::hash(&corrupt_second).to_hex().to_string()
+    );
+    let before = snapshot(dir.path());
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let mut staged = 0;
+        let error = collect_protected_segment_candidate_for_test(
+            root,
+            &manifest,
+            budget,
+            PROTECTED_STAGE_LIMITS,
+            |count| {
+                staged = count;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(staged, 2, "ID1 protected rows must stage before ID2 fails");
+        assert!(matches!(
+            error,
+            PraxisError::Corrupt { path, reason }
+                if path.as_path() == Path::new(&metadata[1].path)
+                    && reason == "compressed v4 block checksum mismatch"
+        ));
+        assert_eq!(budget.remaining_bytes(), balance);
+    });
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
 fn final_recheck_failure_discards_the_protected_candidate() {
     let (dir, _config, lease, _) = two_literal_segments(false);
     let root = lease.root();
@@ -6096,4 +6512,64 @@ fn final_recheck_failure_discards_the_protected_candidate() {
     });
     assert_eq!(staged, 4);
     assert_eq!(snapshot(dir.path()), expected);
+}
+
+#[test]
+fn zstd_final_recheck_detects_changed_earlier_file_after_stage() {
+    let (dir, _config, lease, metadata) = two_segments(Compression::Zstd, false);
+    let root = lease.root();
+    let manifest_path = DiskLayout::at(root).manifest_path();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    assert!(
+        metadata
+            .iter()
+            .all(|meta| fs::read(&meta.path).unwrap()[8] == 2)
+    );
+    let path = Path::new(&metadata[0].path);
+    let original = fs::read(path).unwrap();
+    let original_id = file_id(path);
+    let mut changed = original.clone();
+    changed[13] ^= 1;
+    let before = snapshot(dir.path());
+    let mut expected = snapshot(dir.path());
+    expected
+        .get_mut(path.strip_prefix(root).unwrap())
+        .unwrap()
+        .bytes = Some(changed.clone());
+    let mut mutator = OpenOptions::new().write(true).open(path).unwrap();
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let mut staged = 0;
+        let error = collect_protected_segment_candidate_for_test(
+            root,
+            &manifest,
+            budget,
+            PROTECTED_STAGE_LIMITS,
+            |count| {
+                staged = count;
+                if count == 4 {
+                    mutator.seek(SeekFrom::Start(13)).unwrap();
+                    mutator.write_all(&[changed[13]]).unwrap();
+                    mutator.flush().unwrap();
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(staged, 4, "ID2 must stage before ID1 changes");
+        assert!(matches!(
+            error,
+            PraxisError::Corrupt { path: failed_path, reason }
+                if failed_path.as_path() == path && reason == "v4 segment bytes or identity changed"
+        ));
+        assert_eq!(budget.remaining_bytes(), balance);
+    });
+    assert_eq!(file_id(path), original_id);
+    assert_eq!(snapshot(dir.path()), expected);
+    mutator.seek(SeekFrom::Start(13)).unwrap();
+    mutator.write_all(&[original[13]]).unwrap();
+    mutator.flush().unwrap();
+    assert_eq!(file_id(path), original_id);
+    assert_eq!(fs::read(path).unwrap(), original);
+    assert_eq!(snapshot(dir.path()), before);
 }
