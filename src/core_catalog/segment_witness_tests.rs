@@ -3496,7 +3496,7 @@ fn private_zstd_pass3_rejects_byte_identical_path_replacement_before_callback() 
 
 #[test]
 fn private_zstd_pass3_rejects_wrong_source_id_and_level_before_callback() {
-    let (dir, _config, lease, metadata) = two_segments(Compression::Zstd, false);
+    let (dir, _config, _lease, metadata) = two_segments(Compression::Zstd, false);
     let path = Path::new(&metadata[0].path);
     let bytes = fs::read(path).unwrap();
     assert_eq!(bytes[8], 2);
