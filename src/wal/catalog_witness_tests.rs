@@ -332,7 +332,7 @@ fn long_root_exhausts_reduced_wal_metadata_budget_before_visiting() {
         .unwrap();
     assert_eq!((short_visits, short_proofs.len()), (1, 1));
 
-    let before = snapshot_tree(short.path());
+    let before = snapshot_tree(&long);
     let mut long_visits = 0;
     let error = scan_v4_wals_with_budget_limit(&long, cut(0, 1, 2), limit, |_, _, _, _| {
         long_visits += 1;
@@ -344,7 +344,7 @@ fn long_root_exhausts_reduced_wal_metadata_budget_before_visiting() {
         "{error}"
     );
     assert_eq!(long_visits, 0);
-    assert_eq!(snapshot_tree(short.path()), before);
+    assert_eq!(snapshot_tree(&long), before);
 }
 
 #[test]
