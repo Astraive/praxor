@@ -491,6 +491,7 @@ pub(super) struct ScratchLedger {
     capacities: [usize; 9],
     native_zstd: Option<StaticZstdContext>,
     native_zstd_bytes: usize,
+    pending_owned_bytes: usize,
     live_bytes: usize,
     poisoned: bool,
 }
@@ -503,6 +504,7 @@ impl ScratchLedger {
             capacities: [0; 9],
             native_zstd: None,
             native_zstd_bytes: 0,
+            pending_owned_bytes: 0,
             live_bytes: 0,
             poisoned: false,
         }
@@ -521,7 +523,9 @@ impl ScratchLedger {
             .capacities
             .iter()
             .try_fold(0_usize, |sum, capacity| sum.checked_add(*capacity));
-        let expected = vec_bytes.and_then(|sum| sum.checked_add(self.native_zstd_bytes));
+        let expected = vec_bytes
+            .and_then(|sum| sum.checked_add(self.native_zstd_bytes))
+            .and_then(|sum| sum.checked_add(self.pending_owned_bytes));
         let native_valid = match self.native_zstd.as_ref() {
             None => self.native_zstd_bytes == 0,
             Some(native) => {
@@ -1671,6 +1675,192 @@ fn owned_row(
     })
 }
 
+/// A compressed row's three destination allocations overlap the decoder
+/// buffers. The guard owns their charge until the callback consumes the row;
+/// a callback that keeps it must account for that retained row itself.
+struct PendingOwnedRowCharge<'a> {
+    scratch: &'a mut ScratchLedger,
+    allowances: [usize; 3],
+    charged: usize,
+}
+
+impl<'a> PendingOwnedRowCharge<'a> {
+    fn new(scratch: &'a mut ScratchLedger, lengths: [usize; 3]) -> Result<Self> {
+        if scratch.poisoned || scratch.pending_owned_bytes != 0 {
+            return Err(unsupported(
+                "compressed v4 scratch accounting is inconsistent",
+            ));
+        }
+        let mut allowances = [0; 3];
+        let mut charged = 0_usize;
+        for (index, length) in lengths.into_iter().enumerate() {
+            if length as u64 > scratch.profile.max_decoded_block_bytes {
+                return Err(unsupported(
+                    "compressed v4 owned field exceeds proof profile",
+                ));
+            }
+            let allowance = if length == 0 {
+                0
+            } else {
+                length
+                    .checked_mul(2)
+                    .and_then(|bytes| bytes.checked_add(64))
+                    .ok_or_else(|| unsupported("compressed v4 owned allowance overflow"))?
+            };
+            charged = charged
+                .checked_add(allowance)
+                .ok_or_else(|| unsupported("compressed v4 owned allowance overflow"))?;
+            allowances[index] = allowance;
+        }
+        let peak = scratch
+            .live_bytes
+            .checked_add(charged)
+            .ok_or_else(|| unsupported("compressed v4 owned peak overflow"))?;
+        if peak > scratch.profile.max_parser_owned_peak_bytes {
+            return Err(unsupported(
+                "compressed v4 owned peak exceeds proof profile",
+            ));
+        }
+        scratch.live_bytes = peak;
+        scratch.pending_owned_bytes = charged;
+        Ok(Self {
+            scratch,
+            allowances,
+            charged,
+        })
+    }
+
+    fn settle(&mut self, capacities: [usize; 3]) -> Result<()> {
+        if capacities
+            .iter()
+            .zip(self.allowances)
+            .any(|(actual, allowance)| *actual > allowance)
+        {
+            self.scratch.poisoned = true;
+            return Err(unsupported(
+                "compressed v4 owned allocation exceeds proof profile",
+            ));
+        }
+        let actual = capacities
+            .into_iter()
+            .try_fold(0_usize, |sum, capacity| sum.checked_add(capacity));
+        let Some(actual) = actual else {
+            self.scratch.poisoned = true;
+            return Err(unsupported("compressed v4 owned capacity overflow"));
+        };
+        if self.scratch.pending_owned_bytes != self.charged
+            || self.scratch.live_bytes < self.charged
+            || actual > self.charged
+        {
+            self.scratch.poisoned = true;
+            return Err(unsupported(
+                "compressed v4 scratch accounting is inconsistent",
+            ));
+        }
+        self.scratch.live_bytes -= self.charged - actual;
+        self.scratch.pending_owned_bytes = actual;
+        self.charged = actual;
+        Ok(())
+    }
+
+    fn copy(&mut self, field: usize, bytes: &[u8], path: &Path) -> Result<Vec<u8>> {
+        let mut owned = Vec::new();
+        owned
+            .try_reserve_exact(bytes.len())
+            .map_err(|_| corrupt(path, "compressed v4 owned row allocation failed"))?;
+        if owned.capacity() > self.allowances[field] {
+            self.scratch.poisoned = true;
+            return Err(unsupported(
+                "compressed v4 owned allocation exceeds proof profile",
+            ));
+        }
+        owned.extend_from_slice(bytes);
+        Ok(owned)
+    }
+}
+
+impl Drop for PendingOwnedRowCharge<'_> {
+    fn drop(&mut self) {
+        if self.scratch.pending_owned_bytes != self.charged
+            || self.scratch.live_bytes < self.charged
+        {
+            std::process::abort();
+        }
+        self.scratch.pending_owned_bytes = 0;
+        self.scratch.live_bytes -= self.charged;
+    }
+}
+
+fn visit_bounded_owned_row(
+    row: BorrowedRow<'_>,
+    source: SegmentSource,
+    block_offset: u64,
+    row_ordinal: u32,
+    scratch: &mut ScratchLedger,
+    path: &Path,
+    visit: &mut impl FnMut(ObservedSegmentRow) -> Result<()>,
+) -> Result<()> {
+    let value_len = match row.value {
+        BorrowedValue::Put(value)
+        | BorrowedValue::PutWithExpiry { value, .. }
+        | BorrowedValue::Merge(value) => value.len(),
+        BorrowedValue::Pointer { path, .. } => path.len(),
+        BorrowedValue::Delete => 0,
+    };
+    let mut pending =
+        PendingOwnedRowCharge::new(scratch, [row.cf.len(), row.key.len(), value_len])?;
+    let cf = String::from_utf8(pending.copy(0, row.cf.as_bytes(), path)?)
+        .map_err(|_| corrupt(path, "invalid compressed v4 owned family"))?;
+    let key = pending.copy(1, row.key, path)?;
+    let value = match row.value {
+        BorrowedValue::Put(value) => ObservedSegmentValue::Put(pending.copy(2, value, path)?),
+        BorrowedValue::Delete => ObservedSegmentValue::Delete,
+        BorrowedValue::Pointer {
+            path: pointer_path,
+            offset,
+            len,
+            checksum,
+            expires_at_ms,
+        } => ObservedSegmentValue::Pointer {
+            pointer: ValuePointer {
+                path: String::from_utf8(pending.copy(2, pointer_path.as_bytes(), path)?)
+                    .map_err(|_| corrupt(path, "invalid compressed v4 owned pointer path"))?,
+                offset,
+                len,
+                checksum,
+            },
+            expires_at_ms,
+        },
+        BorrowedValue::PutWithExpiry {
+            value,
+            expires_at_ms,
+        } => ObservedSegmentValue::PutWithExpiry {
+            value: pending.copy(2, value, path)?,
+            expires_at_ms,
+        },
+        BorrowedValue::Merge(value) => ObservedSegmentValue::Merge(pending.copy(2, value, path)?),
+    };
+    let owned = ObservedSegmentRow {
+        source,
+        block_offset,
+        row_ordinal,
+        classification: classify(row.cf),
+        cf,
+        key,
+        sequence: row.sequence,
+        value,
+    };
+    let value_capacity = match &owned.value {
+        ObservedSegmentValue::Put(value)
+        | ObservedSegmentValue::PutWithExpiry { value, .. }
+        | ObservedSegmentValue::Merge(value) => value.capacity(),
+        ObservedSegmentValue::Pointer { pointer, .. } => pointer.path.capacity(),
+        ObservedSegmentValue::Delete => 0,
+    };
+    pending.settle([owned.cf.capacity(), owned.key.capacity(), value_capacity])?;
+    visit(owned)
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct WalkFacts<'a> {
     rows: usize,
@@ -2210,6 +2400,283 @@ fn scan_lz4_opened_pass(
     })
 }
 
+/// Private third pass emits provisional owned rows only. It mirrors the
+/// authenticated bounded parser rather than changing the established first
+/// and Bloom passes; the caller must discard its rows on any late error.
+#[allow(clippy::too_many_arguments)]
+fn scan_lz4_opened_owned_pass(
+    file: &mut File,
+    path: &Path,
+    expected_identity: SegmentPhysicalId,
+    meta: &SegmentMetadata,
+    work: &WorkLedger,
+    pass: CompressedPassContext,
+    first: AuthenticatedLz4Pass,
+    len: u64,
+    source: SegmentSource,
+    mut visit: impl FnMut(ObservedSegmentRow) -> Result<()>,
+) -> Result<AuthenticatedLz4Pass> {
+    let mut scratch = ScratchLedger::new(work.profile);
+
+    // The index is provisional until the later, contiguous read hashes and
+    // compares every footer and trailer byte from this same opened handle.
+    file.seek(SeekFrom::End(-(SEGMENT_TRAILER_BYTES as i64)))?;
+    let mut trailer = [0_u8; SEGMENT_TRAILER_BYTES];
+    file.read_exact(&mut trailer)
+        .map_err(|_| corrupt(path, "compressed v4 trailer truncated"))?;
+    let footer_len = u64::from(u32::from_le_bytes(trailer[..4].try_into().unwrap()));
+    let footer_crc = u32::from_le_bytes(trailer[4..8].try_into().unwrap());
+    if u32::from_le_bytes(trailer[8..].try_into().unwrap()) != SEGMENT_FOOTER_MAGIC {
+        return Err(corrupt(path, "bad compressed v4 footer magic"));
+    }
+    let trailer_start = len - SEGMENT_TRAILER_BYTES as u64;
+    let footer_start = trailer_start
+        .checked_sub(footer_len)
+        .filter(|start| *start >= SEGMENT_HEADER_BYTES as u64)
+        .ok_or_else(|| corrupt(path, "compressed v4 footer out of bounds"))?;
+    if footer_len > work.profile.max_footer_bytes {
+        return Err(unsupported("compressed v4 footer exceeds proof profile"));
+    }
+    let footer_len_usize = usize::try_from(footer_len)
+        .map_err(|_| unsupported("compressed v4 footer exceeds platform range"))?;
+    let mut footer_bytes = Vec::new();
+    scratch.reserve_vec(
+        ScratchSlot::Footer,
+        &mut footer_bytes,
+        footer_len_usize,
+        path,
+    )?;
+    footer_bytes.resize(footer_len_usize, 0);
+    file.seek(SeekFrom::Start(footer_start))?;
+    file.read_exact(&mut footer_bytes)
+        .map_err(|_| corrupt(path, "compressed v4 footer truncated"))?;
+    if crc32c(&footer_bytes) != footer_crc {
+        return Err(corrupt(path, "compressed v4 footer checksum mismatch"));
+    }
+    let mut footer = BinaryReader::new(&footer_bytes, path);
+    let block_count = u64::from(footer.read_u32()?);
+    if block_count > (footer.remaining() / 24) as u64 {
+        return Err(corrupt(path, "compressed v4 block count exceeds footer"));
+    }
+    if block_count > work.profile.max_blocks_file
+        || pass
+            .prior
+            .blocks
+            .checked_add(block_count)
+            .is_none_or(|count| count > work.profile.max_blocks_visit)
+    {
+        return Err(unsupported(
+            "compressed v4 block count exceeds proof profile",
+        ));
+    }
+
+    file.seek(SeekFrom::Start(0))?;
+    let mut reader = CompressedPassReader {
+        file,
+        path,
+        expected_len: len,
+        cursor: 0,
+        hasher: blake3::Hasher::new(),
+    };
+    let mut header = [0_u8; SEGMENT_HEADER_BYTES];
+    reader.read_hashed(&mut header)?;
+    let mut header_reader = BinaryReader::new(&header, path);
+    if header_reader.read_u32()? != SEGMENT_MAGIC || header_reader.read_u32()? != SEGMENT_VERSION {
+        return Err(corrupt(path, "bad compressed v4 segment magic or version"));
+    }
+    if header_reader.read_u8()? != 1 {
+        return Err(corrupt(path, "compressed v4 pass expected LZ4 tag"));
+    }
+    if header_reader.read_u32()? != meta.level || header_reader.read_u64()? != meta.id {
+        return Err(corrupt(path, "compressed v4 header level or id mismatch"));
+    }
+    if meta.partitioned_bloom_filter.is_some() {
+        return Err(unsupported(
+            "partitioned v4 segment Bloom is not yet proven",
+        ));
+    }
+
+    let mut facts = CompressedWorkFacts::default();
+    let mut encoded = Vec::new();
+    let mut decoded = Vec::new();
+    let mut previous = Vec::new();
+    let mut previous_cf_len = 0;
+    let mut previous_valid = false;
+    let mut first_seen = false;
+    let mut last_key_matches = meta.max_key.is_empty();
+    for _ in 0..block_count {
+        let first_key = footer.read_len_slice()?;
+        let last_key = footer.read_len_slice()?;
+        let offset = footer.read_u64()?;
+        let block_len = footer.read_u64()?;
+        let end = offset
+            .checked_add(block_len)
+            .ok_or_else(|| corrupt(path, "compressed v4 block offset overflow"))?;
+        if offset != reader.cursor || block_len < BLOCK_HEADER_BYTES as u64 || end > footer_start {
+            return Err(corrupt(path, "compressed v4 block is not contiguous"));
+        }
+        let mut block_header = [0_u8; BLOCK_HEADER_BYTES];
+        reader.read_hashed(&mut block_header)?;
+        let encoded_len = u64::from(u32::from_le_bytes(block_header[..4].try_into().unwrap()));
+        let decoded_len = u64::from(u32::from_le_bytes(block_header[4..8].try_into().unwrap()));
+        let checksum = u32::from_le_bytes(block_header[8..].try_into().unwrap());
+        if encoded_len
+            .checked_add(BLOCK_HEADER_BYTES as u64)
+            .filter(|total| *total == block_len)
+            .is_none()
+            || encoded_len == 0
+        {
+            return Err(corrupt(path, "compressed v4 block length mismatch"));
+        }
+        if encoded_len > work.profile.max_encoded_block_bytes {
+            return Err(unsupported(
+                "compressed v4 encoded block exceeds proof profile",
+            ));
+        }
+        // Refuse forged output claims before encoded or decoded allocation.
+        work.check_next_block(facts, decoded_len, pass, path)?;
+        let encoded_len_usize = usize::try_from(encoded_len)
+            .map_err(|_| unsupported("compressed v4 encoded block exceeds platform range"))?;
+        encoded.clear();
+        scratch.reserve_vec(ScratchSlot::Encoded, &mut encoded, encoded_len_usize, path)?;
+        encoded.resize(encoded_len_usize, 0);
+        reader.read_hashed(&mut encoded)?;
+        facts = decode_bounded_block(
+            BlockFrame {
+                codec: Compression::Lz4,
+                encoded: &encoded,
+                checksum,
+                decoded_len,
+            },
+            work,
+            facts,
+            pass,
+            &mut decoded,
+            &mut scratch,
+            path,
+        )?;
+        let mut rows = BinaryReader::new(&decoded, path);
+        let row_count = u64::from(rows.read_u32()?);
+        if row_count == 0 || row_count > (rows.remaining() / 17) as u64 {
+            return Err(corrupt(path, "compressed v4 row count exceeds block"));
+        }
+        work.check_next_rows(facts, row_count, pass, path)?;
+        let mut block_first = None;
+        let mut block_last: Option<(&str, &[u8])> = None;
+        for row_index in 0..row_count {
+            let row = borrowed_row(&mut rows, path)?;
+            let prior = block_last.or_else(|| {
+                previous_valid.then(|| {
+                    let (cf, key) = previous.split_at(previous_cf_len);
+                    (
+                        std::str::from_utf8(cf).expect("previous family was validated"),
+                        key,
+                    )
+                })
+            });
+            if prior.is_some_and(|(cf, key)| (row.cf.as_bytes(), row.key) < (cf.as_bytes(), key)) {
+                return Err(corrupt(path, "compressed v4 rows are out of writer order"));
+            }
+            if !first_seen {
+                first_seen = true;
+                if row.key != meta.min_key.as_slice() {
+                    return Err(corrupt(
+                        path,
+                        "compressed v4 first key disagrees with MANIFEST",
+                    ));
+                }
+            }
+            last_key_matches = row.key == meta.max_key.as_slice();
+            block_first.get_or_insert(row.key);
+            block_last = Some((row.cf, row.key));
+            facts = work.check_next_row(facts, pass, path)?;
+            let row_ordinal = u32::try_from(row_index)
+                .map_err(|_| unsupported("compressed v4 row ordinal exceeds u32"))?;
+            visit_bounded_owned_row(
+                row,
+                source,
+                offset,
+                row_ordinal,
+                &mut scratch,
+                path,
+                &mut visit,
+            )?;
+        }
+        if rows.remaining() != 0
+            || block_first != Some(first_key)
+            || block_last.map(|(_, key)| key) != Some(last_key)
+        {
+            return Err(corrupt(
+                path,
+                "compressed v4 block key range or framing mismatch",
+            ));
+        }
+        let (last_cf, last_key) = block_last.expect("nonempty block was checked");
+        previous_cf_len = last_cf.len();
+        let previous_len = previous_cf_len
+            .checked_add(last_key.len())
+            .ok_or_else(|| unsupported("compressed v4 prior key length overflow"))?;
+        scratch.reserve_vec(ScratchSlot::Previous, &mut previous, previous_len, path)?;
+        previous.clear();
+        previous.extend_from_slice(last_cf.as_bytes());
+        previous.extend_from_slice(last_key);
+        previous_valid = true;
+    }
+    if footer.remaining() != 0 || reader.cursor != footer_start {
+        return Err(corrupt(path, "unconsumed compressed v4 framing bytes"));
+    }
+    if facts.rows != meta.entries || (!first_seen && !meta.min_key.is_empty()) || !last_key_matches
+    {
+        return Err(corrupt(
+            path,
+            "compressed v4 observed count or key range mismatch",
+        ));
+    }
+
+    let mut chunk = [0_u8; HASH_CHUNK_BYTES];
+    for expected in footer_bytes.chunks(HASH_CHUNK_BYTES) {
+        let actual = &mut chunk[..expected.len()];
+        reader.read_hashed(actual)?;
+        if actual != expected {
+            return Err(corrupt(path, "compressed v4 footer changed during pass"));
+        }
+    }
+    let mut reread_trailer = [0_u8; SEGMENT_TRAILER_BYTES];
+    reader.read_hashed(&mut reread_trailer)?;
+    if reread_trailer != trailer || reader.cursor != len {
+        return Err(corrupt(path, "compressed v4 trailer changed during pass"));
+    }
+    let mut extra = [0_u8; 1];
+    if reader.file.read(&mut extra)? != 0
+        || reader.file.metadata()?.len() != len
+        || physical_id(reader.file, path)? != expected_identity
+    {
+        return Err(corrupt(
+            path,
+            "compressed v4 length or identity changed during pass",
+        ));
+    }
+    let digest = reader.hasher.finalize();
+    if digest.to_hex().as_str() != meta.file_digest.as_str() {
+        return Err(corrupt(
+            path,
+            "compressed v4 integrated pass digest mismatch",
+        ));
+    }
+    if first.digest != digest || first.len != len {
+        return Err(corrupt(
+            path,
+            "compressed v4 integrated replay digest or length changed",
+        ));
+    }
+    pass.require_exact_replay(facts, path)?;
+    Ok(AuthenticatedLz4Pass {
+        work: facts,
+        digest,
+        len,
+    })
+}
+
 /// Private second pass rebuilds the writer Bloom from authenticated rows but
 /// exposes neither provisional rows nor the filter to the fenced visitor.
 #[allow(dead_code)]
@@ -2255,7 +2722,8 @@ pub(super) fn scan_lz4_pass2(
     )
 }
 
-/// Private third-pass API remains fenced until owned rows and replay are proven.
+/// Private owned-row pass. Its rows remain provisional until the caller has
+/// authenticated the complete stream and performed the final namespace check.
 #[allow(dead_code)]
 pub(super) fn scan_lz4_pass3(
     path: &Path,
@@ -2266,10 +2734,42 @@ pub(super) fn scan_lz4_pass3(
     first: AuthenticatedLz4Pass,
     visit: impl FnMut(ObservedSegmentRow) -> Result<()>,
 ) -> Result<AuthenticatedLz4Pass> {
-    let _ = (path, expected_identity, meta, source, work, first, visit);
-    Err(unsupported(
-        "compressed v4 LZ4 owned row pass is not proven",
-    ))
+    if source.level != meta.level || source.id != meta.id {
+        return Err(corrupt(path, "compressed v4 source and MANIFEST disagree"));
+    }
+    check_real(path)?;
+    let mut file = File::open(path)?;
+    if !file.metadata()?.is_file() || physical_id(&file, path)? != expected_identity {
+        return Err(corrupt(
+            path,
+            "compressed v4 identity changed before owned replay",
+        ));
+    }
+    let len = file.metadata()?.len();
+    if len < (SEGMENT_HEADER_BYTES + SEGMENT_TRAILER_BYTES) as u64 {
+        return Err(corrupt(path, "short compressed v4 segment"));
+    }
+    if len != first.len {
+        return Err(corrupt(path, "compressed v4 replay length changed"));
+    }
+    if len > work.profile.max_physical_file_bytes {
+        return Err(unsupported(
+            "compressed v4 physical file exceeds proof profile",
+        ));
+    }
+    let pass = work.replay_pass(first.work)?;
+    scan_lz4_opened_owned_pass(
+        &mut file,
+        path,
+        expected_identity,
+        meta,
+        work,
+        pass,
+        first,
+        len,
+        source,
+        visit,
+    )
 }
 
 struct ScannedSegment {
@@ -2769,4 +3269,219 @@ pub(super) fn collect_protected_segment_candidate_for_test(
     assert!(limits.max_rows <= PROTECTED_STAGE_LIMITS.max_rows);
     assert!(limits.max_bytes <= PROTECTED_STAGE_LIMITS.max_bytes);
     collect_protected_segment_candidate_inner(root, manifest, budget, limits, after_staged)
+}
+
+#[cfg(test)]
+mod compressed_owned_row_tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const PATH: &str = "compressed-owned-row-test.tseg";
+    const SOURCE: SegmentSource = SegmentSource {
+        level: 0,
+        id: 7,
+        manifest_ordinal: 3,
+    };
+
+    #[test]
+    fn precharges_all_three_fields_before_any_owned_row_allocation() {
+        let row = BorrowedRow {
+            cf: "cf",
+            key: b"k",
+            sequence: 7,
+            value: BorrowedValue::Put(b"data"),
+        };
+        // (2*2+64) + (2*1+64) + (2*4+64) = 206.
+        let path = Path::new(PATH);
+        let mut short = ScratchLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+        let mut short_encoded = Vec::new();
+        short
+            .reserve_vec(ScratchSlot::Encoded, &mut short_encoded, 32, path)
+            .unwrap();
+        let short_baseline = short.live_bytes();
+        short.profile.max_parser_owned_peak_bytes = short_baseline + 205;
+        let mut callbacks = 0;
+        let error = visit_bounded_owned_row(row, SOURCE, 21, 0, &mut short, path, &mut |_| {
+            callbacks += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            PraxisError::UnsupportedCatalogFeature { .. }
+        ));
+        assert_eq!(callbacks, 0);
+        assert_eq!(short.live_bytes(), short_baseline);
+        assert_eq!(short.pending_owned_bytes, 0);
+        short
+            .release_vec(ScratchSlot::Encoded, short_encoded)
+            .unwrap();
+        assert_eq!(short.live_bytes(), 0);
+
+        let mut exact = ScratchLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+        let mut exact_encoded = Vec::new();
+        exact
+            .reserve_vec(ScratchSlot::Encoded, &mut exact_encoded, 32, path)
+            .unwrap();
+        let exact_baseline = exact.live_bytes();
+        exact.profile.max_parser_owned_peak_bytes = exact_baseline + 206;
+        visit_bounded_owned_row(row, SOURCE, 21, 0, &mut exact, path, &mut |owned| {
+            assert_eq!(owned.source, SOURCE);
+            assert_eq!(owned.block_offset, 21);
+            assert_eq!(owned.row_ordinal, 0);
+            assert_eq!(owned.cf, "cf");
+            assert_eq!(owned.key, b"k");
+            let value_capacity = match &owned.value {
+                ObservedSegmentValue::Put(value) => {
+                    assert_eq!(value, b"data");
+                    value.capacity()
+                }
+                other => panic!("expected inline Put, got {other:?}"),
+            };
+            let actual = owned.cf.capacity() + owned.key.capacity() + value_capacity;
+            assert!(actual <= 206);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(exact.live_bytes(), exact_baseline);
+        assert_eq!(exact.pending_owned_bytes, 0);
+        exact
+            .release_vec(ScratchSlot::Encoded, exact_encoded)
+            .unwrap();
+        assert_eq!(exact.live_bytes(), 0);
+    }
+
+    #[test]
+    fn releases_owned_charge_on_other_callback_error_and_stage_rejection() {
+        let path = Path::new(PATH);
+        let mut scratch = ScratchLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+        let other = BorrowedRow {
+            cf: "ordinary",
+            key: b"key",
+            sequence: 4,
+            value: BorrowedValue::Delete,
+        };
+        visit_bounded_owned_row(other, SOURCE, 21, 0, &mut scratch, path, &mut |owned| {
+            assert_eq!(owned.classification, PhysicalRowClass::Other);
+            assert_eq!(owned.value, ObservedSegmentValue::Delete);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(scratch.live_bytes(), 0);
+        let error = visit_bounded_owned_row(other, SOURCE, 21, 0, &mut scratch, path, &mut |_| {
+            Err(unsupported("direct row callback refused"))
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            PraxisError::UnsupportedCatalogFeature { .. }
+        ));
+        assert_eq!(scratch.live_bytes(), 0);
+
+        let mut refused = ProtectedStage::new(ProtectedStageLimits {
+            max_rows: 0,
+            max_bytes: 0,
+        });
+        let error =
+            visit_bounded_owned_row(other, SOURCE, 21, 0, &mut scratch, path, &mut |owned| {
+                refused.push(owned)
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PraxisError::UnsupportedCatalogFeature { .. }
+        ));
+        assert_eq!(refused.len(), 0);
+        assert_eq!(scratch.live_bytes(), 0);
+        assert_eq!(scratch.pending_owned_bytes, 0);
+    }
+
+    #[test]
+    fn retains_pointer_and_expiry_tags_with_independent_owned_bytes() {
+        let path = Path::new(PATH);
+        let mut scratch = ScratchLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+        let mut values = Vec::new();
+        for value in [
+            BorrowedValue::Pointer {
+                path: "value-log/7.vlog",
+                offset: 9,
+                len: 11,
+                checksum: 13,
+                expires_at_ms: Some(17),
+            },
+            BorrowedValue::PutWithExpiry {
+                value: b"put",
+                expires_at_ms: 19,
+            },
+            BorrowedValue::Merge(b"merge"),
+            BorrowedValue::Delete,
+        ] {
+            visit_bounded_owned_row(
+                BorrowedRow {
+                    cf: "ordinary",
+                    key: b"key",
+                    sequence: 4,
+                    value,
+                },
+                SOURCE,
+                21,
+                0,
+                &mut scratch,
+                path,
+                &mut |owned| {
+                    values.push(owned.value);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(scratch.live_bytes(), 0);
+        }
+        assert_eq!(values.len(), 4);
+        assert!(
+            matches!(&values[0], ObservedSegmentValue::Pointer { pointer, expires_at_ms: Some(17) }
+            if pointer.path == "value-log/7.vlog" && pointer.offset == 9 && pointer.len == 11 && pointer.checksum == 13)
+        );
+        assert_eq!(
+            values[1],
+            ObservedSegmentValue::PutWithExpiry {
+                value: b"put".to_vec(),
+                expires_at_ms: 19,
+            }
+        );
+        assert_eq!(values[2], ObservedSegmentValue::Merge(b"merge".to_vec()));
+        assert_eq!(values[3], ObservedSegmentValue::Delete);
+    }
+
+    #[test]
+    fn stage_owns_transferred_row_after_parser_callback_unwinds() {
+        let path = Path::new(PATH);
+        let row = BorrowedRow {
+            cf: "__praxor_record_meta_v1",
+            key: b"key",
+            sequence: 4,
+            value: BorrowedValue::Put(b"value"),
+        };
+        let mut scratch = ScratchLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+        let mut stage = ProtectedStage::new(PROTECTED_STAGE_LIMITS);
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = visit_bounded_owned_row(row, SOURCE, 21, 0, &mut scratch, path, &mut |owned| {
+                stage.push(owned)?;
+                panic!("after protected stage transfer")
+            });
+        }));
+        assert!(panic.is_err());
+        assert_eq!(stage.len(), 1);
+        assert!(stage.used_bytes() > 0);
+        assert_eq!(scratch.live_bytes(), 0);
+        assert_eq!(scratch.pending_owned_bytes, 0);
+        drop(stage);
+
+        let mut retry = ProtectedStage::new(PROTECTED_STAGE_LIMITS);
+        visit_bounded_owned_row(row, SOURCE, 21, 0, &mut scratch, path, &mut |owned| {
+            retry.push(owned)
+        })
+        .unwrap();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(scratch.live_bytes(), 0);
+    }
 }
