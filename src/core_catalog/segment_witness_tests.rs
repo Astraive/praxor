@@ -1,13 +1,14 @@
 use super::physical::inspect_v4_owner;
 use super::physical_tests::flushed_create_fixture;
 use super::segment_witness::{
-    ObservedSegmentRow, ObservedSegmentValue, PhysicalRowClass, ProtectedRole, SegmentSource,
-    visit_v4_segments,
+    ObservedSegmentRow, ObservedSegmentValue, PhysicalRowClass, ProtectedRole, SegmentFileWitness,
+    SegmentSource, visit_v4_segments,
 };
 use crate::accel::cpu::scalar::CpuAccelerator;
 use crate::config::{Compression, PraxisConfig};
 use crate::disk::DiskLayout;
 use crate::errors::PraxisError;
+use crate::io::crc32c;
 use crate::manifest::{Manifest, ManifestStore, SegmentMetadata};
 use crate::segments::block::SegmentEntry;
 use crate::segments::codec::decode_segment;
@@ -204,6 +205,87 @@ fn expected_row(
     }
 }
 
+fn visit_with_wal_budget(
+    root: &Path,
+    manifest: &Manifest,
+    visit: impl FnMut(ObservedSegmentRow) -> crate::errors::Result<()>,
+) -> crate::errors::Result<Vec<SegmentFileWitness>> {
+    let cut = WalCut {
+        flushed_sequence: manifest.flushed_sequence,
+        last_sequence: manifest.last_sequence,
+        flushed_wal_id: manifest.flushed_wal_id,
+        active_wal_id: manifest.active_wal_id,
+        next_wal_id: manifest.next_wal_id,
+    };
+    let (wal_witnesses, mut budget) =
+        scan_v4_wals_with_budget(root, cut, |_, _, _, _| Ok(())).unwrap();
+    assert_eq!(wal_witnesses.len(), 1);
+    visit_v4_segments(root, manifest, &mut budget, visit)
+}
+
+fn rewrite_first_segment(
+    root: &Path,
+    rows: Vec<SegmentEntry>,
+    compression: Compression,
+    large_value_threshold: usize,
+    block_size: usize,
+) -> Manifest {
+    let layout = DiskLayout::at(root);
+    let path = layout.segment_path(0, 1);
+    let value_path = layout.value_log_path(1);
+    let mut value_log = ValueLog::open(&value_path).unwrap();
+    let first = SegmentWriter::write(
+        SegmentWriteOptions {
+            path: &path,
+            id: 1,
+            level: 0,
+            compression,
+            accelerator: &CpuAccelerator,
+            value_log: &mut value_log,
+            large_value_threshold,
+            block_size,
+            partitioned_bloom: None,
+            direct_io: false,
+        },
+        rows,
+    )
+    .unwrap();
+    drop(value_log);
+    fs::remove_file(value_path).unwrap();
+    let manifest_path = layout.manifest_path();
+    let mut manifest =
+        Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    let first_meta = manifest
+        .segments
+        .iter_mut()
+        .find(|meta| meta.id == 1)
+        .unwrap();
+    *first_meta = first;
+    ManifestStore::new(manifest_path.clone())
+        .save(&manifest)
+        .unwrap();
+    Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap()
+}
+
+fn replace_first_segment_bytes(root: &Path, bytes: &[u8]) -> Manifest {
+    let layout = DiskLayout::at(root);
+    let path = layout.segment_path(0, 1);
+    fs::write(path, bytes).unwrap();
+    let manifest_path = layout.manifest_path();
+    let mut manifest =
+        Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    manifest
+        .segments
+        .iter_mut()
+        .find(|meta| meta.id == 1)
+        .unwrap()
+        .file_digest = blake3::hash(bytes).to_hex().to_string();
+    ManifestStore::new(manifest_path.clone())
+        .save(&manifest)
+        .unwrap();
+    Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap()
+}
+
 #[test]
 fn two_literal_segments_emit_owned_physical_copies_but_owner_refuses() {
     for reverse in [true, false] {
@@ -249,7 +331,6 @@ fn two_literal_segments_emit_owned_physical_copies_but_owner_refuses() {
             Ok(())
         });
         assert_eq!(snapshot(dir.path()), before);
-        // Intentional compiling RED: the stub returns Unsupported here.
         let witnesses = candidate.unwrap();
 
         let first_source = SegmentSource {
@@ -405,5 +486,296 @@ fn charged_wal_budget_exhaustion_refuses_before_segment_callbacks() {
     );
     assert_eq!(callbacks, 0);
     assert_eq!(budget.remaining_bytes(), 0);
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn equal_key_rows_remain_distinct_owned_physical_observations() {
+    let (dir, config, lease, _) = two_literal_segments(true);
+    let root = lease.root();
+    let manifest = rewrite_first_segment(
+        root,
+        vec![
+            row(0, StoredValue::Put(vec![0x11])),
+            row(0, StoredValue::Delete),
+            row(1, StoredValue::Merge(vec![0x33])),
+        ],
+        Compression::None,
+        config.large_value_threshold,
+        1,
+    );
+    let before = snapshot(dir.path());
+    let mut observed = Vec::new();
+    let witnesses = visit_with_wal_budget(root, &manifest, |row| {
+        observed.push(row);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(witnesses.len(), 2);
+    assert_eq!(witnesses[0].observed_rows, 3);
+    assert_eq!(witnesses[0].source.manifest_ordinal, 1);
+    assert_eq!(observed.len(), 5);
+    assert_eq!(observed[0].source, observed[1].source);
+    assert_eq!(observed[0].key, observed[1].key);
+    assert_eq!(observed[0].sequence, observed[1].sequence);
+    assert_eq!(observed[0].value, ObservedSegmentValue::Put(vec![0x11]));
+    assert_eq!(observed[1].value, ObservedSegmentValue::Delete);
+    assert_eq!(
+        observed.iter().filter(|row| row.key == [0]).count(),
+        3,
+        "same-key copies across and within files must all be observed"
+    );
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn repaired_block_row_count_refuses_before_callbacks() {
+    let (dir, _config, lease, _) = two_literal_segments(false);
+    let root = lease.root();
+    let path = DiskLayout::at(root).segment_path(0, 1);
+    let mut bytes = fs::read(&path).unwrap();
+    let encoded_len = u32::from_le_bytes(bytes[21..25].try_into().unwrap()) as usize;
+    bytes[33..37].copy_from_slice(&u32::MAX.to_le_bytes());
+    let checksum = crc32c(&bytes[33..33 + encoded_len]);
+    bytes[29..33].copy_from_slice(&checksum.to_le_bytes());
+    assert_eq!(crc32c(&bytes[33..33 + encoded_len]), checksum);
+    let manifest = replace_first_segment_bytes(root, &bytes);
+    let before = snapshot(dir.path());
+    let mut callbacks = 0;
+    let error = visit_with_wal_budget(root, &manifest, |_| {
+        callbacks += 1;
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(matches!(&error, PraxisError::Corrupt { .. }), "{error}");
+    assert_eq!(callbacks, 0);
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn redigested_bad_block_crc_refuses_before_callbacks() {
+    let (dir, _config, lease, _) = two_literal_segments(false);
+    let root = lease.root();
+    let path = DiskLayout::at(root).segment_path(0, 1);
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[29] ^= 1; // The first block checksum follows the 21-byte header and two lengths.
+    let manifest = replace_first_segment_bytes(root, &bytes);
+    let before = snapshot(dir.path());
+    let mut callbacks = 0;
+    let error = visit_with_wal_budget(root, &manifest, |_| {
+        callbacks += 1;
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(matches!(&error, PraxisError::Corrupt { .. }), "{error}");
+    assert_eq!(callbacks, 0);
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn checksum_repaired_interior_row_disorder_refuses_before_callbacks() {
+    let (dir, config, lease, _) = two_literal_segments(false);
+    let root = lease.root();
+    rewrite_first_segment(
+        root,
+        vec![
+            row(0, StoredValue::Delete),
+            row(1, StoredValue::Delete),
+            row(2, StoredValue::Delete),
+            row(3, StoredValue::Delete),
+        ],
+        Compression::None,
+        config.large_value_threshold,
+        usize::MAX,
+    );
+    let path = DiskLayout::at(root).segment_path(0, 1);
+    let mut raw = decode_segment(&fs::read(&path).unwrap(), &path, &CpuAccelerator).unwrap();
+    assert_eq!(raw.blocks.len(), 1);
+    raw.blocks[0].swap(1, 2);
+    let bytes = raw.encode(&CpuAccelerator).unwrap();
+    assert_eq!(
+        decode_segment(&bytes, &path, &CpuAccelerator)
+            .unwrap()
+            .blocks[0]
+            .len(),
+        4
+    );
+    let manifest = replace_first_segment_bytes(root, &bytes);
+    let before = snapshot(dir.path());
+    let mut callbacks = 0;
+    let error = visit_with_wal_budget(root, &manifest, |_| {
+        callbacks += 1;
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(matches!(&error, PraxisError::Corrupt { .. }), "{error}");
+    assert_eq!(callbacks, 0);
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn redigested_wrong_segment_header_id_refuses_before_callbacks() {
+    let (dir, _config, lease, _) = two_literal_segments(false);
+    let root = lease.root();
+    let path = DiskLayout::at(root).segment_path(0, 1);
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[13..21].copy_from_slice(&7_u64.to_le_bytes());
+    let manifest = replace_first_segment_bytes(root, &bytes);
+    let before = snapshot(dir.path());
+    let mut callbacks = 0;
+    let error = visit_with_wal_budget(root, &manifest, |_| {
+        callbacks += 1;
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(matches!(&error, PraxisError::Corrupt { .. }), "{error}");
+    assert_eq!(callbacks, 0);
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn forged_manifest_row_count_does_not_drive_allocation() {
+    let (dir, _config, lease, _) = two_literal_segments(false);
+    let root = lease.root();
+    let manifest_path = DiskLayout::at(root).manifest_path();
+    let mut manifest =
+        Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    manifest
+        .segments
+        .iter_mut()
+        .find(|meta| meta.id == 1)
+        .unwrap()
+        .entries = u64::MAX;
+    ManifestStore::new(manifest_path.clone())
+        .save(&manifest)
+        .unwrap();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    assert_eq!(manifest.segments[0].entries, u64::MAX);
+    let before = snapshot(dir.path());
+    let mut callbacks = 0;
+    let error = visit_with_wal_budget(root, &manifest, |_| {
+        callbacks += 1;
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(matches!(&error, PraxisError::Corrupt { .. }), "{error}");
+    assert_eq!(callbacks, 0);
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn later_file_corruption_invalidates_earlier_provisional_callbacks() {
+    let (dir, _config, lease, _) = two_literal_segments(true);
+    let root = lease.root();
+    let path = DiskLayout::at(root).segment_path(1, 2);
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[29] ^= 1;
+    fs::write(&path, &bytes).unwrap();
+    let manifest_path = DiskLayout::at(root).manifest_path();
+    let mut manifest =
+        Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    manifest
+        .segments
+        .iter_mut()
+        .find(|meta| meta.id == 2)
+        .unwrap()
+        .file_digest = blake3::hash(&bytes).to_hex().to_string();
+    ManifestStore::new(manifest_path.clone())
+        .save(&manifest)
+        .unwrap();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    let before = snapshot(dir.path());
+    let mut provisional = Vec::new();
+    let error = visit_with_wal_budget(root, &manifest, |row| {
+        provisional.push(row);
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(matches!(&error, PraxisError::Corrupt { .. }), "{error}");
+    assert_eq!(provisional.len(), 2);
+    assert!(provisional.iter().all(|row| row.source.id == 1));
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn same_length_overwrite_during_callbacks_fails_final_byte_recheck() {
+    let (dir, _config, lease, _) = two_literal_segments(false);
+    let root = lease.root();
+    let manifest_path = DiskLayout::at(root).manifest_path();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    let path = DiskLayout::at(root).segment_path(0, 1);
+    let mut changed = fs::read(&path).unwrap();
+    changed[13] ^= 1;
+    let mut expected = snapshot(dir.path());
+    expected
+        .get_mut(path.strip_prefix(root).unwrap())
+        .unwrap()
+        .bytes = Some(changed.clone());
+    let mut callbacks = 0;
+    let error = visit_with_wal_budget(root, &manifest, |_| {
+        callbacks += 1;
+        if callbacks == 4 {
+            fs::write(&path, &changed).unwrap();
+        }
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(matches!(&error, PraxisError::Corrupt { .. }), "{error}");
+    assert_eq!(callbacks, 4);
+    assert_eq!(snapshot(dir.path()), expected);
+}
+
+#[test]
+fn authenticated_compressed_tag_is_explicitly_unsupported() {
+    let (dir, _config, lease, _) = two_literal_segments(false);
+    let root = lease.root();
+    let path = DiskLayout::at(root).segment_path(0, 1);
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[8] = 1; // The full-file digest is repaired; inner LZ4 bytes are intentionally unread.
+    let manifest = replace_first_segment_bytes(root, &bytes);
+    let before = snapshot(dir.path());
+    let mut callbacks = 0;
+    let error = visit_with_wal_budget(root, &manifest, |_| {
+        callbacks += 1;
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(
+        matches!(&error, PraxisError::UnsupportedCatalogFeature { .. }),
+        "{error}"
+    );
+    assert_eq!(callbacks, 0);
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn writer_valid_segment_over_literal_cap_is_unsupported() {
+    let (dir, _config, lease, _) = two_literal_segments(false);
+    let root = lease.root();
+    let manifest = rewrite_first_segment(
+        root,
+        vec![row(0, StoredValue::Put(vec![0x5a; 1_048_576]))],
+        Compression::None,
+        usize::MAX,
+        1,
+    );
+    assert!(
+        fs::metadata(DiskLayout::at(root).segment_path(0, 1))
+            .unwrap()
+            .len()
+            > 1_048_576
+    );
+    let before = snapshot(dir.path());
+    let mut callbacks = 0;
+    let error = visit_with_wal_budget(root, &manifest, |_| {
+        callbacks += 1;
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(
+        matches!(&error, PraxisError::UnsupportedCatalogFeature { .. }),
+        "{error}"
+    );
+    assert_eq!(callbacks, 0);
     assert_eq!(snapshot(dir.path()), before);
 }
