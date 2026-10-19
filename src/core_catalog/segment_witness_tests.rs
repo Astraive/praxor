@@ -8,7 +8,7 @@ use super::segment_witness::{
     WorkLedger, ZstdPassProbe, collect_protected_segment_candidate,
     collect_protected_segment_candidate_for_test, decode_bounded_block, physical_id,
     scan_lz4_pass1, scan_lz4_pass2, scan_lz4_pass3, scan_zstd_pass1, scan_zstd_pass2,
-    visit_v4_segments,
+    visit_v4_segments, visit_v4_segments_with_profile_and_hook_for_test,
 };
 use crate::accel::cpu::scalar::CpuAccelerator;
 use crate::config::{Compression, PraxisConfig};
@@ -1630,6 +1630,323 @@ fn visitor_accepts_writer_valid_lz4_inline_put_over_one_mebibyte() {
 }
 
 #[test]
+fn lz4_discovery_retag_before_pass1_is_rejected_by_reopened_parser() {
+    let (dir, _config, lease, metadata) = two_segments(Compression::Lz4, false);
+    let root = lease.root();
+    let manifest_path = DiskLayout::at(root).manifest_path();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    let path = Path::new(&metadata[0].path);
+    let original = fs::read(path).unwrap();
+    assert_eq!(original[8], 1);
+    assert_eq!(fs::read(&metadata[1].path).unwrap()[8], 1);
+    let identity = file_id(path);
+    let mut expected = snapshot(dir.path());
+    let mut retagged = original.clone();
+    retagged[8] = 0;
+    expected
+        .get_mut(path.strip_prefix(root).unwrap())
+        .unwrap()
+        .bytes = Some(retagged.clone());
+    let mut writer = OpenOptions::new().write(true).open(path).unwrap();
+    let mut hooks = 0;
+    let mut callbacks = 0;
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let error = visit_v4_segments_with_profile_and_hook_for_test(
+            root,
+            &manifest,
+            budget,
+            PRODUCTION_COMPRESSED_PROOF_PROFILE,
+            |discovered| {
+                assert_eq!(discovered, path);
+                hooks += 1;
+                assert_eq!(hooks, 1);
+                writer.seek(SeekFrom::Start(8)).unwrap();
+                writer.write_all(&[0]).unwrap();
+                writer.sync_data().unwrap();
+                Ok(())
+            },
+            |_| {
+                callbacks += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                PraxisError::Corrupt { path: error_path, reason }
+                    if error_path.as_path() == path && reason == "compressed v4 pass expected LZ4 tag"
+            ),
+            "{error}"
+        );
+        assert_eq!(budget.remaining_bytes(), balance);
+    });
+    drop(writer);
+    assert_eq!(hooks, 1);
+    assert_eq!(callbacks, 0);
+    assert_eq!(file_id(path), identity);
+    assert_eq!(fs::read(path).unwrap(), retagged);
+    assert_eq!(snapshot(dir.path()), expected);
+}
+
+#[test]
+fn lz4_visitor_enforces_aggregate_physical_cap_at_second_file() {
+    let (dir, _config, lease, metadata) = two_segments(Compression::Lz4, false);
+    let root = lease.root();
+    let manifest_path = DiskLayout::at(root).manifest_path();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    let paths = [Path::new(&metadata[0].path), Path::new(&metadata[1].path)];
+    let bytes = [fs::read(paths[0]).unwrap(), fs::read(paths[1]).unwrap()];
+    let lengths = [bytes[0].len() as u64, bytes[1].len() as u64];
+    for (path, bytes) in paths.into_iter().zip(&bytes) {
+        assert_eq!(bytes[8], 1);
+        let decoded = decode_segment(bytes, path, &CpuAccelerator).unwrap();
+        assert_eq!(decoded.blocks.len(), 2);
+        assert!(decoded.blocks.iter().all(|block| block.len() == 1));
+    }
+    assert_ne!(file_id(paths[0]), file_id(paths[1]));
+    let total = lengths[0].checked_add(lengths[1]).unwrap();
+    assert!(total - 1 >= lengths[0].max(lengths[1]));
+    assert!(
+        lengths[0].max(lengths[1]) <= PRODUCTION_COMPRESSED_PROOF_PROFILE.max_physical_file_bytes
+    );
+    let first_source = SegmentSource {
+        level: 0,
+        id: 1,
+        manifest_ordinal: 0,
+    };
+    let second_source = SegmentSource {
+        level: 1,
+        id: 2,
+        manifest_ordinal: 1,
+    };
+    let offsets = [two_block_offsets(paths[0]), two_block_offsets(paths[1])];
+    let expected_rows = vec![
+        expected_row(
+            first_source,
+            offsets[0][0],
+            0,
+            ObservedSegmentValue::Put(vec![0xca, 0xfe]),
+        ),
+        expected_row(first_source, offsets[0][1], 1, ObservedSegmentValue::Delete),
+        expected_row(
+            second_source,
+            offsets[1][0],
+            0,
+            ObservedSegmentValue::Put(vec![0xca, 0xfe]),
+        ),
+        expected_row(
+            second_source,
+            offsets[1][1],
+            2,
+            ObservedSegmentValue::Merge(vec![0x22]),
+        ),
+    ];
+    let before = snapshot(dir.path());
+    let profile = ProofProfile {
+        max_physical_file_bytes: lengths[0].max(lengths[1]),
+        max_physical_visit_bytes: total - 1,
+        ..PRODUCTION_COMPRESSED_PROOF_PROFILE
+    };
+    let mut rejected_rows = Vec::new();
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let error = visit_v4_segments_with_profile_and_hook_for_test(
+            root,
+            &manifest,
+            budget,
+            profile,
+            |_| Ok(()),
+            |row| {
+                rejected_rows.push(row);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            PraxisError::UnsupportedCatalogFeature {
+                feature: "compressed v4 visit physical bytes exceed proof profile"
+            }
+        ));
+        assert_eq!(budget.remaining_bytes(), balance);
+    });
+    assert_eq!(rejected_rows, expected_rows[..2]);
+    assert!(rejected_rows.iter().all(|row| row.source.id == 1));
+    assert_eq!(snapshot(dir.path()), before);
+
+    let mut admitted_rows = Vec::new();
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let (witnesses, retained) = visit_v4_segments_with_profile_and_hook_for_test(
+            root,
+            &manifest,
+            budget,
+            ProofProfile {
+                max_physical_visit_bytes: total,
+                ..profile
+            },
+            |_| Ok(()),
+            |row| {
+                admitted_rows.push(row);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(witnesses.len(), 2);
+        for (witness, meta) in witnesses.iter().zip(&manifest.segments) {
+            let path = Path::new(&meta.path);
+            let contents = fs::read(path).unwrap();
+            assert_eq!(witness.source.id, meta.id);
+            assert_eq!(
+                witness.identity,
+                physical_id(&File::open(path).unwrap(), path).unwrap()
+            );
+            assert_eq!(witness.len, contents.len() as u64);
+            assert_eq!(witness.digest, blake3::hash(&contents));
+            assert_eq!(witness.observed_rows, 2);
+        }
+        assert_eq!(balance - budget.remaining_bytes(), retained);
+        drop(witnesses);
+        budget.release(root, retained).unwrap();
+        assert_eq!(budget.remaining_bytes(), balance);
+    });
+    assert_eq!(admitted_rows, expected_rows);
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn literal_files_are_excluded_from_lz4_visitor_physical_cap() {
+    for literal_first in [true, false] {
+        let (dir, _config, lease, manifest) = mixed_literal_lz4_segments(literal_first);
+        let root = lease.root();
+        let paths = [
+            Path::new(&manifest.segments[0].path),
+            Path::new(&manifest.segments[1].path),
+        ];
+        let bytes = [fs::read(paths[0]).unwrap(), fs::read(paths[1]).unwrap()];
+        assert_eq!(bytes[0][8], if literal_first { 0 } else { 1 });
+        assert_eq!(bytes[1][8], if literal_first { 1 } else { 0 });
+        for (path, contents) in paths.into_iter().zip(&bytes) {
+            let decoded = decode_segment(contents, path, &CpuAccelerator).unwrap();
+            assert_eq!(decoded.blocks.len(), 2);
+            assert!(decoded.blocks.iter().all(|block| block.len() == 1));
+        }
+        let compressed_index = usize::from(literal_first);
+        let compressed_len = bytes[compressed_index].len() as u64;
+        assert!(compressed_len > 0);
+        assert!(compressed_len <= PRODUCTION_COMPRESSED_PROOF_PROFILE.max_physical_file_bytes);
+        let first_source = SegmentSource {
+            level: 0,
+            id: 1,
+            manifest_ordinal: 0,
+        };
+        let second_source = SegmentSource {
+            level: 1,
+            id: 2,
+            manifest_ordinal: 1,
+        };
+        let offsets = [two_block_offsets(paths[0]), two_block_offsets(paths[1])];
+        let expected_rows = vec![
+            expected_row(
+                first_source,
+                offsets[0][0],
+                0,
+                ObservedSegmentValue::Put(vec![0xca, 0xfe]),
+            ),
+            expected_row(first_source, offsets[0][1], 1, ObservedSegmentValue::Delete),
+            expected_row(
+                second_source,
+                offsets[1][0],
+                0,
+                ObservedSegmentValue::Put(vec![0xca, 0xfe]),
+            ),
+            expected_row(
+                second_source,
+                offsets[1][1],
+                2,
+                ObservedSegmentValue::Merge(vec![0x22]),
+            ),
+        ];
+        let before = snapshot(dir.path());
+        let mut admitted_rows = Vec::new();
+        with_wal_budget(root, &manifest, |budget| {
+            let balance = budget.remaining_bytes();
+            let (witnesses, retained) = visit_v4_segments_with_profile_and_hook_for_test(
+                root,
+                &manifest,
+                budget,
+                ProofProfile {
+                    max_physical_visit_bytes: compressed_len,
+                    ..PRODUCTION_COMPRESSED_PROOF_PROFILE
+                },
+                |_| Ok(()),
+                |row| {
+                    admitted_rows.push(row);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(witnesses.len(), 2);
+            for (witness, meta) in witnesses.iter().zip(&manifest.segments) {
+                let path = Path::new(&meta.path);
+                let contents = fs::read(path).unwrap();
+                assert_eq!(witness.source.id, meta.id);
+                assert_eq!(
+                    witness.identity,
+                    physical_id(&File::open(path).unwrap(), path).unwrap()
+                );
+                assert_eq!(witness.len, contents.len() as u64);
+                assert_eq!(witness.digest, blake3::hash(&contents));
+                assert_eq!(witness.observed_rows, 2);
+            }
+            assert_eq!(balance - budget.remaining_bytes(), retained);
+            drop(witnesses);
+            budget.release(root, retained).unwrap();
+            assert_eq!(budget.remaining_bytes(), balance);
+        });
+        assert_eq!(admitted_rows, expected_rows);
+        let mut rejected_rows = Vec::new();
+        with_wal_budget(root, &manifest, |budget| {
+            let balance = budget.remaining_bytes();
+            let error = visit_v4_segments_with_profile_and_hook_for_test(
+                root,
+                &manifest,
+                budget,
+                ProofProfile {
+                    max_physical_visit_bytes: compressed_len - 1,
+                    ..PRODUCTION_COMPRESSED_PROOF_PROFILE
+                },
+                |_| Ok(()),
+                |row| {
+                    rejected_rows.push(row);
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                PraxisError::UnsupportedCatalogFeature {
+                    feature: "compressed v4 visit physical bytes exceed proof profile"
+                }
+            ));
+            assert_eq!(budget.remaining_bytes(), balance);
+        });
+        assert_eq!(
+            rejected_rows,
+            if literal_first {
+                expected_rows[..2].to_vec()
+            } else {
+                Vec::new()
+            }
+        );
+        assert!(rejected_rows.iter().all(|row| row.source.id == 1));
+        assert_eq!(snapshot(dir.path()), before);
+    }
+}
+
+#[test]
 fn writer_valid_zstd_segments_preserve_reversed_manifest_ordinals_when_admitted() {
     assert_compressed_segment_provenance(Compression::Zstd, true);
 }
@@ -2107,6 +2424,154 @@ fn private_lz4_pass3_emits_writer_valid_inline_put_over_one_mebibyte() {
     );
     assert_eq!(work.accepted(), accepted);
     assert_eq!(work.compressed_physical_bytes(), physical);
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn private_lz4_pass3_preflights_entire_two_row_block_against_file_and_visit_caps() {
+    let (dir, config, lease, _) = two_segments(Compression::Lz4, false);
+    let root = lease.root();
+    let manifest = rewrite_first_segment(
+        root,
+        vec![
+            row(0, StoredValue::Put(vec![0xca, 0xfe])),
+            row(1, StoredValue::Delete),
+        ],
+        Compression::Lz4,
+        config.large_value_threshold,
+        4096,
+    );
+    let target = &manifest.segments[0];
+    assert_eq!(target.id, 1);
+    assert_eq!(target.entries, 2);
+    let path = Path::new(&target.path);
+    let bytes = fs::read(path).unwrap();
+    assert_eq!(bytes[8], 1);
+    let decoded = decode_segment(&bytes, path, &CpuAccelerator).unwrap();
+    assert_eq!(decoded.blocks.len(), 1);
+    assert_eq!(decoded.blocks[0].len(), 2);
+    let identity = physical_id(&File::open(path).unwrap(), path).unwrap();
+    let source = SegmentSource {
+        level: target.level,
+        id: target.id,
+        manifest_ordinal: 0,
+    };
+    let before = snapshot(dir.path());
+
+    let mut file_limited = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let first = scan_lz4_pass1(path, identity, target, &mut file_limited, |_| {}).unwrap();
+    assert_eq!(first.work.rows, 2);
+    assert_eq!(first.work.blocks, 1);
+    let first_context = file_limited.first_pass();
+    file_limited
+        .accept_authenticated_file(first_context, first.work, path)
+        .unwrap();
+    assert_eq!(
+        scan_lz4_pass2(path, identity, target, &file_limited, first, |_| {}).unwrap(),
+        first
+    );
+    let accepted = file_limited.accepted();
+    let physical = file_limited.compressed_physical_bytes();
+    assert_eq!(accepted.rows, 2);
+    assert_eq!(physical, bytes.len() as u64);
+    file_limited.lower_row_caps_for_test(1, PRODUCTION_COMPRESSED_PROOF_PROFILE.max_rows_visit);
+    let mut callbacks = 0;
+    let error = scan_lz4_pass3(path, identity, target, source, &file_limited, first, |_| {
+        callbacks += 1;
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        PraxisError::UnsupportedCatalogFeature {
+            feature: "compressed v4 file row count exceeds proof profile"
+        }
+    ));
+    assert_eq!(callbacks, 0);
+    assert_eq!(file_limited.accepted(), accepted);
+    assert_eq!(file_limited.compressed_physical_bytes(), physical);
+    assert_eq!(
+        physical_id(&File::open(path).unwrap(), path).unwrap(),
+        identity
+    );
+    assert_eq!(snapshot(dir.path()), before);
+
+    // A second authenticated file gives pass 3 a nonzero visit baseline.
+    let prior = &manifest.segments[1];
+    assert_eq!(prior.id, 2);
+    let prior_path = Path::new(&prior.path);
+    let prior_identity = physical_id(&File::open(prior_path).unwrap(), prior_path).unwrap();
+    let mut visit_limited = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let prior_first = scan_lz4_pass1(
+        prior_path,
+        prior_identity,
+        prior,
+        &mut visit_limited,
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(prior_first.work.rows, 2);
+    let prior_context = visit_limited.first_pass();
+    visit_limited
+        .accept_authenticated_file(prior_context, prior_first.work, prior_path)
+        .unwrap();
+    assert_eq!(
+        scan_lz4_pass2(
+            prior_path,
+            prior_identity,
+            prior,
+            &visit_limited,
+            prior_first,
+            |_| {},
+        )
+        .unwrap(),
+        prior_first
+    );
+    assert_eq!(visit_limited.accepted().rows, 2);
+    let target_first = scan_lz4_pass1(path, identity, target, &mut visit_limited, |_| {}).unwrap();
+    let target_context = visit_limited.first_pass();
+    visit_limited
+        .accept_authenticated_file(target_context, target_first.work, path)
+        .unwrap();
+    assert_eq!(
+        scan_lz4_pass2(path, identity, target, &visit_limited, target_first, |_| {}).unwrap(),
+        target_first
+    );
+    let accepted = visit_limited.accepted();
+    let physical = visit_limited.compressed_physical_bytes();
+    assert_eq!(accepted.rows, 4);
+    assert_eq!(
+        physical,
+        bytes.len() as u64 + fs::metadata(prior_path).unwrap().len()
+    );
+    visit_limited.lower_row_caps_for_test(PRODUCTION_COMPRESSED_PROOF_PROFILE.max_rows_file, 3);
+    let mut callbacks = 0;
+    let error = scan_lz4_pass3(
+        path,
+        identity,
+        target,
+        source,
+        &visit_limited,
+        target_first,
+        |_| {
+            callbacks += 1;
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        PraxisError::UnsupportedCatalogFeature {
+            feature: "compressed v4 visit row count exceeds proof profile"
+        }
+    ));
+    assert_eq!(callbacks, 0);
+    assert_eq!(visit_limited.accepted(), accepted);
+    assert_eq!(visit_limited.compressed_physical_bytes(), physical);
+    assert_eq!(
+        physical_id(&File::open(path).unwrap(), path).unwrap(),
+        identity
+    );
     assert_eq!(snapshot(dir.path()), before);
 }
 

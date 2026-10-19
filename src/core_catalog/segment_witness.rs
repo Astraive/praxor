@@ -116,6 +116,14 @@ impl WorkLedger {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn lower_row_caps_for_test(&mut self, file: u64, visit: u64) {
+        assert!(file <= self.profile.max_rows_file);
+        assert!(visit <= self.profile.max_rows_visit);
+        self.profile.max_rows_file = file;
+        self.profile.max_rows_visit = visit;
+    }
+
     #[allow(dead_code)] // Private diagnostics read these counters in direct tests.
     pub(super) fn compressed_physical_bytes(&self) -> u64 {
         self.compressed_physical_bytes
@@ -3153,6 +3161,36 @@ fn visit_v4_segments_with_receipt(
     root: &Path,
     manifest: &Manifest,
     budget: &mut PhysicalWitnessBudget,
+    visit: impl FnMut(ObservedSegmentRow) -> Result<()>,
+) -> Result<(Vec<SegmentFileWitness>, usize)> {
+    visit_v4_segments_with_receipt_inner(
+        root,
+        manifest,
+        budget,
+        PRODUCTION_COMPRESSED_PROOF_PROFILE,
+        |_| Ok(()),
+        visit,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn visit_v4_segments_with_profile_and_hook_for_test(
+    root: &Path,
+    manifest: &Manifest,
+    budget: &mut PhysicalWitnessBudget,
+    profile: ProofProfile,
+    on_lz4_discovered: impl FnMut(&Path) -> Result<()>,
+    visit: impl FnMut(ObservedSegmentRow) -> Result<()>,
+) -> Result<(Vec<SegmentFileWitness>, usize)> {
+    visit_v4_segments_with_receipt_inner(root, manifest, budget, profile, on_lz4_discovered, visit)
+}
+
+fn visit_v4_segments_with_receipt_inner(
+    root: &Path,
+    manifest: &Manifest,
+    budget: &mut PhysicalWitnessBudget,
+    profile: ProofProfile,
+    mut on_lz4_discovered: impl FnMut(&Path) -> Result<()>,
     mut visit: impl FnMut(ObservedSegmentRow) -> Result<()>,
 ) -> Result<(Vec<SegmentFileWitness>, usize)> {
     // This guard starts before inventory. On every Err or Rust unwind, later
@@ -3160,12 +3198,13 @@ fn visit_v4_segments_with_receipt(
     let mut attempt = WitnessAttempt::new(root, budget);
     let mut admitted = inventory(root, manifest, &mut attempt)?;
     let (locators, witnesses) = (&mut admitted.locators, &mut admitted.witnesses);
-    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let mut work = WorkLedger::new(profile);
     for locator in locators {
         let meta = &manifest.segments[locator.source.manifest_ordinal];
         let scanned = match discover_segment_compression(locator)? {
             0 => scan_literal_segment(locator, meta, &mut visit)?,
             1 => {
+                on_lz4_discovered(&locator.path)?;
                 let expected_identity = locator.identity.ok_or_else(|| {
                     corrupt(&locator.path, "v4 segment lacks admitted physical identity")
                 })?;
