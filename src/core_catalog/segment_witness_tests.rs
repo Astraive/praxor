@@ -2824,7 +2824,8 @@ fn private_zstd_pass1_rejects_repaired_magic_offset_and_overcap_claim() {
     let mut bad_magic = original.clone();
     bad_magic[33] ^= 1;
     let encoded_len = encoded.len();
-    bad_magic[29..33].copy_from_slice(&crc32c(&bad_magic[33..33 + encoded_len]).to_le_bytes());
+    let checksum = crc32c(&bad_magic[33..33 + encoded_len]);
+    bad_magic[29..33].copy_from_slice(&checksum.to_le_bytes());
     let manifest = replace_first_segment_bytes(root, &bad_magic);
     let altered = manifest.segments.iter().find(|meta| meta.id == 1).unwrap();
     assert_eq!(
