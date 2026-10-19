@@ -134,13 +134,19 @@ fn file_identity(path: &std::path::Path) -> (u64, [u8; 16]) {
     (meta.dev(), id)
 }
 
-fn snapshot_tree(
-    root: &std::path::Path,
-) -> Vec<(std::path::PathBuf, u8, Option<(u64, [u8; 16])>, Vec<u8>)> {
+#[derive(Debug, Eq, PartialEq)]
+struct TreeSnapshotEntry {
+    path: std::path::PathBuf,
+    kind: u8,
+    identity: Option<(u64, [u8; 16])>,
+    bytes: Vec<u8>,
+}
+
+fn snapshot_tree(root: &std::path::Path) -> Vec<TreeSnapshotEntry> {
     fn walk(
         root: &std::path::Path,
         directory: &std::path::Path,
-        snapshot: &mut Vec<(std::path::PathBuf, u8, Option<(u64, [u8; 16])>, Vec<u8>)>,
+        snapshot: &mut Vec<TreeSnapshotEntry>,
     ) {
         let mut paths: Vec<_> = fs::read_dir(directory)
             .unwrap()
@@ -170,12 +176,12 @@ fn snapshot_tree(
             } else {
                 Vec::new()
             };
-            snapshot.push((
-                path.strip_prefix(root).unwrap().to_path_buf(),
-                tag,
+            snapshot.push(TreeSnapshotEntry {
+                path: path.strip_prefix(root).unwrap().to_path_buf(),
+                kind: tag,
                 identity,
                 bytes,
-            ));
+            });
             if kind.is_dir() {
                 walk(root, &path, snapshot);
             }

@@ -790,7 +790,7 @@ fn scan_v4_wals_with_limit(
         }
     }
     scan_before_first_open_hook();
-    for (item, witness_path) in listed.files.iter().zip(prepared_paths.into_iter()) {
+    for (item, witness_path) in listed.files.iter().zip(prepared_paths) {
         result.push(scan_file(
             item,
             item.id == cut.active_wal_id,
