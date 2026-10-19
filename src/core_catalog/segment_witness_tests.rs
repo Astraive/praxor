@@ -1707,7 +1707,7 @@ fn lz4_visitor_enforces_aggregate_physical_cap_at_second_file() {
     }
     assert_ne!(file_id(paths[0]), file_id(paths[1]));
     let total = lengths[0].checked_add(lengths[1]).unwrap();
-    assert!(total - 1 >= lengths[0].max(lengths[1]));
+    assert!(total > lengths[0].max(lengths[1]));
     assert!(
         lengths[0].max(lengths[1]) <= PRODUCTION_COMPRESSED_PROOF_PROFILE.max_physical_file_bytes
     );
