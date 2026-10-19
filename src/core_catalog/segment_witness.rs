@@ -1009,3 +1009,105 @@ pub(crate) fn visit_v4_segments(
         }
     }
 }
+
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // Fields are consumed by the upcoming private stage implementation.
+pub(super) struct ProtectedStageLimits {
+    pub(super) max_rows: usize,
+    pub(super) max_bytes: usize,
+}
+
+pub(super) const PROTECTED_STAGE_LIMITS: ProtectedStageLimits = ProtectedStageLimits {
+    max_rows: 65_536,
+    max_bytes: 64 * 1024 * 1024,
+};
+
+/// A candidate remains private and carries no installed or effective owner claim.
+#[derive(Debug)]
+#[allow(dead_code)] // The test-first adapter is intentionally RED until this private cut lands.
+pub(crate) struct ProtectedSegmentCandidate {
+    pub(crate) rows: Vec<ObservedSegmentRow>,
+    pub(crate) witnesses: Vec<SegmentFileWitness>,
+    pub(crate) retained_witness_bytes: usize,
+}
+
+fn collect_protected_segment_candidate_inner(
+    _root: &Path,
+    _manifest: &Manifest,
+    _budget: &mut PhysicalWitnessBudget,
+    _limits: ProtectedStageLimits,
+    _after_staged: impl FnMut(usize) -> Result<()>,
+) -> Result<ProtectedSegmentCandidate> {
+    Err(unsupported(
+        "bounded protected segment candidate staging is not yet admitted",
+    ))
+}
+
+#[allow(dead_code)] // Used by the next private owner-composition cut.
+pub(crate) fn collect_protected_segment_candidate(
+    root: &Path,
+    manifest: &Manifest,
+    budget: &mut PhysicalWitnessBudget,
+) -> Result<ProtectedSegmentCandidate> {
+    collect_protected_segment_candidate_inner(
+        root,
+        manifest,
+        budget,
+        PROTECTED_STAGE_LIMITS,
+        |_| Ok(()),
+    )
+}
+
+#[cfg(test)]
+pub(super) fn collect_protected_segment_candidate_for_test(
+    root: &Path,
+    manifest: &Manifest,
+    budget: &mut PhysicalWitnessBudget,
+    limits: ProtectedStageLimits,
+    after_staged: impl FnMut(usize) -> Result<()>,
+) -> Result<ProtectedSegmentCandidate> {
+    assert!(limits.max_rows <= PROTECTED_STAGE_LIMITS.max_rows);
+    assert!(limits.max_bytes <= PROTECTED_STAGE_LIMITS.max_bytes);
+    collect_protected_segment_candidate_inner(root, manifest, budget, limits, after_staged)
+}
+
+#[cfg(test)]
+pub(super) struct ProtectedStage {
+    rows: Vec<ObservedSegmentRow>,
+    used_bytes: usize,
+    limits: ProtectedStageLimits,
+}
+
+#[cfg(test)]
+impl ProtectedStage {
+    pub(super) fn new(limits: ProtectedStageLimits) -> Self {
+        Self {
+            rows: Vec::new(),
+            used_bytes: 0,
+            limits,
+        }
+    }
+
+    pub(super) fn push(&mut self, _row: ObservedSegmentRow) -> Result<()> {
+        Err(unsupported(
+            "bounded protected segment candidate staging is not yet admitted",
+        ))
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub(super) fn used_bytes(&self) -> usize {
+        self.used_bytes
+    }
+
+    pub(super) fn capacity(&self) -> usize {
+        self.rows.capacity()
+    }
+
+    pub(super) fn set_max_bytes_for_test(&mut self, max_bytes: usize) {
+        assert!(max_bytes <= PROTECTED_STAGE_LIMITS.max_bytes);
+        self.limits.max_bytes = max_bytes;
+    }
+}
