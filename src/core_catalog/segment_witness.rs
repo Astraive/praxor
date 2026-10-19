@@ -363,16 +363,14 @@ fn inventory(
         seen.resize(count, 0);
         let (mut physical_ids, physical_set_charge) =
             reserved_set::<SegmentPhysicalId>(count, root, budget, &mut charged)?;
-        let mut levels = 0;
         let mut observed = 0;
-        for level_entry in fs::read_dir(&segment_root)? {
+        for (levels, level_entry) in fs::read_dir(&segment_root)?.enumerate() {
             if levels == MAX_SEGMENT_LEVELS {
                 return Err(corrupt(
                     &segment_root,
                     "v4 segment level-entry limit exceeded",
                 ));
             }
-            levels += 1;
             let level_path = level_entry?.path();
             check_real(&level_path)?;
             if !fs::symlink_metadata(&level_path)?.is_dir() {
@@ -422,7 +420,7 @@ fn inventory(
                 seen[position] = 1;
             }
         }
-        if observed != count || seen.iter().any(|seen| *seen == 0) {
+        if observed != count || seen.contains(&0) {
             return Err(corrupt(&segment_root, "listed v4 segment file is missing"));
         }
 
