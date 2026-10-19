@@ -686,10 +686,10 @@ fn walk_literal<'a>(
         let mut block_last: Option<&[u8]> = None;
         for row_index in 0..row_count {
             let row = borrowed_row(&mut rows, path)?;
-            if let Some((cf, key)) = previous_row {
-                if (row.cf.as_bytes(), row.key) < (cf.as_bytes(), key) {
-                    return Err(corrupt(path, "v4 segment rows are out of writer order"));
-                }
+            if let Some((cf, key)) = previous_row
+                && (row.cf.as_bytes(), row.key) < (cf.as_bytes(), key)
+            {
+                return Err(corrupt(path, "v4 segment rows are out of writer order"));
             }
             previous_row = Some((row.cf, row.key));
             block_first.get_or_insert(row.key);
