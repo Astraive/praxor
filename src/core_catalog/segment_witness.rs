@@ -3,6 +3,7 @@
 //! No caller may turn these observations into an owner proof until the later
 //! protected-copy, installed-relation, and WAL-history proofs are complete.
 
+use crate::config::Compression;
 use crate::disk::DiskLayout;
 use crate::errors::{PraxisError, Result};
 use crate::io::{BinaryReader, crc32c};
@@ -28,6 +29,553 @@ const SEGMENT_HEADER_BYTES: usize = 21;
 const SEGMENT_TRAILER_BYTES: usize = 12;
 const BLOCK_HEADER_BYTES: usize = 12;
 const HASH_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Private proof policy for compressed files only. Literal admission is unchanged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // The bounded stream scanner consumes the remaining fields in the next cut.
+pub(super) struct ProofProfile {
+    pub(super) max_physical_file_bytes: u64,
+    pub(super) max_physical_visit_bytes: u64,
+    pub(super) max_encoded_block_bytes: u64,
+    pub(super) max_decoded_block_bytes: u64,
+    pub(super) max_footer_bytes: u64,
+    pub(super) max_decoded_file_bytes: u64,
+    pub(super) max_decoded_visit_bytes: u64,
+    pub(super) max_blocks_file: u64,
+    pub(super) max_blocks_visit: u64,
+    pub(super) max_rows_file: u64,
+    pub(super) max_rows_visit: u64,
+    pub(super) max_parser_owned_peak_bytes: usize,
+}
+
+#[allow(dead_code)] // The compressed tag remains fenced until the streaming scanner is proved.
+pub(super) const PRODUCTION_COMPRESSED_PROOF_PROFILE: ProofProfile = ProofProfile {
+    max_physical_file_bytes: 128 * 1024 * 1024,
+    max_physical_visit_bytes: 512 * 1024 * 1024,
+    max_encoded_block_bytes: 9 * 1024 * 1024,
+    max_decoded_block_bytes: 8 * 1024 * 1024,
+    max_footer_bytes: 8 * 1024 * 1024,
+    max_decoded_file_bytes: 256 * 1024 * 1024,
+    max_decoded_visit_bytes: 1024 * 1024 * 1024,
+    max_blocks_file: 65_536,
+    max_blocks_visit: 131_072,
+    max_rows_file: 4_194_304,
+    max_rows_visit: 8_388_608,
+    max_parser_owned_peak_bytes: 128 * 1024 * 1024,
+};
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct CompressedWorkFacts {
+    pub(super) decoded_bytes: u64,
+    pub(super) blocks: u64,
+    pub(super) rows: u64,
+}
+
+/// One file's pass carries the prior-file baseline. Replay passes subtract
+/// this file's authenticated first-pass facts instead of charging it twice.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CompressedPassContext {
+    prior: CompressedWorkFacts,
+    authenticated_file: Option<CompressedWorkFacts>,
+}
+
+#[allow(dead_code)] // The later streaming scanner calls this after its integrated digest.
+impl CompressedPassContext {
+    pub(super) fn require_exact_replay(
+        self,
+        actual: CompressedWorkFacts,
+        path: &Path,
+    ) -> Result<()> {
+        if self
+            .authenticated_file
+            .is_some_and(|expected| expected != actual)
+        {
+            return Err(corrupt(path, "compressed v4 replay facts changed"));
+        }
+        Ok(())
+    }
+}
+
+/// Only authenticated first-pass facts are committed to the visit totals.
+#[allow(dead_code)] // Wired to the private streaming visitor in the next cut.
+pub(super) struct WorkLedger {
+    profile: ProofProfile,
+    compressed_physical_bytes: u64,
+    accepted: CompressedWorkFacts,
+}
+
+#[allow(dead_code)] // Direct helper tests exercise these checks before visitor admission.
+impl WorkLedger {
+    pub(super) fn new(profile: ProofProfile) -> Self {
+        Self {
+            profile,
+            compressed_physical_bytes: 0,
+            accepted: CompressedWorkFacts::default(),
+        }
+    }
+
+    pub(super) fn compressed_physical_bytes(&self) -> u64 {
+        self.compressed_physical_bytes
+    }
+
+    pub(super) fn accepted(&self) -> CompressedWorkFacts {
+        self.accepted
+    }
+
+    pub(super) fn first_pass(&self) -> CompressedPassContext {
+        CompressedPassContext {
+            prior: self.accepted,
+            authenticated_file: None,
+        }
+    }
+
+    pub(super) fn replay_pass(
+        &self,
+        authenticated_file: CompressedWorkFacts,
+    ) -> Result<CompressedPassContext> {
+        let prior = CompressedWorkFacts {
+            decoded_bytes: self
+                .accepted
+                .decoded_bytes
+                .checked_sub(authenticated_file.decoded_bytes)
+                .ok_or_else(|| unsupported("compressed v4 replay decoded baseline underflow"))?,
+            blocks: self
+                .accepted
+                .blocks
+                .checked_sub(authenticated_file.blocks)
+                .ok_or_else(|| unsupported("compressed v4 replay block baseline underflow"))?,
+            rows: self
+                .accepted
+                .rows
+                .checked_sub(authenticated_file.rows)
+                .ok_or_else(|| unsupported("compressed v4 replay row baseline underflow"))?,
+        };
+        Ok(CompressedPassContext {
+            prior,
+            authenticated_file: Some(authenticated_file),
+        })
+    }
+
+    fn check_pass_context(&self, pass: CompressedPassContext) -> Result<()> {
+        let expected = match pass.authenticated_file {
+            Some(file) => CompressedWorkFacts {
+                decoded_bytes: pass
+                    .prior
+                    .decoded_bytes
+                    .checked_add(file.decoded_bytes)
+                    .ok_or_else(|| unsupported("compressed v4 replay decoded baseline overflow"))?,
+                blocks: pass
+                    .prior
+                    .blocks
+                    .checked_add(file.blocks)
+                    .ok_or_else(|| unsupported("compressed v4 replay block baseline overflow"))?,
+                rows: pass
+                    .prior
+                    .rows
+                    .checked_add(file.rows)
+                    .ok_or_else(|| unsupported("compressed v4 replay row baseline overflow"))?,
+            },
+            None => pass.prior,
+        };
+        if expected != self.accepted {
+            return Err(unsupported("compressed v4 pass baseline changed"));
+        }
+        Ok(())
+    }
+
+    /// Call after opened-handle identity admission, before buffer reservation.
+    pub(super) fn admit_compressed_file(&mut self, len: u64, _path: &Path) -> Result<()> {
+        if len > self.profile.max_physical_file_bytes {
+            return Err(unsupported(
+                "compressed v4 physical file exceeds proof profile",
+            ));
+        }
+        // Policy-counter overflow is Unsupported, before doing any file work.
+        let total = self
+            .compressed_physical_bytes
+            .checked_add(len)
+            .ok_or_else(|| unsupported("compressed v4 visit physical counter overflow"))?;
+        if total > self.profile.max_physical_visit_bytes {
+            return Err(unsupported(
+                "compressed v4 visit physical bytes exceed proof profile",
+            ));
+        }
+        self.compressed_physical_bytes = total;
+        Ok(())
+    }
+
+    /// Preview a block claim before decoding or allocating its output.
+    pub(super) fn check_next_block(
+        &self,
+        current: CompressedWorkFacts,
+        decoded_len: u64,
+        pass: CompressedPassContext,
+        path: &Path,
+    ) -> Result<CompressedWorkFacts> {
+        self.check_pass_context(pass)?;
+        if decoded_len == 0 {
+            return Err(corrupt(path, "zero-length compressed v4 decoded block"));
+        }
+        if decoded_len > self.profile.max_decoded_block_bytes {
+            return Err(unsupported(
+                "compressed v4 decoded block exceeds proof profile",
+            ));
+        }
+        let decoded_bytes = current
+            .decoded_bytes
+            .checked_add(decoded_len)
+            .ok_or_else(|| unsupported("compressed v4 file decoded counter overflow"))?;
+        let blocks = current
+            .blocks
+            .checked_add(1)
+            .ok_or_else(|| unsupported("compressed v4 file block counter overflow"))?;
+        if decoded_bytes > self.profile.max_decoded_file_bytes {
+            return Err(unsupported(
+                "compressed v4 file decoded bytes exceed proof profile",
+            ));
+        }
+        if blocks > self.profile.max_blocks_file {
+            return Err(unsupported(
+                "compressed v4 file block count exceeds proof profile",
+            ));
+        }
+        if let Some(first) = pass.authenticated_file {
+            if decoded_bytes > first.decoded_bytes {
+                return Err(unsupported(
+                    "compressed v4 replay decoded bytes exceed authenticated facts",
+                ));
+            }
+            if blocks > first.blocks {
+                return Err(unsupported(
+                    "compressed v4 replay block count exceeds authenticated facts",
+                ));
+            }
+        }
+        let visit_decoded = pass
+            .prior
+            .decoded_bytes
+            .checked_add(decoded_bytes)
+            .ok_or_else(|| unsupported("compressed v4 visit decoded counter overflow"))?;
+        let visit_blocks = pass
+            .prior
+            .blocks
+            .checked_add(blocks)
+            .ok_or_else(|| unsupported("compressed v4 visit block counter overflow"))?;
+        if visit_decoded > self.profile.max_decoded_visit_bytes {
+            return Err(unsupported(
+                "compressed v4 visit decoded bytes exceed proof profile",
+            ));
+        }
+        if visit_blocks > self.profile.max_blocks_visit {
+            return Err(unsupported(
+                "compressed v4 visit block count exceeds proof profile",
+            ));
+        }
+        Ok(CompressedWorkFacts {
+            decoded_bytes,
+            blocks,
+            ..current
+        })
+    }
+
+    /// Check one parsed row before cloning it or calling an observer.
+    pub(super) fn check_next_row(
+        &self,
+        current: CompressedWorkFacts,
+        pass: CompressedPassContext,
+        _path: &Path,
+    ) -> Result<CompressedWorkFacts> {
+        self.check_pass_context(pass)?;
+        let rows = current
+            .rows
+            .checked_add(1)
+            .ok_or_else(|| unsupported("compressed v4 file row counter overflow"))?;
+        if rows > self.profile.max_rows_file {
+            return Err(unsupported(
+                "compressed v4 file row count exceeds proof profile",
+            ));
+        }
+        if pass
+            .authenticated_file
+            .is_some_and(|first| rows > first.rows)
+        {
+            return Err(unsupported(
+                "compressed v4 replay exceeds authenticated row facts",
+            ));
+        }
+        let visit_rows = pass
+            .prior
+            .rows
+            .checked_add(rows)
+            .ok_or_else(|| unsupported("compressed v4 visit row counter overflow"))?;
+        if visit_rows > self.profile.max_rows_visit {
+            return Err(unsupported(
+                "compressed v4 visit row count exceeds proof profile",
+            ));
+        }
+        Ok(CompressedWorkFacts { rows, ..current })
+    }
+
+    /// The caller invokes this only after its same-handle pass digest matches MANIFEST.
+    pub(super) fn accept_authenticated_file(
+        &mut self,
+        pass: CompressedPassContext,
+        facts: CompressedWorkFacts,
+        _path: &Path,
+    ) -> Result<()> {
+        self.check_pass_context(pass)?;
+        if pass.authenticated_file.is_some() {
+            return Err(unsupported(
+                "compressed v4 replay cannot charge visit twice",
+            ));
+        }
+        if facts.decoded_bytes > self.profile.max_decoded_file_bytes
+            || facts.blocks > self.profile.max_blocks_file
+            || facts.rows > self.profile.max_rows_file
+        {
+            return Err(unsupported("compressed v4 file work exceeds proof profile"));
+        }
+        let decoded_bytes = self
+            .accepted
+            .decoded_bytes
+            .checked_add(facts.decoded_bytes)
+            .ok_or_else(|| unsupported("compressed v4 visit decoded counter overflow"))?;
+        let blocks = self
+            .accepted
+            .blocks
+            .checked_add(facts.blocks)
+            .ok_or_else(|| unsupported("compressed v4 visit block counter overflow"))?;
+        let rows = self
+            .accepted
+            .rows
+            .checked_add(facts.rows)
+            .ok_or_else(|| unsupported("compressed v4 visit row counter overflow"))?;
+        if decoded_bytes > self.profile.max_decoded_visit_bytes
+            || blocks > self.profile.max_blocks_visit
+            || rows > self.profile.max_rows_visit
+        {
+            return Err(unsupported(
+                "compressed v4 visit work exceeds proof profile",
+            ));
+        }
+        self.accepted = CompressedWorkFacts {
+            decoded_bytes,
+            blocks,
+            rows,
+        };
+        Ok(())
+    }
+}
+
+/// Each slot represents one enrolled parser-owned Vec. On pinned Rust 1.99.0
+/// this models requested layouts and reported Vec capacities, including
+/// old/new growth overlap. It excludes allocator usable-size surplus,
+/// unenrolled buffers, native decoder workspace, OS commit and process RSS.
+/// Re-audit the requested-layout behavior on a Rust toolchain upgrade.
+/// Bloom words need 128 bytes of allowance beyond 2x logical capacity.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // Additional slots are consumed by the next streaming scanner cut.
+pub(super) enum ScratchSlot {
+    Encoded,
+    Decoded,
+    Footer,
+    Previous,
+    BloomScratch,
+    BloomBits,
+    OwnedCf,
+    OwnedKey,
+    OwnedValue,
+}
+
+#[allow(dead_code)]
+impl ScratchSlot {
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn logical_limit(self, profile: ProofProfile) -> u64 {
+        match self {
+            Self::Encoded => profile.max_encoded_block_bytes,
+            Self::Footer => profile.max_footer_bytes,
+            Self::Decoded
+            | Self::Previous
+            | Self::BloomScratch
+            | Self::BloomBits
+            | Self::OwnedCf
+            | Self::OwnedKey
+            | Self::OwnedValue => profile.max_decoded_block_bytes,
+        }
+    }
+
+    const fn allowance_overhead(self) -> usize {
+        match self {
+            Self::BloomBits => 128,
+            _ => 64,
+        }
+    }
+}
+
+#[allow(dead_code)] // The private stream scanner will account its additional live Vecs here.
+pub(super) struct ScratchLedger {
+    profile: ProofProfile,
+    capacities: [usize; 9],
+    live_bytes: usize,
+    poisoned: bool,
+}
+
+#[allow(dead_code)] // Direct helper tests pin preallocation refusal and overlap accounting.
+impl ScratchLedger {
+    pub(super) fn new(profile: ProofProfile) -> Self {
+        Self {
+            profile,
+            capacities: [0; 9],
+            live_bytes: 0,
+            poisoned: false,
+        }
+    }
+
+    pub(super) fn live_bytes(&self) -> usize {
+        self.live_bytes
+    }
+
+    pub(super) fn reserve_vec(
+        &mut self,
+        slot: ScratchSlot,
+        buffer: &mut Vec<u8>,
+        required_len: usize,
+        path: &Path,
+    ) -> Result<()> {
+        if self.poisoned || self.capacities[slot.index()] != buffer.capacity() {
+            self.poisoned = true;
+            return Err(unsupported(
+                "compressed v4 scratch accounting is inconsistent",
+            ));
+        }
+        let logical_limit = usize::try_from(slot.logical_limit(self.profile))
+            .map_err(|_| unsupported("compressed v4 scratch limit exceeds platform range"))?;
+        if required_len > logical_limit {
+            return Err(unsupported(
+                "compressed v4 scratch vector exceeds proof profile",
+            ));
+        }
+        if buffer.capacity() >= required_len {
+            return Ok(());
+        }
+        let allowance = logical_limit
+            .checked_mul(2)
+            .and_then(|size| size.checked_add(slot.allowance_overhead()))
+            .ok_or_else(|| unsupported("compressed v4 scratch allowance overflow"))?;
+        // Under pinned Rust 1.99.0, the old requested layout remains live
+        // during growth. Precharge its reported capacity plus the full
+        // allowed new requested capacity, then verify the reported result.
+        let peak = self
+            .live_bytes
+            .checked_add(allowance)
+            .ok_or_else(|| unsupported("compressed v4 scratch peak counter overflow"))?;
+        if peak > self.profile.max_parser_owned_peak_bytes {
+            return Err(unsupported(
+                "compressed v4 scratch peak exceeds proof profile",
+            ));
+        }
+        let old_capacity = buffer.capacity();
+        let additional = required_len
+            .checked_sub(buffer.len())
+            .ok_or_else(|| corrupt(path, "compressed v4 scratch length exceeds request"))?;
+        if buffer.try_reserve_exact(additional).is_err() {
+            self.poisoned = true;
+            return Err(corrupt(path, "compressed v4 scratch allocation failed"));
+        }
+        let new_capacity = buffer.capacity();
+        if new_capacity > allowance {
+            self.poisoned = true;
+            return Err(unsupported(
+                "compressed v4 scratch allocation exceeds proof profile",
+            ));
+        }
+        let live_bytes = self
+            .live_bytes
+            .checked_sub(old_capacity)
+            .and_then(|bytes| bytes.checked_add(new_capacity))
+            .ok_or_else(|| unsupported("compressed v4 scratch live counter overflow"))?;
+        if live_bytes > self.profile.max_parser_owned_peak_bytes {
+            self.poisoned = true;
+            return Err(unsupported(
+                "compressed v4 scratch live bytes exceed proof profile",
+            ));
+        }
+        self.capacities[slot.index()] = new_capacity;
+        self.live_bytes = live_bytes;
+        Ok(())
+    }
+}
+
+pub(super) struct BlockFrame<'a> {
+    pub(super) codec: Compression,
+    pub(super) encoded: &'a [u8],
+    pub(super) checksum: u32,
+    pub(super) decoded_len: u64,
+}
+
+/// Bounded reusable block decoder for one enrolled output Vec. The caller
+/// must separately enroll its encoded/footer/row buffers. This helper does
+/// not authenticate a file digest. Zstd and visitor callbacks remain fenced.
+#[allow(dead_code)]
+pub(super) fn decode_bounded_block(
+    frame: BlockFrame<'_>,
+    work: &WorkLedger,
+    current: CompressedWorkFacts,
+    pass: CompressedPassContext,
+    decoded: &mut Vec<u8>,
+    scratch: &mut ScratchLedger,
+    path: &Path,
+) -> Result<CompressedWorkFacts> {
+    if frame.codec != Compression::Lz4 {
+        return Err(unsupported("compressed v4 Zstd decoder is not yet bounded"));
+    }
+    if scratch.profile != work.profile {
+        return Err(unsupported(
+            "compressed v4 scratch and work profiles disagree",
+        ));
+    }
+    let next = work.check_next_block(current, frame.decoded_len, pass, path)?;
+    if frame.encoded.len() as u64 > work.profile.max_encoded_block_bytes {
+        return Err(unsupported(
+            "compressed v4 encoded block exceeds proof profile",
+        ));
+    }
+    if frame.encoded.is_empty() {
+        return Err(corrupt(path, "empty compressed v4 encoded block"));
+    }
+    if crc32c(frame.encoded) != frame.checksum {
+        return Err(corrupt(path, "compressed v4 block checksum mismatch"));
+    }
+    let prefix = frame
+        .encoded
+        .get(..4)
+        .ok_or_else(|| corrupt(path, "missing compressed v4 LZ4 size prefix"))?;
+    if u64::from(u32::from_le_bytes(
+        prefix.try_into().expect("four-byte prefix"),
+    )) != frame.decoded_len
+    {
+        return Err(corrupt(
+            path,
+            "compressed v4 LZ4 inner and outer lengths disagree",
+        ));
+    }
+    let target = usize::try_from(frame.decoded_len)
+        .map_err(|_| unsupported("compressed v4 decoded block exceeds platform range"))?;
+    decoded.clear();
+    scratch.reserve_vec(ScratchSlot::Decoded, decoded, target, path)?;
+    decoded.resize(target, 0);
+    let result = lz4_flex::block::decompress_into(&frame.encoded[4..], decoded.as_mut_slice());
+    match result {
+        Ok(written) if written == target => Ok(next),
+        _ => {
+            decoded.clear();
+            Err(corrupt(path, "invalid compressed v4 LZ4 block"))
+        }
+    }
+}
 
 /// This position is from the original, unsorted MANIFEST segment vector.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -1,10 +1,11 @@
 use super::physical::inspect_v4_owner;
 use super::physical_tests::flushed_create_fixture;
 use super::segment_witness::{
-    ObservedSegmentRow, ObservedSegmentValue, PROTECTED_STAGE_LIMITS, PhysicalRowClass,
-    ProtectedRole, ProtectedStage, ProtectedStageLimits, SegmentFileWitness, SegmentSource,
-    collect_protected_segment_candidate, collect_protected_segment_candidate_for_test,
-    visit_v4_segments,
+    BlockFrame, CompressedWorkFacts, ObservedSegmentRow, ObservedSegmentValue,
+    PRODUCTION_COMPRESSED_PROOF_PROFILE, PROTECTED_STAGE_LIMITS, PhysicalRowClass, ProofProfile,
+    ProtectedRole, ProtectedStage, ProtectedStageLimits, ScratchLedger, ScratchSlot,
+    SegmentFileWitness, SegmentSource, WorkLedger, collect_protected_segment_candidate,
+    collect_protected_segment_candidate_for_test, decode_bounded_block, visit_v4_segments,
 };
 use crate::accel::cpu::scalar::CpuAccelerator;
 use crate::config::{Compression, PraxisConfig};
@@ -13,7 +14,7 @@ use crate::errors::PraxisError;
 use crate::io::{BinaryReader, crc32c};
 use crate::manifest::{Manifest, ManifestStore, SegmentMetadata};
 use crate::segments::block::SegmentEntry;
-use crate::segments::codec::decode_segment;
+use crate::segments::codec::{decode_entries, decode_segment};
 use crate::segments::{BloomFilter, SegmentWriteOptions, SegmentWriter};
 use crate::types::{ColumnFamily, StoredValue, ValuePointer, VersionedValue};
 use crate::values::ValueLog;
@@ -209,6 +210,16 @@ fn two_block_offsets(path: &Path) -> [u64; 2] {
     assert!(parsed.blocks.iter().all(|block| block.len() == 1));
     let first_len = u32::from_le_bytes(bytes[21..25].try_into().unwrap()) as u64;
     [21, 21 + 12 + first_len]
+}
+
+fn writer_block_frame(bytes: &[u8], offset: u64) -> (&[u8], u64, u32) {
+    let start = usize::try_from(offset).unwrap();
+    let encoded_len = u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap()) as usize;
+    let decoded_len = u32::from_le_bytes(bytes[start + 4..start + 8].try_into().unwrap());
+    let checksum = u32::from_le_bytes(bytes[start + 8..start + 12].try_into().unwrap());
+    let end = start.checked_add(12 + encoded_len).unwrap();
+    assert!(end <= bytes.len());
+    (&bytes[start + 12..end], u64::from(decoded_len), checksum)
 }
 
 fn expected_row(
@@ -1317,6 +1328,447 @@ fn oversized_lz4_outer_decoded_claim_is_refused_before_allocation() {
         assert_eq!(budget.remaining_bytes(), wal_balance);
     });
     assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn bounded_lz4_helper_decodes_writer_blocks_and_charges_direct_fixture_work_once() {
+    let (_dir, _config, lease, metadata) = two_segments(Compression::Lz4, false);
+    let path = Path::new(&metadata[0].path);
+    let bytes = fs::read(path).unwrap();
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    work.admit_compressed_file(bytes.len() as u64, path)
+        .unwrap();
+    let mut scratch = ScratchLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let mut decoded = Vec::new();
+    let mut facts = CompressedWorkFacts::default();
+    let pass = work.first_pass();
+    for (ordinal, offset) in two_block_offsets(path).into_iter().enumerate() {
+        let (encoded, decoded_len, checksum) = writer_block_frame(&bytes, offset);
+        facts = decode_bounded_block(
+            BlockFrame {
+                codec: Compression::Lz4,
+                encoded,
+                checksum,
+                decoded_len,
+            },
+            &work,
+            facts,
+            pass,
+            &mut decoded,
+            &mut scratch,
+            path,
+        )
+        .unwrap();
+        let rows = decode_entries(&decoded, path).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entry.cf.0, CATALOG_CF);
+        assert_eq!(rows[0].entry.key.as_ref(), &[ordinal as u8]);
+        assert_eq!(rows[0].entry.version.sequence, 2);
+        facts = work.check_next_row(facts, pass, path).unwrap();
+    }
+    assert_eq!(facts.blocks, 2);
+    assert_eq!(facts.rows, 2);
+    // This ledger unit test commits known writer fixture facts directly. Only
+    // the later same-handle scanner may claim a MANIFEST-authenticated pass.
+    work.accept_authenticated_file(pass, facts, path).unwrap();
+    assert_eq!(work.accepted(), facts);
+    assert_eq!(work.compressed_physical_bytes(), bytes.len() as u64);
+    assert_eq!(scratch.live_bytes(), decoded.capacity());
+    let replay = work.replay_pass(facts).unwrap();
+    let mut replay_facts = CompressedWorkFacts::default();
+    for offset in two_block_offsets(path) {
+        let (encoded, decoded_len, checksum) = writer_block_frame(&bytes, offset);
+        replay_facts = decode_bounded_block(
+            BlockFrame {
+                codec: Compression::Lz4,
+                encoded,
+                checksum,
+                decoded_len,
+            },
+            &work,
+            replay_facts,
+            replay,
+            &mut decoded,
+            &mut scratch,
+            path,
+        )
+        .unwrap();
+        replay_facts = work.check_next_row(replay_facts, replay, path).unwrap();
+    }
+    replay.require_exact_replay(replay_facts, path).unwrap();
+    assert_eq!(work.accepted(), facts);
+}
+
+#[test]
+fn bounded_lz4_helper_refuses_repaired_inner_size_and_outer_profile_before_output() {
+    let (_dir, _config, lease, metadata) = two_segments(Compression::Lz4, false);
+    let path = Path::new(&metadata[0].path);
+    let bytes = fs::read(path).unwrap();
+    let (encoded, outer, _checksum) = writer_block_frame(&bytes, 21);
+    let mut repaired = encoded.to_vec();
+    repaired[..4].copy_from_slice(&(u32::try_from(outer).unwrap() + 1).to_le_bytes());
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    work.admit_compressed_file(bytes.len() as u64, path)
+        .unwrap();
+    let mut scratch = ScratchLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let mut decoded = Vec::new();
+    let pass = work.first_pass();
+    let error = decode_bounded_block(
+        BlockFrame {
+            codec: Compression::Lz4,
+            encoded: &repaired,
+            checksum: crc32c(&repaired),
+            decoded_len: outer,
+        },
+        &work,
+        CompressedWorkFacts::default(),
+        pass,
+        &mut decoded,
+        &mut scratch,
+        path,
+    )
+    .unwrap_err();
+    assert!(matches!(error, PraxisError::Corrupt { .. }));
+    assert_eq!(decoded.capacity(), 0);
+    assert_eq!(scratch.live_bytes(), 0);
+    let error = decode_bounded_block(
+        BlockFrame {
+            codec: Compression::Lz4,
+            encoded,
+            checksum: crc32c(encoded),
+            decoded_len: 8 * 1024 * 1024 + 1,
+        },
+        &work,
+        CompressedWorkFacts::default(),
+        pass,
+        &mut decoded,
+        &mut scratch,
+        path,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        PraxisError::UnsupportedCatalogFeature { feature } if feature.contains("decoded block")
+    ));
+    assert_eq!(decoded.capacity(), 0);
+    assert_eq!(scratch.live_bytes(), 0);
+    assert_eq!(work.accepted(), CompressedWorkFacts::default());
+}
+
+#[test]
+fn compressed_work_ledger_checks_file_and_visit_caps_at_exact_claims() {
+    let (_dir, _config, _lease, metadata) = two_segments(Compression::Lz4, false);
+    let first_path = Path::new(&metadata[0].path);
+    let second_path = Path::new(&metadata[1].path);
+    let first = fs::read(first_path).unwrap();
+    let second = fs::read(second_path).unwrap();
+    let first_offsets = two_block_offsets(first_path);
+    let first_claims = first_offsets.map(|offset| writer_block_frame(&first, offset).1);
+    let exact_file_total = first_claims[0] + first_claims[1];
+    let profile = ProofProfile {
+        max_decoded_file_bytes: exact_file_total,
+        ..PRODUCTION_COMPRESSED_PROOF_PROFILE
+    };
+    let work = WorkLedger::new(profile);
+    let pass = work.first_pass();
+    let first_block = work
+        .check_next_block(
+            CompressedWorkFacts::default(),
+            first_claims[0],
+            pass,
+            first_path,
+        )
+        .unwrap();
+    let both_blocks = work
+        .check_next_block(first_block, first_claims[1], pass, first_path)
+        .unwrap();
+    assert_eq!(both_blocks.decoded_bytes, exact_file_total);
+    let narrowed = WorkLedger::new(ProofProfile {
+        max_decoded_file_bytes: exact_file_total - 1,
+        ..profile
+    });
+    let narrowed_pass = narrowed.first_pass();
+    let error = narrowed
+        .check_next_block(first_block, first_claims[1], narrowed_pass, first_path)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        PraxisError::UnsupportedCatalogFeature { .. }
+    ));
+
+    let physical_sum = first.len() as u64 + second.len() as u64;
+    let mut physical = WorkLedger::new(ProofProfile {
+        max_physical_visit_bytes: physical_sum,
+        ..PRODUCTION_COMPRESSED_PROOF_PROFILE
+    });
+    physical
+        .admit_compressed_file(first.len() as u64, first_path)
+        .unwrap();
+    physical
+        .admit_compressed_file(second.len() as u64, second_path)
+        .unwrap();
+    assert_eq!(physical.compressed_physical_bytes(), physical_sum);
+    assert!(matches!(
+        physical.admit_compressed_file(1, first_path),
+        Err(PraxisError::UnsupportedCatalogFeature { .. })
+    ));
+
+    let second_claim = writer_block_frame(&second, two_block_offsets(second_path)[0]).1;
+    let mut visit = WorkLedger::new(ProofProfile {
+        max_decoded_visit_bytes: exact_file_total + second_claim,
+        max_blocks_visit: 3,
+        max_rows_visit: 3,
+        ..PRODUCTION_COMPRESSED_PROOF_PROFILE
+    });
+    let prior_pass = visit.first_pass();
+    visit
+        .accept_authenticated_file(
+            prior_pass,
+            CompressedWorkFacts {
+                decoded_bytes: exact_file_total,
+                blocks: 2,
+                rows: 2,
+            },
+            first_path,
+        )
+        .unwrap();
+    let next_pass = visit.first_pass();
+    let second_facts = visit
+        .check_next_block(
+            CompressedWorkFacts::default(),
+            second_claim,
+            next_pass,
+            second_path,
+        )
+        .unwrap();
+    assert_eq!(second_facts.decoded_bytes, second_claim);
+    assert!(matches!(
+        visit.check_next_block(second_facts, 1, next_pass, second_path),
+        Err(PraxisError::UnsupportedCatalogFeature { .. })
+    ));
+    let second_facts = visit
+        .check_next_row(second_facts, next_pass, second_path)
+        .unwrap();
+    assert!(matches!(
+        visit.check_next_row(second_facts, next_pass, second_path),
+        Err(PraxisError::UnsupportedCatalogFeature { .. })
+    ));
+    let visit_over = WorkLedger::new(ProofProfile {
+        max_decoded_visit_bytes: exact_file_total + second_claim - 1,
+        ..PRODUCTION_COMPRESSED_PROOF_PROFILE
+    });
+    // A prior authenticated file is the only source of the visit charge.
+    let mut visit_over = visit_over;
+    let prior_pass = visit_over.first_pass();
+    visit_over
+        .accept_authenticated_file(
+            prior_pass,
+            CompressedWorkFacts {
+                decoded_bytes: exact_file_total,
+                blocks: 2,
+                rows: 2,
+            },
+            first_path,
+        )
+        .unwrap();
+    let next_pass = visit_over.first_pass();
+    assert!(matches!(
+        visit_over.check_next_block(
+            CompressedWorkFacts::default(),
+            second_claim,
+            next_pass,
+            second_path
+        ),
+        Err(PraxisError::UnsupportedCatalogFeature { .. })
+    ));
+}
+
+#[test]
+fn compressed_counters_refuse_checked_overflow_and_zero_length_claim() {
+    let path = Path::new("compressed-work-test.tseg");
+    let work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let pass = work.first_pass();
+    assert!(matches!(
+        work.check_next_block(CompressedWorkFacts::default(), 0, pass, path),
+        Err(PraxisError::Corrupt { .. })
+    ));
+    assert!(matches!(
+        work.check_next_block(
+            CompressedWorkFacts {
+                decoded_bytes: u64::MAX,
+                ..Default::default()
+            },
+            1,
+            pass,
+            path,
+        ),
+        Err(PraxisError::UnsupportedCatalogFeature { .. })
+    ));
+    assert!(matches!(
+        work.check_next_row(
+            CompressedWorkFacts {
+                rows: u64::MAX,
+                ..Default::default()
+            },
+            pass,
+            path,
+        ),
+        Err(PraxisError::UnsupportedCatalogFeature { .. })
+    ));
+}
+
+#[test]
+fn compressed_replay_uses_prior_files_and_refuses_changed_work_early() {
+    let path = Path::new("compressed-replay-test.tseg");
+    let profile = ProofProfile {
+        max_decoded_visit_bytes: 7,
+        max_blocks_visit: 7,
+        max_rows_visit: 7,
+        ..PRODUCTION_COMPRESSED_PROOF_PROFILE
+    };
+    let mut work = WorkLedger::new(profile);
+    let prior_file = CompressedWorkFacts {
+        decoded_bytes: 5,
+        blocks: 5,
+        rows: 5,
+    };
+    let prior_pass = work.first_pass();
+    work.accept_authenticated_file(prior_pass, prior_file, path)
+        .unwrap();
+    let this_file = CompressedWorkFacts {
+        decoded_bytes: 2,
+        blocks: 2,
+        rows: 2,
+    };
+    let first_pass = work.first_pass();
+    work.accept_authenticated_file(first_pass, this_file, path)
+        .unwrap();
+    assert_eq!(
+        work.accepted(),
+        CompressedWorkFacts {
+            decoded_bytes: 7,
+            blocks: 7,
+            rows: 7,
+        }
+    );
+    let replay = work.replay_pass(this_file).unwrap();
+    let one = work
+        .check_next_block(CompressedWorkFacts::default(), 1, replay, path)
+        .unwrap();
+    let two = work.check_next_block(one, 1, replay, path).unwrap();
+    let one_row = work.check_next_row(two, replay, path).unwrap();
+    let exact = work.check_next_row(one_row, replay, path).unwrap();
+    replay.require_exact_replay(exact, path).unwrap();
+    assert!(matches!(
+        replay.require_exact_replay(one_row, path),
+        Err(PraxisError::Corrupt { .. })
+    ));
+
+    // A later pass cannot consume even one more unit than the authenticated
+    // file or the visit boundary before its next decode or row callback.
+    let decoded_error = work
+        .check_next_block(
+            CompressedWorkFacts {
+                decoded_bytes: 2,
+                ..Default::default()
+            },
+            1,
+            replay,
+            path,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        decoded_error,
+        PraxisError::UnsupportedCatalogFeature { feature }
+            if feature.contains("replay decoded")
+    ));
+    let block_error = work
+        .check_next_block(
+            CompressedWorkFacts {
+                blocks: 2,
+                ..Default::default()
+            },
+            1,
+            replay,
+            path,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        block_error,
+        PraxisError::UnsupportedCatalogFeature { feature }
+            if feature.contains("replay block")
+    ));
+    let row_error = work
+        .check_next_row(
+            CompressedWorkFacts {
+                rows: 2,
+                ..Default::default()
+            },
+            replay,
+            path,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        row_error,
+        PraxisError::UnsupportedCatalogFeature { feature }
+            if feature.contains("replay") && feature.contains("row")
+    ));
+    assert!(matches!(
+        work.replay_pass(CompressedWorkFacts {
+            decoded_bytes: 8,
+            ..Default::default()
+        }),
+        Err(PraxisError::UnsupportedCatalogFeature { .. })
+    ));
+    assert_eq!(work.accepted().decoded_bytes, 7);
+}
+
+#[test]
+fn scratch_ledger_precharges_growth_and_bloom_word_overhead() {
+    let path = Path::new("compressed-scratch-test.tseg");
+    let mut short = ScratchLedger::new(ProofProfile {
+        max_decoded_block_bytes: 16,
+        max_parser_owned_peak_bytes: 95,
+        ..PRODUCTION_COMPRESSED_PROOF_PROFILE
+    });
+    let mut decoded = Vec::new();
+    assert!(matches!(
+        short.reserve_vec(ScratchSlot::Decoded, &mut decoded, 1, path),
+        Err(PraxisError::UnsupportedCatalogFeature { .. })
+    ));
+    assert_eq!(decoded.capacity(), 0);
+    assert_eq!(short.live_bytes(), 0);
+
+    let mut exact = ScratchLedger::new(ProofProfile {
+        max_decoded_block_bytes: 16,
+        max_parser_owned_peak_bytes: 96,
+        ..PRODUCTION_COMPRESSED_PROOF_PROFILE
+    });
+    exact
+        .reserve_vec(ScratchSlot::Decoded, &mut decoded, 1, path)
+        .unwrap();
+    assert!(decoded.capacity() > 0);
+    assert_eq!(exact.live_bytes(), decoded.capacity());
+    if decoded.capacity() < 16 {
+        let old_capacity = decoded.capacity();
+        assert!(matches!(
+            exact.reserve_vec(ScratchSlot::Decoded, &mut decoded, 16, path),
+            Err(PraxisError::UnsupportedCatalogFeature { .. })
+        ));
+        assert_eq!(decoded.capacity(), old_capacity);
+    }
+
+    let mut bloom = ScratchLedger::new(ProofProfile {
+        max_decoded_block_bytes: 8 * 1024 * 1024,
+        max_parser_owned_peak_bytes: 16 * 1024 * 1024 + 127,
+        ..PRODUCTION_COMPRESSED_PROOF_PROFILE
+    });
+    let mut bits = Vec::new();
+    assert!(matches!(
+        bloom.reserve_vec(ScratchSlot::BloomBits, &mut bits, 1, path),
+        Err(PraxisError::UnsupportedCatalogFeature { .. })
+    ));
+    assert_eq!(bits.capacity(), 0);
 }
 
 #[test]
