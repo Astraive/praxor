@@ -43,7 +43,8 @@ fn row_in(cf: &str, key: &[u8], sequence: u64, value: StoredValue) -> SegmentEnt
     }
 }
 
-fn two_literal_segments(
+fn two_segments(
+    compression: Compression,
     reverse_manifest_order: bool,
 ) -> (
     tempfile::TempDir,
@@ -64,7 +65,7 @@ fn two_literal_segments(
             path: &layout.segment_path(0, 1),
             id: 1,
             level: 0,
-            compression: Compression::None,
+            compression,
             accelerator: &CpuAccelerator,
             value_log: &mut value_log,
             large_value_threshold: config.large_value_threshold,
@@ -80,7 +81,7 @@ fn two_literal_segments(
             path: &layout.segment_path(1, 2),
             id: 2,
             level: 1,
-            compression: Compression::None,
+            compression,
             accelerator: &CpuAccelerator,
             value_log: &mut value_log,
             large_value_threshold: config.large_value_threshold,
@@ -101,6 +102,17 @@ fn two_literal_segments(
     manifest.next_segment_id = 3;
     ManifestStore::new(manifest_path).save(&manifest).unwrap();
     (dir, config, lease, [first, second])
+}
+
+fn two_literal_segments(
+    reverse_manifest_order: bool,
+) -> (
+    tempfile::TempDir,
+    PraxisConfig,
+    WriterLease,
+    [SegmentMetadata; 2],
+) {
+    two_segments(Compression::None, reverse_manifest_order)
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1055,6 +1067,255 @@ fn authenticated_compressed_tag_is_explicitly_unsupported() {
         "{error}"
     );
     assert_eq!(callbacks, 0);
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn writer_valid_compressed_segments_remain_fenced_today() {
+    for (compression, reverse) in [(Compression::Lz4, false), (Compression::Zstd, true)] {
+        let (dir, config, lease, metadata) = two_segments(compression, reverse);
+        let root = lease.root();
+        let manifest_path = DiskLayout::at(root).manifest_path();
+        let manifest =
+            Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+        assert_eq!(manifest.format_version, 4);
+        assert_eq!(manifest.segments.len(), 2);
+        assert_eq!(manifest.segments[0].id, if reverse { 2 } else { 1 });
+        assert_eq!(manifest.segments[1].id, if reverse { 1 } else { 2 });
+        for meta in &metadata {
+            let bytes = fs::read(&meta.path).unwrap();
+            assert_eq!(meta.entries, 2);
+            assert_eq!(
+                bytes[8],
+                if compression == Compression::Lz4 {
+                    1
+                } else {
+                    2
+                }
+            );
+            assert_eq!(
+                decode_segment(&bytes, Path::new(&meta.path), &CpuAccelerator)
+                    .unwrap()
+                    .blocks
+                    .len(),
+                2
+            );
+        }
+        let before = snapshot(dir.path());
+        let mut staged = 0;
+        with_wal_budget(root, &manifest, |budget| {
+            let wal_balance = budget.remaining_bytes();
+            let error = collect_protected_segment_candidate_for_test(
+                root,
+                &manifest,
+                budget,
+                PROTECTED_STAGE_LIMITS,
+                |count| {
+                    staged = count;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                PraxisError::UnsupportedCatalogFeature {
+                    feature: "compressed v4 segments need a bounded proof profile"
+                }
+            ));
+            assert_eq!(budget.remaining_bytes(), wal_balance);
+        });
+        assert_eq!(staged, 0);
+        assert!(matches!(
+            inspect_v4_owner(&lease, &config, &CpuAccelerator),
+            Err(PraxisError::UnsupportedCatalogFeature {
+                feature: "v4 installed cut beyond narrow D0 bootstrap"
+            })
+        ));
+        assert_eq!(snapshot(dir.path()), before);
+    }
+}
+
+fn assert_compressed_segment_provenance(compression: Compression, reverse: bool) {
+    let (dir, config, lease, metadata) = two_segments(compression, reverse);
+    let root = lease.root();
+    let manifest_path = DiskLayout::at(root).manifest_path();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    assert_eq!(manifest.segments[0].id, if reverse { 2 } else { 1 });
+    assert_eq!(manifest.segments[1].id, if reverse { 1 } else { 2 });
+    let first_offsets = two_block_offsets(Path::new(&metadata[0].path));
+    let second_offsets = two_block_offsets(Path::new(&metadata[1].path));
+    let first_source = SegmentSource {
+        level: 0,
+        id: 1,
+        manifest_ordinal: usize::from(reverse),
+    };
+    let second_source = SegmentSource {
+        level: 1,
+        id: 2,
+        manifest_ordinal: usize::from(!reverse),
+    };
+    let before = snapshot(dir.path());
+    with_wal_budget(root, &manifest, |budget| {
+        let wal_balance = budget.remaining_bytes();
+        let candidate = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+        assert_eq!(
+            wal_balance - budget.remaining_bytes(),
+            candidate.retained_witness_bytes()
+        );
+        assert_eq!(candidate.witnesses.len(), 2);
+        assert_eq!(candidate.rows.len(), 4);
+        assert_ne!(
+            candidate.witnesses[0].identity,
+            candidate.witnesses[1].identity
+        );
+        assert_eq!(
+            candidate.rows.iter().filter(|row| row.key == [0]).count(),
+            2
+        );
+        assert_eq!(
+            candidate
+                .witnesses
+                .iter()
+                .map(|w| w.source)
+                .collect::<Vec<_>>(),
+            vec![first_source, second_source]
+        );
+        for (witness, meta) in candidate.witnesses.iter().zip(&metadata) {
+            assert_eq!(witness.path.as_path(), Path::new(&meta.path));
+            assert_eq!(witness.observed_rows, 2);
+            assert_eq!(witness.len, fs::metadata(&meta.path).unwrap().len());
+            assert_eq!(witness.digest, blake3::hash(&fs::read(&meta.path).unwrap()));
+        }
+        assert_eq!(
+            candidate.rows,
+            vec![
+                expected_row(
+                    first_source,
+                    first_offsets[0],
+                    0,
+                    ObservedSegmentValue::Put(vec![0xca, 0xfe])
+                ),
+                expected_row(
+                    first_source,
+                    first_offsets[1],
+                    1,
+                    ObservedSegmentValue::Delete
+                ),
+                expected_row(
+                    second_source,
+                    second_offsets[0],
+                    0,
+                    ObservedSegmentValue::Put(vec![0xca, 0xfe])
+                ),
+                expected_row(
+                    second_source,
+                    second_offsets[1],
+                    2,
+                    ObservedSegmentValue::Merge(vec![0x22])
+                ),
+            ]
+        );
+        candidate.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), wal_balance);
+    });
+    assert!(matches!(
+        inspect_v4_owner(&lease, &config, &CpuAccelerator),
+        Err(PraxisError::UnsupportedCatalogFeature {
+            feature: "v4 installed cut beyond narrow D0 bootstrap"
+        })
+    ));
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn writer_valid_lz4_segments_preserve_physical_provenance_when_admitted() {
+    assert_compressed_segment_provenance(Compression::Lz4, false);
+}
+
+#[test]
+fn writer_valid_zstd_segments_preserve_reversed_manifest_ordinals_when_admitted() {
+    assert_compressed_segment_provenance(Compression::Zstd, true);
+}
+
+#[test]
+fn repaired_lz4_inner_size_mismatch_is_corrupt_before_callbacks() {
+    let (dir, _config, lease, _) = two_segments(Compression::Lz4, false);
+    let root = lease.root();
+    let path = DiskLayout::at(root).segment_path(0, 1);
+    let mut bytes = fs::read(&path).unwrap();
+    assert_eq!(bytes[8], 1);
+    let encoded_len = u32::from_le_bytes(bytes[21..25].try_into().unwrap()) as usize;
+    let decoded_len = u32::from_le_bytes(bytes[25..29].try_into().unwrap());
+    assert!(encoded_len >= 4);
+    assert!(33 + encoded_len <= bytes.len());
+    assert_eq!(
+        u32::from_le_bytes(bytes[33..37].try_into().unwrap()),
+        decoded_len
+    );
+    bytes[33..37].copy_from_slice(&(decoded_len + 1).to_le_bytes());
+    let checksum = crc32c(&bytes[33..33 + encoded_len]);
+    bytes[29..33].copy_from_slice(&checksum.to_le_bytes());
+    assert!(matches!(
+        decode_segment(&bytes, &path, &CpuAccelerator),
+        Err(PraxisError::Corrupt { reason, .. })
+            if reason == "LZ4 inner and segment lengths disagree"
+    ));
+    let manifest = replace_first_segment_bytes(root, &bytes);
+    assert_eq!(
+        manifest.segments[0].file_digest,
+        blake3::hash(&bytes).to_hex().to_string()
+    );
+    let before = snapshot(dir.path());
+    with_wal_budget(root, &manifest, |budget| {
+        let wal_balance = budget.remaining_bytes();
+        let mut callbacks = 0;
+        let error = visit_v4_segments(root, &manifest, budget, |_| {
+            callbacks += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&error, PraxisError::Corrupt { path: error_path, .. }
+            if error_path == &path),
+            "{error}"
+        );
+        assert_eq!(callbacks, 0);
+        assert_eq!(budget.remaining_bytes(), wal_balance);
+    });
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn oversized_lz4_outer_decoded_claim_is_refused_before_allocation() {
+    let (dir, _config, lease, _) = two_segments(Compression::Lz4, false);
+    let root = lease.root();
+    let path = DiskLayout::at(root).segment_path(0, 1);
+    let mut bytes = fs::read(&path).unwrap();
+    assert!(bytes.len() < 4096);
+    assert_eq!(bytes[8], 1);
+    bytes[25..29].copy_from_slice(&(8_u32 * 1024 * 1024 + 1).to_le_bytes());
+    let manifest = replace_first_segment_bytes(root, &bytes);
+    assert_eq!(
+        manifest.segments[0].file_digest,
+        blake3::hash(&bytes).to_hex().to_string()
+    );
+    let before = snapshot(dir.path());
+    with_wal_budget(root, &manifest, |budget| {
+        let wal_balance = budget.remaining_bytes();
+        let mut callbacks = 0;
+        let error = visit_v4_segments(root, &manifest, budget, |_| {
+            callbacks += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&error, PraxisError::UnsupportedCatalogFeature { feature }
+            if feature.contains("decoded block")),
+            "{error}"
+        );
+        assert_eq!(callbacks, 0);
+        assert_eq!(budget.remaining_bytes(), wal_balance);
+    });
     assert_eq!(snapshot(dir.path()), before);
 }
 
