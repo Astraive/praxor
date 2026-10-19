@@ -2388,17 +2388,16 @@ fn scan_compressed_opened_pass(
             ));
         }
         // Refuse forged output claims before encoded or decoded allocation.
-        if let Err(error) = work.check_next_block(facts, decoded_len, pass, path) {
-            #[cfg(test)]
-            if codec == Compression::Zstd {
-                probe(CompressedPassProbe::RefusedDecodedClaimBeforeReserve {
-                    encoded_capacity: encoded.capacity(),
-                    decoded_capacity: decoded.capacity(),
-                    native_zstd_bytes: scratch.native_zstd_bytes(),
-                });
-            }
-            return Err(error);
+        let block_admission = work.check_next_block(facts, decoded_len, pass, path);
+        #[cfg(test)]
+        if block_admission.is_err() && codec == Compression::Zstd {
+            probe(CompressedPassProbe::RefusedDecodedClaimBeforeReserve {
+                encoded_capacity: encoded.capacity(),
+                decoded_capacity: decoded.capacity(),
+                native_zstd_bytes: scratch.native_zstd_bytes(),
+            });
         }
+        block_admission?;
         let encoded_len_usize = usize::try_from(encoded_len)
             .map_err(|_| unsupported("compressed v4 encoded block exceeds platform range"))?;
         encoded.clear();
