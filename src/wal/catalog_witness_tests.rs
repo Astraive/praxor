@@ -1,6 +1,8 @@
 use super::catalog_witness::{
-    WalCut, recheck_v4_wals, scan_v4_wals, set_recheck_final_open_hook,
-    set_scan_before_first_open_hook, set_second_pass_hook,
+    ReservationKind, WalCut, charged_existing_witness_bytes_for_test, recheck_v4_wals,
+    scan_v4_wals, scan_v4_wals_with_budget, scan_v4_wals_with_budget_limit,
+    set_recheck_final_open_hook, set_reservation_failure, set_scan_before_first_open_hook,
+    set_second_pass_hook,
 };
 use super::record::{CoreWalRecord, WalRecord};
 use crate::errors::PraxisError;
@@ -103,6 +105,87 @@ fn write(root: &std::path::Path, id: u64, body: &[u8]) -> Vec<u8> {
     bytes
 }
 
+#[cfg(windows)]
+fn file_identity(path: &std::path::Path) -> (u64, [u8; 16]) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+    let file = File::open(path).unwrap();
+    let mut info = FILE_ID_INFO::default();
+    let success = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            (&raw mut info).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    assert_ne!(success, 0, "{}", std::io::Error::last_os_error());
+    (info.VolumeSerialNumber, info.FileId.Identifier)
+}
+
+#[cfg(unix)]
+fn file_identity(path: &std::path::Path) -> (u64, [u8; 16]) {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::symlink_metadata(path).unwrap();
+    let mut id = [0; 16];
+    id[..8].copy_from_slice(&meta.ino().to_le_bytes());
+    (meta.dev(), id)
+}
+
+fn snapshot_tree(
+    root: &std::path::Path,
+) -> Vec<(std::path::PathBuf, u8, Option<(u64, [u8; 16])>, Vec<u8>)> {
+    fn walk(
+        root: &std::path::Path,
+        directory: &std::path::Path,
+        snapshot: &mut Vec<(std::path::PathBuf, u8, Option<(u64, [u8; 16])>, Vec<u8>)>,
+    ) {
+        let mut paths: Vec<_> = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        paths.sort_unstable();
+        for path in paths {
+            let kind = fs::symlink_metadata(&path).unwrap().file_type();
+            let tag = if kind.is_file() {
+                0
+            } else if kind.is_dir() {
+                1
+            } else if kind.is_symlink() {
+                2
+            } else {
+                3
+            };
+            let identity = kind.is_file().then(|| file_identity(&path));
+            let bytes = if kind.is_file() {
+                fs::read(&path).unwrap()
+            } else if kind.is_symlink() {
+                fs::read_link(&path)
+                    .unwrap()
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec()
+            } else {
+                Vec::new()
+            };
+            snapshot.push((
+                path.strip_prefix(root).unwrap().to_path_buf(),
+                tag,
+                identity,
+                bytes,
+            ));
+            if kind.is_dir() {
+                walk(root, &path, snapshot);
+            }
+        }
+    }
+    let mut snapshot = Vec::new();
+    walk(root, root, &mut snapshot);
+    snapshot
+}
+
 fn empty(sequence: u64) -> Vec<u8> {
     WalRecord {
         sequence,
@@ -161,6 +244,197 @@ fn forged_huge_wal_cut_refuses_without_enumerating_claimed_range() {
         Ok(())
     });
     assert!(result.is_err());
+}
+
+#[test]
+fn wal_inventory_accepts_4096_files_and_refuses_4097_without_a_visit_or_write() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("wal")).unwrap();
+    write(root.path(), 1, BOOTSTRAP);
+    for id in 2..=4_096 {
+        fs::write(path(root.path(), id), header(id)).unwrap();
+    }
+    let mut positive_visits = 0;
+    let proofs = scan_v4_wals(root.path(), cut(0, 4_096, 4_097), |id, _, _, record| {
+        assert_eq!(id, 1);
+        assert!(matches!(record, CoreWalRecord::Catalog { .. }));
+        positive_visits += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(positive_visits, 1);
+    assert_eq!(proofs.len(), 4_096);
+    assert_eq!((proofs[0].id, proofs[4_095].id), (1, 4_096));
+    assert_eq!(proofs[0].record_count, 1);
+
+    fs::write(path(root.path(), 4_097), header(4_097)).unwrap();
+    let before = snapshot_tree(root.path());
+    let mut visits = 0;
+    let error = scan_v4_wals(root.path(), cut(0, 4_097, 4_098), |_, _, _, _| {
+        visits += 1;
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(
+        matches!(&error, PraxisError::Corrupt { reason, .. } if reason.contains("budget")),
+        "{error}"
+    );
+    assert_eq!(visits, 0);
+    assert_eq!(snapshot_tree(root.path()), before);
+}
+
+#[test]
+fn long_root_exhausts_reduced_wal_metadata_budget_before_visiting() {
+    fn minimum_accepted_budget(root: &std::path::Path) -> usize {
+        let scan_at =
+            |limit| scan_v4_wals_with_budget_limit(root, cut(0, 1, 2), limit, |_, _, _, _| Ok(()));
+        let mut rejected = 0;
+        let mut accepted = 64 * 1024;
+        assert!(scan_at(accepted).is_ok());
+        while rejected + 1 < accepted {
+            let candidate = rejected + (accepted - rejected) / 2;
+            match scan_at(candidate) {
+                Ok(_) => accepted = candidate,
+                Err(PraxisError::Corrupt { reason, .. }) if reason.contains("budget") => {
+                    rejected = candidate;
+                }
+                Err(error) => panic!("unexpected budget calibration error: {error}"),
+            }
+        }
+        accepted
+    }
+
+    let short = tempfile::tempdir().unwrap();
+    fs::create_dir(short.path().join("wal")).unwrap();
+    write(short.path(), 1, BOOTSTRAP);
+    let long = short.path().join("x".repeat(55)).join("y".repeat(55));
+    fs::create_dir_all(long.join("wal")).unwrap();
+    write(&long, 1, BOOTSTRAP);
+    let short_minimum = minimum_accepted_budget(short.path());
+    let long_minimum = minimum_accepted_budget(&long);
+    assert!(
+        short_minimum < long_minimum,
+        "short budget {short_minimum} must precede long budget {long_minimum}"
+    );
+    let limit = short_minimum + (long_minimum - short_minimum) / 2;
+    let mut short_visits = 0;
+    let short_proofs =
+        scan_v4_wals_with_budget_limit(short.path(), cut(0, 1, 2), limit, |_, _, _, _| {
+            short_visits += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!((short_visits, short_proofs.len()), (1, 1));
+
+    let before = snapshot_tree(short.path());
+    let mut long_visits = 0;
+    let error = scan_v4_wals_with_budget_limit(&long, cut(0, 1, 2), limit, |_, _, _, _| {
+        long_visits += 1;
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(
+        matches!(&error, PraxisError::Corrupt { reason, .. } if reason.contains("budget")),
+        "{error}"
+    );
+    assert_eq!(long_visits, 0);
+    assert_eq!(snapshot_tree(short.path()), before);
+}
+
+#[test]
+fn wal_inventory_reservation_failures_refuse_without_visiting_or_mutating() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("wal")).unwrap();
+    let bytes = write(root.path(), 1, BOOTSTRAP);
+    for kind in [
+        ReservationKind::Listed,
+        ReservationKind::Physical,
+        ReservationKind::Witness,
+    ] {
+        set_reservation_failure(kind);
+        let mut visits = 0;
+        let error = scan_v4_wals(root.path(), cut(0, 1, 2), |_, _, _, _| {
+            visits += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&error, PraxisError::Corrupt { reason, .. } if reason.contains("budget reservation")),
+            "{error}"
+        );
+        assert_eq!(visits, 0);
+        assert_eq!(fs::read(path(root.path(), 1)).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn wal_witness_budget_remaining_accounts_for_retained_proofs() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("wal")).unwrap();
+    write(root.path(), 1, BOOTSTRAP);
+    let (proofs, mut budget) =
+        scan_v4_wals_with_budget(root.path(), cut(0, 1, 2), |_, _, _, _| Ok(())).unwrap();
+    assert_eq!(proofs.len(), 1);
+    assert!(budget.remaining_bytes() < 64 * 1024 * 1024);
+    let remaining = budget.remaining_bytes();
+    budget.charge(root.path(), remaining).unwrap();
+    assert_eq!(budget.remaining_bytes(), 0);
+    let error = budget.charge(root.path(), 1).unwrap_err();
+    assert!(matches!(error, PraxisError::Corrupt { .. }));
+}
+
+#[test]
+fn recheck_budget_charges_existing_path_capacity() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("wal")).unwrap();
+    write(root.path(), 1, BOOTSTRAP);
+    let mut proofs = scan_v4_wals(root.path(), cut(0, 1, 2), |_, _, _, _| Ok(())).unwrap();
+    let ordinary = charged_existing_witness_bytes_for_test(&proofs, root.path()).unwrap();
+    proofs[0].path.reserve(4_096);
+    let padded_capacity = proofs[0].path.capacity();
+    let padded = charged_existing_witness_bytes_for_test(&proofs, root.path()).unwrap();
+    assert!(padded > ordinary, "ordinary {ordinary}, padded {padded}");
+    assert!(padded >= padded_capacity);
+    recheck_v4_wals(root.path(), cut(0, 1, 2), &proofs).unwrap();
+}
+
+#[test]
+fn many_wal_frames_do_not_accumulate_witness_inventory_memory() {
+    fn scan_frames(count: u64) -> AllocationStats {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("wal")).unwrap();
+        let mut file = File::create(path(root.path(), 1)).unwrap();
+        file.write_all(&header(1)).unwrap();
+        for sequence in 1..=count {
+            file.write_all(&empty(sequence)).unwrap();
+        }
+        drop(file);
+        let cut = WalCut {
+            flushed_sequence: 0,
+            last_sequence: count,
+            flushed_wal_id: 0,
+            active_wal_id: 1,
+            next_wal_id: 2,
+        };
+        let (proofs, stats) =
+            measure(|| scan_v4_wals(root.path(), cut, |_, _, _, _| Ok(())).unwrap());
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0].record_count, count);
+        stats
+    }
+    let few = scan_frames(32);
+    let many = scan_frames(4_096);
+    assert!(
+        many.peak <= few.peak + 512 * 1024,
+        "few peak {}, many peak {}",
+        few.peak,
+        many.peak
+    );
+    assert!(
+        many.max_request <= 512 * 1024,
+        "largest {}",
+        many.max_request
+    );
 }
 
 #[test]

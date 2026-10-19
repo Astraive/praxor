@@ -18,6 +18,8 @@ const CHUNK: usize = 64 * 1024;
 const FILE_MAGIC: u32 = 0x5457_4146;
 const FILE_VERSION: u32 = 1;
 const FILE_HEADER_LEN: u64 = 16;
+const MAX_OBSERVED_WAL_FILES: usize = 4_096;
+const PHYSICAL_WITNESS_METADATA_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct PhysicalId {
@@ -109,6 +111,188 @@ struct ListedFile {
     identity: PhysicalId,
 }
 
+struct Inventory {
+    files: Vec<ListedFile>,
+    // The listed vector and its retained paths remain live after the
+    // temporary physical-ID set has been released.
+    charged_bytes: usize,
+}
+
+/// Conservative remaining metadata admission for a future physical owner.
+/// Frame decoding has its own independent bounded workspace.
+#[derive(Debug)]
+pub(crate) struct PhysicalWitnessBudget {
+    limit: usize,
+    used: usize,
+}
+
+impl PhysicalWitnessBudget {
+    fn new(limit: usize) -> Self {
+        Self { limit, used: 0 }
+    }
+
+    #[allow(dead_code)] // Consumed by the later #75 segment/value inventory.
+    pub(crate) fn remaining_bytes(&self) -> usize {
+        self.limit - self.used
+    }
+
+    pub(crate) fn charge(&mut self, path: &Path, bytes: usize) -> Result<()> {
+        self.used = self
+            .used
+            .checked_add(bytes)
+            .filter(|used| *used <= self.limit)
+            .ok_or_else(|| budget_error(path))?;
+        Ok(())
+    }
+
+    fn release(&mut self, path: &Path, bytes: usize) -> Result<()> {
+        self.used = budget_arithmetic(path, self.used.checked_sub(bytes))?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum ReservationKind {
+    Listed,
+    Physical,
+    Witness,
+}
+
+fn budget_error(path: &Path) -> PraxisError {
+    corrupt(path, "v4 WAL physical witness metadata budget exceeded")
+}
+
+fn budget_arithmetic<T>(path: &Path, value: Option<T>) -> Result<T> {
+    value.ok_or_else(|| budget_error(path))
+}
+
+fn path_charge(path: &Path) -> Result<usize> {
+    // Windows native paths may use two bytes per encoded ASCII byte. Allow
+    // additional capacity and allocator slack for every retained path and
+    // cloned witness path, rather than charging only the logical filename.
+    let encoded = path.as_os_str().as_encoded_bytes().len();
+    budget_arithmetic(path, encoded.checked_mul(6).and_then(|n| n.checked_add(64)))
+}
+
+fn vector_charge<T>(path: &Path, capacity: usize) -> Result<usize> {
+    if capacity == 0 {
+        return Ok(0);
+    }
+    budget_arithmetic(
+        path,
+        capacity
+            .checked_mul(std::mem::size_of::<T>())
+            .and_then(|n| n.checked_mul(2))
+            .and_then(|n| n.checked_add(64)),
+    )
+}
+
+fn physical_set_charge(path: &Path, capacity: usize) -> Result<usize> {
+    if capacity == 0 {
+        return Ok(0);
+    }
+    // HashSet::capacity counts usable elements, not all buckets. This
+    // includes bucket/control overhead and a further twofold allowance.
+    budget_arithmetic(
+        path,
+        capacity
+            .checked_mul(std::mem::size_of::<PhysicalId>() + 8)
+            .and_then(|n| n.checked_mul(2))
+            .and_then(|n| n.checked_add(64)),
+    )
+}
+
+fn next_capacity(path: &Path, current: usize) -> Result<usize> {
+    let next = if current == 0 {
+        4
+    } else {
+        budget_arithmetic(path, current.checked_mul(2))?
+    };
+    Ok(next.min(MAX_OBSERVED_WAL_FILES))
+}
+
+fn check_reservation(kind: ReservationKind, path: &Path) -> Result<()> {
+    #[cfg(test)]
+    if RESERVATION_FAILURE.with(|slot| {
+        if slot.get() == Some(kind) {
+            slot.set(None);
+            true
+        } else {
+            false
+        }
+    }) {
+        return Err(corrupt(
+            path,
+            "v4 WAL physical witness budget reservation failed",
+        ));
+    }
+    let _ = kind;
+    let _ = path;
+    Ok(())
+}
+
+fn reserve_vector<T>(
+    vec: &mut Vec<T>,
+    kind: ReservationKind,
+    path: &Path,
+    budget: &mut PhysicalWitnessBudget,
+) -> Result<()> {
+    if vec.len() < vec.capacity() {
+        return Ok(());
+    }
+    let old_charge = vector_charge::<T>(path, vec.capacity())?;
+    let target = next_capacity(path, vec.capacity())?;
+    let prospective = budget_arithmetic(path, target.checked_mul(2))?;
+    let reserved_charge = vector_charge::<T>(path, prospective)?;
+    // During a reallocation, the old and new buffers may overlap in life.
+    budget.charge(path, reserved_charge)?;
+    check_reservation(kind, path)?;
+    vec.try_reserve_exact(target - vec.len())
+        .map_err(|_| corrupt(path, "v4 WAL physical witness budget reservation failed"))?;
+    let actual_charge = vector_charge::<T>(path, vec.capacity())?;
+    if actual_charge > reserved_charge {
+        return Err(budget_error(path));
+    }
+    let refund = budget_arithmetic(
+        path,
+        old_charge
+            .checked_add(reserved_charge)
+            .and_then(|n| n.checked_sub(actual_charge)),
+    )?;
+    budget.release(path, refund)?;
+    Ok(())
+}
+
+fn reserve_physical_set(
+    set: &mut HashSet<PhysicalId>,
+    path: &Path,
+    budget: &mut PhysicalWitnessBudget,
+) -> Result<()> {
+    if set.len() < set.capacity() {
+        return Ok(());
+    }
+    let old_charge = physical_set_charge(path, set.capacity())?;
+    let target = next_capacity(path, set.capacity())?;
+    let prospective = budget_arithmetic(path, target.checked_mul(2))?;
+    let reserved_charge = physical_set_charge(path, prospective)?;
+    budget.charge(path, reserved_charge)?;
+    check_reservation(ReservationKind::Physical, path)?;
+    set.try_reserve(target - set.len())
+        .map_err(|_| corrupt(path, "v4 WAL physical witness budget reservation failed"))?;
+    let actual_charge = physical_set_charge(path, set.capacity())?;
+    if actual_charge > reserved_charge {
+        return Err(budget_error(path));
+    }
+    let refund = budget_arithmetic(
+        path,
+        old_charge
+            .checked_add(reserved_charge)
+            .and_then(|n| n.checked_sub(actual_charge)),
+    )?;
+    budget.release(path, refund)?;
+    Ok(())
+}
+
 fn corrupt(path: &Path, reason: &'static str) -> PraxisError {
     PraxisError::Corrupt {
         path: path.to_path_buf(),
@@ -154,7 +338,7 @@ fn parse_id(path: &Path) -> Result<u64> {
     Ok(id)
 }
 
-fn inventory(root: &Path, cut: WalCut) -> Result<Vec<ListedFile>> {
+fn inventory(root: &Path, cut: WalCut, budget: &mut PhysicalWitnessBudget) -> Result<Inventory> {
     if cut.flushed_sequence > cut.last_sequence
         || cut.active_wal_id == 0
         || cut.flushed_wal_id >= cut.active_wal_id
@@ -169,7 +353,11 @@ fn inventory(root: &Path, cut: WalCut) -> Result<Vec<ListedFile>> {
     }
     let mut listed = Vec::new();
     let mut physical = HashSet::new();
+    let mut retained_path_bytes = 0usize;
     for entry in fs::read_dir(&wal_dir)? {
+        if listed.len() == MAX_OBSERVED_WAL_FILES {
+            return Err(corrupt(&wal_dir, "v4 WAL observed-file budget exceeded"));
+        }
         let path = entry?.path();
         let id = parse_id(&path)?;
         if id > cut.active_wal_id {
@@ -183,6 +371,15 @@ fn inventory(root: &Path, cut: WalCut) -> Result<Vec<ListedFile>> {
         // next entry, avoiding O(file count) operating-system handles.
         let file = File::open(&path)?;
         let identity = physical_id(&file, &path)?;
+        let charged_path = path_charge(&path)?;
+        if path.capacity() > charged_path {
+            return Err(budget_error(&path));
+        }
+        budget.charge(&path, charged_path)?;
+        retained_path_bytes =
+            budget_arithmetic(&path, retained_path_bytes.checked_add(charged_path))?;
+        reserve_vector(&mut listed, ReservationKind::Listed, &path, budget)?;
+        reserve_physical_set(&mut physical, &path, budget)?;
         if !physical.insert(identity) {
             return Err(corrupt(&path, "v4 WAL files alias the same physical file"));
         }
@@ -201,14 +398,17 @@ fn inventory(root: &Path, cut: WalCut) -> Result<Vec<ListedFile>> {
     if previous != cut.active_wal_id {
         return Err(corrupt(&wal_dir, "active v4 WAL is absent"));
     }
-    Ok(listed)
-}
-
-fn recheck_inventory(root: &Path, cut: WalCut, initial: &[ListedFile]) -> Result<()> {
-    if inventory(root, cut)? != initial {
-        return Err(corrupt(&root.join("wal"), "v4 WAL namespace changed"));
-    }
-    Ok(())
+    let charged_bytes = budget_arithmetic(
+        &wal_dir,
+        retained_path_bytes.checked_add(vector_charge::<ListedFile>(&wal_dir, listed.capacity())?),
+    )?;
+    let physical_bytes = physical_set_charge(&wal_dir, physical.capacity())?;
+    drop(physical);
+    budget.release(&wal_dir, physical_bytes)?;
+    Ok(Inventory {
+        files: listed,
+        charged_bytes,
+    })
 }
 
 fn hash_exact(file: &mut File, len: u64) -> Result<blake3::Hash> {
@@ -267,6 +467,7 @@ fn scan_file(
     listed: &ListedFile,
     active: bool,
     cut: WalCut,
+    witness_path: PathBuf,
     visit: &mut impl FnMut(u64, u64, u64, &CoreWalRecord) -> Result<()>,
 ) -> Result<WalFileWitness> {
     check_real(&listed.path)?;
@@ -293,7 +494,7 @@ fn scan_file(
     let mut offset = FILE_HEADER_LEN;
     let mut result = WalFileWitness {
         id: listed.id,
-        path: listed.path.clone(),
+        path: witness_path,
         cut,
         identity: listed.identity,
         full_len: len,
@@ -434,6 +635,13 @@ thread_local! {
         std::cell::RefCell::new(None);
     static SCAN_BEFORE_FIRST_OPEN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    static RESERVATION_FAILURE: std::cell::Cell<Option<ReservationKind>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn set_reservation_failure(kind: ReservationKind) {
+    RESERVATION_FAILURE.with(|slot| slot.set(Some(kind)));
 }
 
 #[cfg(test)]
@@ -478,33 +686,56 @@ fn scan_before_first_open_hook() {
     });
 }
 
-pub(crate) fn scan_v4_wals(
-    root: &Path,
-    cut: WalCut,
-    mut visit: impl FnMut(u64, u64, u64, &CoreWalRecord) -> Result<()>,
-) -> Result<Vec<WalFileWitness>> {
-    let listed = inventory(root, cut)?;
-    scan_before_first_open_hook();
-    let mut result = Vec::new();
-    for item in &listed {
-        result.push(scan_file(
-            item,
-            item.id == cut.active_wal_id,
-            cut,
-            &mut visit,
-        )?);
+fn clone_witness_path(path: &Path) -> Result<PathBuf> {
+    let mut copy = PathBuf::new();
+    let native_capacity = budget_arithmetic(
+        path,
+        path.as_os_str().as_encoded_bytes().len().checked_mul(2),
+    )?;
+    copy.try_reserve_exact(native_capacity)
+        .map_err(|_| corrupt(path, "v4 WAL physical witness budget reservation failed"))?;
+    copy.push(path);
+    if copy.capacity() > path_charge(path)? {
+        return Err(budget_error(path));
     }
-    recheck_inventory(root, cut, &listed)?;
-    Ok(result)
+    Ok(copy)
 }
 
-/// Recheck evidence immediately before a future fenced owner may use it.
-pub(crate) fn recheck_v4_wals(
+fn precharge_witnesses(
+    witnesses: &[WalFileWitness],
+    root: &Path,
+    budget: &mut PhysicalWitnessBudget,
+) -> Result<()> {
+    if witnesses.len() > MAX_OBSERVED_WAL_FILES {
+        return Err(corrupt(root, "v4 WAL observed-file budget exceeded"));
+    }
+    // A slice does not expose its backing Vec capacity. Carry a twofold
+    // allowance, matching the precharge made by the producing scanner.
+    let prospective = budget_arithmetic(root, witnesses.len().checked_mul(2))?;
+    budget.charge(root, vector_charge::<WalFileWitness>(root, prospective)?)?;
+    for witness in witnesses {
+        let conservative = path_charge(&witness.path)?;
+        budget.charge(&witness.path, conservative.max(witness.path.capacity()))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn charged_existing_witness_bytes_for_test(
+    witnesses: &[WalFileWitness],
+    root: &Path,
+) -> Result<usize> {
+    let mut budget = PhysicalWitnessBudget::new(PHYSICAL_WITNESS_METADATA_BYTES);
+    precharge_witnesses(witnesses, root, &mut budget)?;
+    Ok(PHYSICAL_WITNESS_METADATA_BYTES - budget.remaining_bytes())
+}
+
+fn inventory_matches_witnesses(
     root: &Path,
     cut: WalCut,
+    listed: &[ListedFile],
     witnesses: &[WalFileWitness],
 ) -> Result<()> {
-    let listed = inventory(root, cut)?;
     if listed.len() != witnesses.len() {
         return Err(corrupt(&root.join("wal"), "v4 WAL inventory changed"));
     }
@@ -516,6 +747,107 @@ pub(crate) fn recheck_v4_wals(
         {
             return Err(corrupt(&item.path, "v4 WAL inventory identity changed"));
         }
+    }
+    Ok(())
+}
+
+fn scan_v4_wals_with_limit(
+    root: &Path,
+    cut: WalCut,
+    limit: usize,
+    mut visit: impl FnMut(u64, u64, u64, &CoreWalRecord) -> Result<()>,
+) -> Result<(Vec<WalFileWitness>, PhysicalWitnessBudget)> {
+    let mut budget = PhysicalWitnessBudget::new(limit);
+    let listed = inventory(root, cut, &mut budget)?;
+    let mut result = Vec::new();
+    let mut prepared_paths = Vec::new();
+    let mut prepared_charge = 0;
+    if !listed.files.is_empty() {
+        // Charge both the live listed inventory and all prospective witness
+        // paths/vector before a single callback can observe a record.
+        let prospective = budget_arithmetic(root, listed.files.len().checked_mul(2))?;
+        budget.charge(root, vector_charge::<WalFileWitness>(root, prospective)?)?;
+        for item in &listed.files {
+            budget.charge(&item.path, path_charge(&item.path)?)?;
+        }
+        prepared_charge = vector_charge::<PathBuf>(root, prospective)?;
+        budget.charge(root, prepared_charge)?;
+        check_reservation(ReservationKind::Witness, root)?;
+        result
+            .try_reserve_exact(listed.files.len())
+            .map_err(|_| corrupt(root, "v4 WAL physical witness budget reservation failed"))?;
+        if result.capacity() > prospective {
+            return Err(budget_error(root));
+        }
+        prepared_paths
+            .try_reserve_exact(listed.files.len())
+            .map_err(|_| corrupt(root, "v4 WAL physical witness budget reservation failed"))?;
+        if prepared_paths.capacity() > prospective {
+            return Err(budget_error(root));
+        }
+        for item in &listed.files {
+            prepared_paths.push(clone_witness_path(&item.path)?);
+        }
+    }
+    scan_before_first_open_hook();
+    for (item, witness_path) in listed.files.iter().zip(prepared_paths.into_iter()) {
+        result.push(scan_file(
+            item,
+            item.id == cut.active_wal_id,
+            cut,
+            witness_path,
+            &mut visit,
+        )?);
+    }
+    budget.release(root, prepared_charge)?;
+    let initial_charge = listed.charged_bytes;
+    drop(listed);
+    budget.release(root, initial_charge)?;
+    let final_inventory = inventory(root, cut, &mut budget)?;
+    inventory_matches_witnesses(root, cut, &final_inventory.files, &result)?;
+    let final_charge = final_inventory.charged_bytes;
+    drop(final_inventory);
+    budget.release(root, final_charge)?;
+    Ok((result, budget))
+}
+
+pub(crate) fn scan_v4_wals_with_budget(
+    root: &Path,
+    cut: WalCut,
+    visit: impl FnMut(u64, u64, u64, &CoreWalRecord) -> Result<()>,
+) -> Result<(Vec<WalFileWitness>, PhysicalWitnessBudget)> {
+    scan_v4_wals_with_limit(root, cut, PHYSICAL_WITNESS_METADATA_BYTES, visit)
+}
+
+pub(crate) fn scan_v4_wals(
+    root: &Path,
+    cut: WalCut,
+    visit: impl FnMut(u64, u64, u64, &CoreWalRecord) -> Result<()>,
+) -> Result<Vec<WalFileWitness>> {
+    scan_v4_wals_with_budget(root, cut, visit).map(|(witnesses, _)| witnesses)
+}
+
+#[cfg(test)]
+pub(super) fn scan_v4_wals_with_budget_limit(
+    root: &Path,
+    cut: WalCut,
+    limit: usize,
+    visit: impl FnMut(u64, u64, u64, &CoreWalRecord) -> Result<()>,
+) -> Result<Vec<WalFileWitness>> {
+    scan_v4_wals_with_limit(root, cut, limit, visit).map(|(witnesses, _)| witnesses)
+}
+
+/// Recheck evidence immediately before a future fenced owner may use it.
+pub(crate) fn recheck_v4_wals(
+    root: &Path,
+    cut: WalCut,
+    witnesses: &[WalFileWitness],
+) -> Result<()> {
+    let mut budget = PhysicalWitnessBudget::new(PHYSICAL_WITNESS_METADATA_BYTES);
+    precharge_witnesses(witnesses, root, &mut budget)?;
+    let listed = inventory(root, cut, &mut budget)?;
+    inventory_matches_witnesses(root, cut, &listed.files, witnesses)?;
+    for (item, expected) in listed.files.iter().zip(witnesses) {
         check_real(&item.path)?;
         let mut file = File::open(&item.path)?;
         if physical_id(&file, &item.path)? != expected.identity
@@ -540,6 +872,10 @@ pub(crate) fn recheck_v4_wals(
             return Err(corrupt(&item.path, "v4 WAL path changed after scan"));
         }
     }
-    recheck_inventory(root, cut, &listed)?;
+    let initial_charge = listed.charged_bytes;
+    drop(listed);
+    budget.release(root, initial_charge)?;
+    let final_inventory = inventory(root, cut, &mut budget)?;
+    inventory_matches_witnesses(root, cut, &final_inventory.files, witnesses)?;
     Ok(())
 }
