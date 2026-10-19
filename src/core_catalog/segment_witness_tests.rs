@@ -444,6 +444,58 @@ fn assert_segment_corrupt_without_mutation(
     assert_eq!(snapshot(root), before);
 }
 
+#[test]
+fn relative_manifest_segment_path_refuses_before_callbacks_without_mutation() {
+    let (_dir, _config, lease, metadata) = two_literal_segments(false);
+    let root = lease.root();
+    let layout = DiskLayout::at(root);
+    let manifest_path = layout.manifest_path();
+    let mut manifest =
+        Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    let canonical_id2 = layout.segment_path(1, 2);
+    let relative_id2 = PathBuf::from("segments")
+        .join("1")
+        .join(format!("{:020}.tseg", 2_u64));
+    assert!(relative_id2.is_relative());
+    assert_eq!(root.join(&relative_id2), canonical_id2);
+    assert_ne!(relative_id2.to_str().unwrap(), metadata[1].path);
+
+    let mut changed_id2 = metadata[1].clone();
+    changed_id2.path = relative_id2.to_str().unwrap().to_owned();
+    manifest.segments[1] = changed_id2.clone();
+    let saved = save_strict_manifest(root, &manifest);
+    assert_eq!(saved.segments[0], metadata[0]);
+    assert_eq!(saved.segments[1], changed_id2);
+    assert_segment_corrupt_without_mutation(
+        root,
+        &saved,
+        &canonical_id2,
+        "noncanonical v4 segment MANIFEST path",
+    );
+}
+
+#[test]
+fn external_segment_hardlink_refuses_before_callbacks_without_mutation() {
+    let (_dir, _config, lease, _) = two_literal_segments(false);
+    let root = lease.root();
+    let layout = DiskLayout::at(root);
+    let id1_path = layout.segment_path(0, 1);
+    let alias = root.join("external-segment-alias");
+    fs::hard_link(&id1_path, &alias).unwrap();
+    assert!(id1_path.is_file());
+    assert!(alias.is_file());
+    assert_eq!(file_id(&id1_path), file_id(&alias));
+
+    let manifest_path = layout.manifest_path();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    assert_segment_corrupt_without_mutation(
+        root,
+        &manifest,
+        &id1_path,
+        "v4 segment has an external hardlink alias",
+    );
+}
+
 #[derive(Clone, Copy)]
 struct FooterFieldPositions {
     first_key: usize,
