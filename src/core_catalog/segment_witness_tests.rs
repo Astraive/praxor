@@ -2897,6 +2897,78 @@ fn private_zstd_pass1_rejects_repaired_magic_offset_and_overcap_claim() {
 }
 
 #[test]
+fn private_zstd_pass1_refuses_second_overcap_claim_with_prior_block_charge() {
+    let (dir, _config, lease, metadata) = two_segments(Compression::Zstd, false);
+    let root = lease.root();
+    let path = Path::new(&metadata[0].path);
+    let original = fs::read(path).unwrap();
+    let [first_offset, second_offset] = two_block_offsets(path);
+    assert_eq!(first_offset, 21);
+    let (first_encoded, first_decoded_len, _) = writer_block_frame(&original, first_offset);
+    let (second_encoded, second_decoded_len, _) = writer_block_frame(&original, second_offset);
+    assert!(!first_encoded.is_empty());
+    assert!(first_decoded_len > 0);
+    assert!(first_decoded_len <= PRODUCTION_COMPRESSED_PROOF_PROFILE.max_decoded_block_bytes);
+    assert!(second_decoded_len <= PRODUCTION_COMPRESSED_PROOF_PROFILE.max_decoded_block_bytes);
+    assert_eq!(
+        second_offset,
+        first_offset + 12 + first_encoded.len() as u64
+    );
+
+    let second_start = usize::try_from(second_offset).unwrap();
+    let mut overcap = original.clone();
+    let refused_len =
+        u32::try_from(PRODUCTION_COMPRESSED_PROOF_PROFILE.max_decoded_block_bytes + 1).unwrap();
+    overcap[second_start + 4..second_start + 8].copy_from_slice(&refused_len.to_le_bytes());
+    assert_eq!(&overcap[..second_start], &original[..second_start]);
+    assert_eq!(overcap.len(), original.len());
+    assert_eq!(
+        writer_block_frame(&overcap, second_offset).0,
+        second_encoded
+    );
+
+    let manifest = replace_first_segment_bytes(root, &overcap);
+    let altered = manifest.segments.iter().find(|meta| meta.id == 1).unwrap();
+    assert_eq!(
+        altered.file_digest,
+        blake3::hash(&overcap).to_hex().to_string()
+    );
+    assert_eq!(fs::read(path).unwrap(), overcap);
+    let before = snapshot(dir.path());
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let mut probes = Vec::new();
+    let error = direct_zstd_pass1(altered, &mut work, |event| probes.push(event)).unwrap_err();
+    assert!(
+        matches!(error, PraxisError::UnsupportedCatalogFeature { feature }
+        if feature == "compressed v4 decoded block exceeds proof profile")
+    );
+    assert_eq!(probes.len(), 2);
+    assert_eq!(probes[0], ZstdPassProbe::AfterFooterPreread);
+    let ZstdPassProbe::RefusedDecodedClaimBeforeReserve {
+        encoded_capacity,
+        decoded_capacity,
+        native_zstd_bytes,
+    } = probes[1]
+    else {
+        panic!("second-block refusal did not report retained scratch");
+    };
+    assert!(encoded_capacity > 0);
+    assert!(decoded_capacity > 0);
+    assert!(encoded_capacity >= first_encoded.len());
+    assert!(decoded_capacity >= usize::try_from(first_decoded_len).unwrap());
+    assert!(native_zstd_bytes > 0);
+    assert!(
+        native_zstd_bytes <= PRODUCTION_COMPRESSED_PROOF_PROFILE.max_zstd_native_workspace_bytes
+    );
+    assert!(
+        encoded_capacity + decoded_capacity + native_zstd_bytes
+            <= PRODUCTION_COMPRESSED_PROOF_PROFILE.max_parser_owned_peak_bytes
+    );
+    assert_eq!(work.accepted(), CompressedWorkFacts::default());
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
 fn private_zstd_pass1_rejects_reencoded_excess_row_count_after_repaired_framing() {
     let (_dir, _config, lease, metadata) = two_segments(Compression::Zstd, false);
     let root = lease.root();
