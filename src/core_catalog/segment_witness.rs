@@ -9,6 +9,7 @@ use crate::errors::{PraxisError, Result};
 use crate::io::{BinaryReader, crc32c};
 use crate::manifest::{Manifest, SegmentMetadata};
 use crate::segments::BloomFilter;
+use crate::segments::bloom::BloomBuildError;
 use crate::segments::format::{SEGMENT_FOOTER_MAGIC, SEGMENT_MAGIC, SEGMENT_VERSION};
 use crate::types::ValuePointer;
 use crate::wal::catalog_witness::{
@@ -411,18 +412,26 @@ impl ScratchSlot {
         self as usize
     }
 
-    const fn logical_limit(self, profile: ProofProfile) -> u64 {
-        match self {
+    fn logical_limit(self, profile: ProofProfile) -> Result<usize> {
+        if matches!(self, Self::BloomBits) {
+            let max_rows = usize::try_from(profile.max_rows_file)
+                .map_err(|_| unsupported("compressed v4 Bloom row limit exceeds platform range"))?;
+            return BloomFilter::observed_bits_len_bytes(max_rows)
+                .map_err(|_| unsupported("compressed v4 Bloom shape exceeds platform range"));
+        }
+        let bytes = match self {
             Self::Encoded => profile.max_encoded_block_bytes,
             Self::Footer => profile.max_footer_bytes,
             Self::Decoded
             | Self::Previous
             | Self::BloomScratch
-            | Self::BloomBits
             | Self::OwnedCf
             | Self::OwnedKey
             | Self::OwnedValue => profile.max_decoded_block_bytes,
-        }
+            Self::BloomBits => unreachable!("Bloom bits use their row-derived bound"),
+        };
+        usize::try_from(bytes)
+            .map_err(|_| unsupported("compressed v4 scratch limit exceeds platform range"))
     }
 
     const fn allowance_overhead(self) -> usize {
@@ -673,8 +682,7 @@ impl ScratchLedger {
                 "compressed v4 scratch accounting is inconsistent",
             ));
         }
-        let logical_limit = usize::try_from(slot.logical_limit(self.profile))
-            .map_err(|_| unsupported("compressed v4 scratch limit exceeds platform range"))?;
+        let logical_limit = slot.logical_limit(self.profile)?;
         if required_len > logical_limit {
             return Err(unsupported(
                 "compressed v4 scratch vector exceeds proof profile",
@@ -733,6 +741,103 @@ impl ScratchLedger {
                 "compressed v4 scratch live bytes exceed proof profile",
             ));
         }
+        Ok(())
+    }
+
+    /// Charge the maximum permitted Vec<u64> layout before the hidden Bloom
+    /// allocation, then retain only its reported live capacity. The full
+    /// allowance overlaps every parser buffer already enrolled here.
+    pub(super) fn reserve_observed_bloom(
+        &mut self,
+        observed_rows: u64,
+        path: &Path,
+    ) -> Result<BloomFilter> {
+        let slot = ScratchSlot::BloomBits.index();
+        if self.poisoned || self.capacities[slot] != 0 {
+            self.poisoned = true;
+            return Err(unsupported(
+                "compressed v4 Bloom scratch accounting is inconsistent",
+            ));
+        }
+        let rows = usize::try_from(observed_rows)
+            .map_err(|_| unsupported("compressed v4 Bloom rows exceed platform range"))?;
+        let max_rows = usize::try_from(self.profile.max_rows_file)
+            .map_err(|_| unsupported("compressed v4 Bloom row limit exceeds platform range"))?;
+        if rows > max_rows {
+            return Err(unsupported("compressed v4 Bloom rows exceed proof profile"));
+        }
+        let allowance = BloomFilter::observed_bits_capacity_limit_bytes(max_rows)
+            .map_err(|_| unsupported("compressed v4 Bloom shape exceeds platform range"))?;
+        let peak = self
+            .live_bytes
+            .checked_add(allowance)
+            .ok_or_else(|| unsupported("compressed v4 Bloom peak counter overflow"))?;
+        if peak > self.profile.max_parser_owned_peak_bytes {
+            return Err(unsupported(
+                "compressed v4 Bloom peak exceeds proof profile",
+            ));
+        }
+        self.capacities[slot] = allowance;
+        self.live_bytes = peak;
+        let built = BloomFilter::try_with_observed_items(rows, max_rows);
+        let bloom = match built {
+            Ok(bloom) => bloom,
+            Err(error) => {
+                self.capacities[slot] = 0;
+                self.live_bytes -= allowance;
+                return Err(match error {
+                    BloomBuildError::AllocationFailed => {
+                        corrupt(path, "compressed v4 Bloom allocation failed")
+                    }
+                    _ => unsupported("compressed v4 Bloom shape exceeds proof profile"),
+                });
+            }
+        };
+        let actual = bloom.observed_bits_capacity_bytes().unwrap_or(usize::MAX);
+        if actual > allowance {
+            drop(bloom);
+            self.capacities[slot] = 0;
+            self.live_bytes -= allowance;
+            return Err(unsupported(
+                "compressed v4 Bloom capacity exceeds proof profile",
+            ));
+        }
+        self.capacities[slot] = actual;
+        self.live_bytes -= allowance - actual;
+        Ok(bloom)
+    }
+
+    pub(super) fn release_observed_bloom(
+        &mut self,
+        bloom: BloomFilter,
+        _path: &Path,
+    ) -> Result<()> {
+        let slot = ScratchSlot::BloomBits.index();
+        let actual = bloom.observed_bits_capacity_bytes().unwrap_or(usize::MAX);
+        if self.poisoned || self.capacities[slot] != actual || self.live_bytes < actual {
+            self.poisoned = true;
+            return Err(unsupported(
+                "compressed v4 Bloom scratch accounting is inconsistent",
+            ));
+        }
+        drop(bloom);
+        self.capacities[slot] = 0;
+        self.live_bytes -= actual;
+        Ok(())
+    }
+
+    fn release_vec(&mut self, slot: ScratchSlot, buffer: Vec<u8>) -> Result<()> {
+        let capacity = buffer.capacity();
+        if self.poisoned || self.capacities[slot.index()] != capacity || self.live_bytes < capacity
+        {
+            self.poisoned = true;
+            return Err(unsupported(
+                "compressed v4 scratch accounting is inconsistent",
+            ));
+        }
+        drop(buffer);
+        self.capacities[slot.index()] = 0;
+        self.live_bytes -= capacity;
         Ok(())
     }
 }
@@ -1745,7 +1850,7 @@ pub(super) fn scan_lz4_pass1(
     expected_identity: SegmentPhysicalId,
     meta: &SegmentMetadata,
     work: &mut WorkLedger,
-    mut probe: impl FnMut(Lz4PassProbe),
+    probe: impl FnMut(Lz4PassProbe),
 ) -> Result<AuthenticatedLz4Pass> {
     check_real(path)?;
     let mut file = File::open(path)?;
@@ -1758,7 +1863,39 @@ pub(super) fn scan_lz4_pass1(
     }
     work.admit_compressed_file(len, path)?;
     let pass = work.first_pass();
+    scan_lz4_opened_pass(
+        &mut file,
+        path,
+        expected_identity,
+        meta,
+        work,
+        pass,
+        None,
+        len,
+        probe,
+    )
+}
+
+/// Both passes parse and hash every byte through their own admitted handle.
+/// Replay alone builds a provisional Bloom, which cannot leave this function.
+#[allow(clippy::too_many_arguments)]
+fn scan_lz4_opened_pass(
+    file: &mut File,
+    path: &Path,
+    expected_identity: SegmentPhysicalId,
+    meta: &SegmentMetadata,
+    work: &WorkLedger,
+    pass: CompressedPassContext,
+    first: Option<AuthenticatedLz4Pass>,
+    len: u64,
+    mut probe: impl FnMut(Lz4PassProbe),
+) -> Result<AuthenticatedLz4Pass> {
     let mut scratch = ScratchLedger::new(work.profile);
+    let mut bloom = match first {
+        Some(first) => Some(scratch.reserve_observed_bloom(first.work.rows, path)?),
+        None => None,
+    };
+    let mut bloom_scratch = Vec::new();
 
     // The index is provisional until the later, contiguous read hashes and
     // compares every footer and trailer byte from this same opened handle.
@@ -1815,7 +1952,7 @@ pub(super) fn scan_lz4_pass1(
     probe(Lz4PassProbe::AfterFooterPreread);
     file.seek(SeekFrom::Start(0))?;
     let mut reader = CompressedPassReader {
-        file: &mut file,
+        file,
         path,
         expected_len: len,
         cursor: 0,
@@ -1933,6 +2070,31 @@ pub(super) fn scan_lz4_pass1(
             block_first.get_or_insert(row.key);
             block_last = Some((row.cf, row.key));
             facts = work.check_next_row(facts, pass, path)?;
+            if let Some(filter) = &mut bloom {
+                let needed = row
+                    .cf
+                    .len()
+                    .checked_add(1)
+                    .and_then(|bytes| bytes.checked_add(row.key.len()))
+                    .ok_or_else(|| unsupported("compressed v4 Bloom key length overflow"))?;
+                scratch.reserve_vec(ScratchSlot::BloomScratch, &mut bloom_scratch, needed, path)?;
+                let enrolled_capacity = bloom_scratch.capacity();
+                filter
+                    .try_insert_parts(
+                        row.cf,
+                        row.key,
+                        &mut bloom_scratch,
+                        ScratchSlot::BloomScratch.logical_limit(work.profile)?,
+                    )
+                    .map_err(|_| {
+                        unsupported("compressed v4 Bloom insert exceeded proof profile")
+                    })?;
+                if bloom_scratch.capacity() != enrolled_capacity {
+                    return Err(unsupported(
+                        "compressed v4 Bloom scratch grew outside ledger",
+                    ));
+                }
+            }
         }
         if rows.remaining() != 0
             || block_first != Some(first_key)
@@ -1996,12 +2158,73 @@ pub(super) fn scan_lz4_pass1(
             "compressed v4 integrated pass digest mismatch",
         ));
     }
+    if first.is_some_and(|first| first.digest != digest || first.len != len) {
+        return Err(corrupt(
+            path,
+            "compressed v4 integrated replay digest or length changed",
+        ));
+    }
     pass.require_exact_replay(facts, path)?;
+    if let Some(observed) = bloom {
+        if observed != meta.bloom_filter {
+            return Err(corrupt(
+                path,
+                "compressed v4 observed Bloom disagrees with MANIFEST",
+            ));
+        }
+        scratch.release_observed_bloom(observed, path)?;
+        scratch.release_vec(ScratchSlot::BloomScratch, bloom_scratch)?;
+    }
     Ok(AuthenticatedLz4Pass {
         work: facts,
         digest,
         len,
     })
+}
+
+/// Private second pass rebuilds the writer Bloom from authenticated rows but
+/// exposes neither provisional rows nor the filter to the fenced visitor.
+#[allow(dead_code)]
+pub(super) fn scan_lz4_pass2(
+    path: &Path,
+    expected_identity: SegmentPhysicalId,
+    meta: &SegmentMetadata,
+    work: &WorkLedger,
+    first: AuthenticatedLz4Pass,
+    probe: impl FnMut(Lz4PassProbe),
+) -> Result<AuthenticatedLz4Pass> {
+    check_real(path)?;
+    let mut file = File::open(path)?;
+    if !file.metadata()?.is_file() || physical_id(&file, path)? != expected_identity {
+        return Err(corrupt(
+            path,
+            "compressed v4 identity changed before replay",
+        ));
+    }
+    let len = file.metadata()?.len();
+    if len < (SEGMENT_HEADER_BYTES + SEGMENT_TRAILER_BYTES) as u64 {
+        return Err(corrupt(path, "short compressed v4 segment"));
+    }
+    if len != first.len {
+        return Err(corrupt(path, "compressed v4 replay length changed"));
+    }
+    if len > work.profile.max_physical_file_bytes {
+        return Err(unsupported(
+            "compressed v4 physical file exceeds proof profile",
+        ));
+    }
+    let pass = work.replay_pass(first.work)?;
+    scan_lz4_opened_pass(
+        &mut file,
+        path,
+        expected_identity,
+        meta,
+        work,
+        pass,
+        Some(first),
+        len,
+        probe,
+    )
 }
 
 struct ScannedSegment {

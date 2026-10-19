@@ -24,6 +24,39 @@ pub struct PartitionedBloomFilter {
 }
 
 impl BloomFilter {
+    fn observed_bit_count(items: usize) -> Result<usize, BloomBuildError> {
+        items
+            .max(1)
+            .checked_mul(12)
+            .and_then(usize::checked_next_power_of_two)
+            .ok_or(BloomBuildError::ArithmeticOverflow)
+    }
+
+    pub(crate) fn observed_bits_len_bytes(items: usize) -> Result<usize, BloomBuildError> {
+        Self::observed_bit_count(items)?
+            .div_ceil(64)
+            .checked_mul(std::mem::size_of::<u64>())
+            .ok_or(BloomBuildError::ArithmeticOverflow)
+    }
+
+    pub(crate) fn observed_bits_capacity_limit_bytes(
+        max_items: usize,
+    ) -> Result<usize, BloomBuildError> {
+        Self::observed_bit_count(max_items)?
+            .div_ceil(64)
+            .checked_mul(2)
+            .and_then(|words| words.checked_add(16))
+            .and_then(|words| words.checked_mul(std::mem::size_of::<u64>()))
+            .ok_or(BloomBuildError::ArithmeticOverflow)
+    }
+
+    pub(crate) fn observed_bits_capacity_bytes(&self) -> Result<usize, BloomBuildError> {
+        self.bits
+            .capacity()
+            .checked_mul(std::mem::size_of::<u64>())
+            .ok_or(BloomBuildError::ArithmeticOverflow)
+    }
+
     pub fn with_expected_items(items: usize) -> Self {
         let bit_count = ((items.max(1) * 12).next_power_of_two()) as u64;
         let words = bit_count.div_ceil(64) as usize;
@@ -45,26 +78,19 @@ impl BloomFilter {
         if items > max_items {
             return Err(BloomBuildError::LimitExceeded);
         }
-        let shape = |count: usize| {
-            count
-                .max(1)
-                .checked_mul(12)
-                .and_then(usize::checked_next_power_of_two)
-                .ok_or(BloomBuildError::ArithmeticOverflow)
-        };
-        let bit_count = shape(items)?;
+        let bit_count = Self::observed_bit_count(items)?;
         let bit_count_u64 =
             u64::try_from(bit_count).map_err(|_| BloomBuildError::ArithmeticOverflow)?;
-        let max_words = shape(max_items)?.div_ceil(64);
         let words = bit_count.div_ceil(64);
-        let capacity_limit = max_words
-            .checked_mul(2)
-            .and_then(|value| value.checked_add(16))
-            .ok_or(BloomBuildError::ArithmeticOverflow)?;
+        let capacity_limit = Self::observed_bits_capacity_limit_bytes(max_items)?;
         let mut bits = Vec::new();
         bits.try_reserve_exact(words)
             .map_err(|_| BloomBuildError::AllocationFailed)?;
-        if bits.capacity() > capacity_limit {
+        if bits
+            .capacity()
+            .checked_mul(std::mem::size_of::<u64>())
+            .is_none_or(|bytes| bytes > capacity_limit)
+        {
             return Err(BloomBuildError::LimitExceeded);
         }
         bits.resize(words, 0);

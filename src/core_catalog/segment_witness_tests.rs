@@ -6,7 +6,7 @@ use super::segment_witness::{
     PhysicalRowClass, ProofProfile, ProtectedRole, ProtectedStage, ProtectedStageLimits,
     ScratchLedger, ScratchSlot, SegmentFileWitness, SegmentSource, WorkLedger,
     collect_protected_segment_candidate, collect_protected_segment_candidate_for_test,
-    decode_bounded_block, physical_id, scan_lz4_pass1, visit_v4_segments,
+    decode_bounded_block, physical_id, scan_lz4_pass1, scan_lz4_pass2, visit_v4_segments,
 };
 use crate::accel::cpu::scalar::CpuAccelerator;
 use crate::config::{Compression, PraxisConfig};
@@ -1629,7 +1629,111 @@ fn private_lz4_pass1_authenticates_writer_blocks_without_exposing_rows() {
 }
 
 #[test]
-fn private_lz4_pass1_accepts_writer_valid_block_and_file_over_one_mebibyte() {
+fn private_lz4_pass2_rebuilds_writer_blooms_without_charging_two_files_twice() {
+    let (_dir, _config, _lease, metadata) = two_segments(Compression::Lz4, false);
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let mut expected_physical = 0;
+    for (ordinal, meta) in metadata.iter().enumerate() {
+        let path = Path::new(&meta.path);
+        let bytes = fs::read(path).unwrap();
+        let file = File::open(path).unwrap();
+        let original_identity = physical_id(&file, path).unwrap();
+        drop(file);
+
+        let first = scan_lz4_pass1(path, original_identity, meta, &mut work, |_| {}).unwrap();
+        assert_eq!(first.work.blocks, 2);
+        assert_eq!(first.work.rows, 2);
+        assert_eq!(first.digest, blake3::hash(&bytes));
+        let first_context = work.first_pass();
+        work.accept_authenticated_file(first_context, first.work, path)
+            .unwrap();
+        expected_physical += first.len;
+        let accepted_before_replay = work.accepted();
+        let physical_before_replay = work.compressed_physical_bytes();
+        assert_eq!(physical_before_replay, expected_physical);
+        assert_eq!(
+            accepted_before_replay.rows,
+            if ordinal == 0 { 2 } else { 4 }
+        );
+        if ordinal == 1 {
+            assert!(accepted_before_replay.rows > first.work.rows);
+        }
+
+        let mut probes = Vec::new();
+        let replay = scan_lz4_pass2(path, original_identity, meta, &work, first, |event| {
+            probes.push(event)
+        })
+        .unwrap();
+        assert_eq!(replay, first);
+        assert_eq!(work.accepted(), accepted_before_replay);
+        assert_eq!(work.compressed_physical_bytes(), physical_before_replay);
+        assert_eq!(
+            probes,
+            vec![
+                Lz4PassProbe::AfterFooterPreread,
+                Lz4PassProbe::AfterContiguousRead {
+                    digest: first.digest
+                }
+            ]
+        );
+    }
+    assert_eq!(work.accepted().rows, 4);
+}
+
+#[test]
+fn private_lz4_pass2_rejects_legal_manifest_bloom_bit_change() {
+    let (dir, _config, lease, metadata) = two_segments(Compression::Lz4, false);
+    let root = lease.root();
+    let path = Path::new(&metadata[0].path);
+    let original_bytes = fs::read(path).unwrap();
+    let mut wire = serde_json::to_value(&metadata[0].bloom_filter).unwrap();
+    let original_bit_count = wire["bit_count"].clone();
+    let original_hash_count = wire["hash_count"].clone();
+    let original_word_count = wire["bits"].as_array().unwrap().len();
+    let word = wire["bits"][0].as_u64().unwrap();
+    wire["bits"][0] = serde_json::Value::from(word ^ 1);
+    assert_eq!(wire["bit_count"], original_bit_count);
+    assert_eq!(wire["hash_count"], original_hash_count);
+    assert_eq!(wire["bits"].as_array().unwrap().len(), original_word_count);
+    assert_eq!((word ^ wire["bits"][0].as_u64().unwrap()).count_ones(), 1);
+    let changed_bloom: BloomFilter = serde_json::from_value(wire).unwrap();
+    assert_ne!(changed_bloom, metadata[0].bloom_filter);
+
+    let manifest_path = DiskLayout::at(root).manifest_path();
+    let mut manifest =
+        Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    manifest.segments[0].bloom_filter = changed_bloom.clone();
+    let saved = save_strict_manifest(root, &manifest);
+    let altered = &saved.segments[0];
+    assert_eq!(altered.bloom_filter, changed_bloom);
+    assert_eq!(altered.file_digest, metadata[0].file_digest);
+    assert_eq!(fs::read(path).unwrap(), original_bytes);
+
+    let file = File::open(path).unwrap();
+    let original_identity = physical_id(&file, path).unwrap();
+    drop(file);
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let first = scan_lz4_pass1(path, original_identity, altered, &mut work, |_| {}).unwrap();
+    assert_eq!(first.digest, blake3::hash(&original_bytes));
+    let first_context = work.first_pass();
+    work.accept_authenticated_file(first_context, first.work, path)
+        .unwrap();
+    let accepted_before_replay = work.accepted();
+    let physical_before_replay = work.compressed_physical_bytes();
+    let tree_before_replay = snapshot(dir.path());
+    let error = scan_lz4_pass2(path, original_identity, altered, &work, first, |_| {}).unwrap_err();
+    assert!(matches!(
+        error,
+        PraxisError::Corrupt { reason, .. }
+            if reason == "compressed v4 observed Bloom disagrees with MANIFEST"
+    ));
+    assert_eq!(work.accepted(), accepted_before_replay);
+    assert_eq!(work.compressed_physical_bytes(), physical_before_replay);
+    assert_eq!(snapshot(dir.path()), tree_before_replay);
+}
+
+#[test]
+fn private_lz4_passes_accept_writer_valid_block_and_file_over_one_mebibyte() {
     let (_dir, _config, lease, metadata) = two_segments(Compression::Lz4, false);
     let root = lease.root();
     let path = Path::new(&metadata[0].path);
@@ -1657,12 +1761,60 @@ fn private_lz4_pass1_accepts_writer_valid_block_and_file_over_one_mebibyte() {
     let bytes = fs::read(path).unwrap();
     assert!(bytes.len() > 1_048_576);
     assert!(writer_block_frame(&bytes, 21).1 > 1_048_576);
+    let file = File::open(path).unwrap();
+    let identity = physical_id(&file, path).unwrap();
+    drop(file);
     let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
-    let pass = direct_lz4_pass1(&meta, &mut work, |_| {}).unwrap();
+    let pass = scan_lz4_pass1(path, identity, &meta, &mut work, |_| {}).unwrap();
     assert_eq!(pass.work.rows, 1);
     assert_eq!(pass.work.blocks, 1);
     assert_eq!(pass.digest, blake3::hash(&bytes));
     assert_eq!(work.accepted(), CompressedWorkFacts::default());
+
+    let first_context = work.first_pass();
+    work.accept_authenticated_file(first_context, pass.work, path)
+        .unwrap();
+    let accepted = work.accepted();
+    let physical = work.compressed_physical_bytes();
+    let replay = scan_lz4_pass2(path, identity, &meta, &work, pass, |_| {}).unwrap();
+    assert_eq!(replay, pass);
+    assert_eq!(work.accepted(), accepted);
+    assert_eq!(work.compressed_physical_bytes(), physical);
+}
+
+#[test]
+fn private_lz4_pass2_precharges_bloom_words_before_allocation_and_releases_them() {
+    let path = Path::new("compressed-bloom-test.tseg");
+    let maximum_bits_allowance = 16 * 1024 * 1024 + 128;
+    let mut short = ScratchLedger::new(ProofProfile {
+        max_parser_owned_peak_bytes: maximum_bits_allowance - 1,
+        ..PRODUCTION_COMPRESSED_PROOF_PROFILE
+    });
+    assert!(matches!(
+        short.reserve_observed_bloom(0, path),
+        Err(PraxisError::UnsupportedCatalogFeature { .. })
+    ));
+    assert_eq!(short.live_bytes(), 0);
+
+    let mut exact = ScratchLedger::new(ProofProfile {
+        max_parser_owned_peak_bytes: maximum_bits_allowance,
+        ..PRODUCTION_COMPRESSED_PROOF_PROFILE
+    });
+    let bloom = exact.reserve_observed_bloom(0, path).unwrap();
+    assert!(exact.live_bytes() > 0);
+    assert!(exact.live_bytes() <= maximum_bits_allowance);
+    exact.release_observed_bloom(bloom, path).unwrap();
+    assert_eq!(exact.live_bytes(), 0);
+
+    let mut impossible = ScratchLedger::new(ProofProfile {
+        max_rows_file: u64::MAX,
+        ..PRODUCTION_COMPRESSED_PROOF_PROFILE
+    });
+    assert!(matches!(
+        impossible.reserve_observed_bloom(0, path),
+        Err(PraxisError::UnsupportedCatalogFeature { .. })
+    ));
+    assert_eq!(impossible.live_bytes(), 0);
 }
 
 #[test]
@@ -1847,6 +1999,61 @@ fn private_lz4_pass1_rejects_same_handle_aba_by_integrated_digest() {
     assert_eq!(observed_digest, Some(blake3::hash(&changed)));
     assert_eq!(work.accepted(), CompressedWorkFacts::default());
     assert_eq!(fs::read(path).unwrap(), original);
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn private_lz4_pass2_rejects_same_handle_aba_before_bloom_comparison() {
+    let (dir, _config, _lease, metadata) = two_segments(Compression::Lz4, false);
+    let path = Path::new(&metadata[0].path);
+    let original = fs::read(path).unwrap();
+    let changed = same_length_lz4_value_variant(&original, path);
+    assert_eq!(original.len(), changed.len());
+    let file = File::open(path).unwrap();
+    let identity = physical_id(&file, path).unwrap();
+    drop(file);
+    let mut work = WorkLedger::new(PRODUCTION_COMPRESSED_PROOF_PROFILE);
+    let first = scan_lz4_pass1(path, identity, &metadata[0], &mut work, |_| {}).unwrap();
+    let first_context = work.first_pass();
+    work.accept_authenticated_file(first_context, first.work, path)
+        .unwrap();
+    let accepted = work.accepted();
+    let physical = work.compressed_physical_bytes();
+    let before = snapshot(dir.path());
+    let mut writer = OpenOptions::new().write(true).open(path).unwrap();
+    let first_len = writer_block_frame(&original, 21).0.len() + 12;
+    let mut observed_digest = None;
+    let error = scan_lz4_pass2(
+        path,
+        identity,
+        &metadata[0],
+        &work,
+        first,
+        |event| match event {
+            Lz4PassProbe::AfterFooterPreread => {
+                writer.seek(SeekFrom::Start(21)).unwrap();
+                writer.write_all(&changed[21..21 + first_len]).unwrap();
+                writer.sync_data().unwrap();
+                assert_eq!(fs::read(path).unwrap(), changed);
+            }
+            Lz4PassProbe::AfterContiguousRead { digest } => {
+                observed_digest = Some(digest);
+                writer.seek(SeekFrom::Start(21)).unwrap();
+                writer.write_all(&original[21..21 + first_len]).unwrap();
+                writer.sync_data().unwrap();
+                assert_eq!(fs::read(path).unwrap(), original);
+            }
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        PraxisError::Corrupt { reason, .. }
+            if reason == "compressed v4 integrated pass digest mismatch"
+    ));
+    assert_eq!(observed_digest, Some(blake3::hash(&changed)));
+    assert_eq!(work.accepted(), accepted);
+    assert_eq!(work.compressed_physical_bytes(), physical);
     assert_eq!(snapshot(dir.path()), before);
 }
 
@@ -2726,6 +2933,79 @@ fn scratch_ledger_precharges_growth_and_bloom_word_overhead() {
         Err(PraxisError::UnsupportedCatalogFeature { .. })
     ));
     assert_eq!(bits.capacity(), 0);
+}
+
+#[test]
+fn scratch_ledger_counts_live_bloom_words_during_bloom_key_growth() {
+    let path = Path::new("compressed-bloom-overlap-test.tseg");
+    let mut short = ScratchLedger::new(ProofProfile {
+        max_rows_file: 0,
+        max_encoded_block_bytes: 16,
+        max_decoded_block_bytes: 16,
+        max_footer_bytes: 16,
+        max_parser_owned_peak_bytes: 144,
+        ..PRODUCTION_COMPRESSED_PROOF_PROFILE
+    });
+    let bloom = short.reserve_observed_bloom(0, path).unwrap();
+    let mut encoded = Vec::new();
+    let mut decoded = Vec::new();
+    let mut footer = Vec::new();
+    short
+        .reserve_vec(ScratchSlot::Encoded, &mut encoded, 16, path)
+        .unwrap();
+    short
+        .reserve_vec(ScratchSlot::Decoded, &mut decoded, 16, path)
+        .unwrap();
+    short
+        .reserve_vec(ScratchSlot::Footer, &mut footer, 16, path)
+        .unwrap();
+    let live_before = short.live_bytes();
+    let mut key = Vec::new();
+    assert!(matches!(
+        short.reserve_vec(ScratchSlot::BloomScratch, &mut key, 3, path),
+        Err(PraxisError::UnsupportedCatalogFeature { .. })
+    ));
+    assert_eq!(key.capacity(), 0);
+    assert_eq!(short.live_bytes(), live_before);
+    short.release_observed_bloom(bloom, path).unwrap();
+
+    let mut permitted = ScratchLedger::new(ProofProfile {
+        max_rows_file: 0,
+        max_encoded_block_bytes: 16,
+        max_decoded_block_bytes: 16,
+        max_footer_bytes: 16,
+        max_parser_owned_peak_bytes: 152,
+        ..PRODUCTION_COMPRESSED_PROOF_PROFILE
+    });
+    let mut bloom = permitted.reserve_observed_bloom(0, path).unwrap();
+    let mut encoded = Vec::new();
+    let mut decoded = Vec::new();
+    let mut footer = Vec::new();
+    permitted
+        .reserve_vec(ScratchSlot::Encoded, &mut encoded, 16, path)
+        .unwrap();
+    permitted
+        .reserve_vec(ScratchSlot::Decoded, &mut decoded, 16, path)
+        .unwrap();
+    permitted
+        .reserve_vec(ScratchSlot::Footer, &mut footer, 16, path)
+        .unwrap();
+    let mut key = Vec::new();
+    permitted
+        .reserve_vec(ScratchSlot::BloomScratch, &mut key, 3, path)
+        .unwrap();
+    let capacity = key.capacity();
+    bloom.try_insert_parts("c", b"k", &mut key, 16).unwrap();
+    assert_eq!(key.capacity(), capacity);
+    assert!(bloom.may_contain(b"c\0k"));
+    assert_eq!(
+        permitted.live_bytes(),
+        bloom.observed_bits_capacity_bytes().unwrap()
+            + encoded.capacity()
+            + decoded.capacity()
+            + footer.capacity()
+            + capacity
+    );
 }
 
 #[test]
