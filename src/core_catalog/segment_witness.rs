@@ -1389,6 +1389,15 @@ fn parse_segment_id(path: &Path) -> Result<u64> {
     Ok(id)
 }
 
+pub(super) fn next_observed_file(path: &Path, observed: usize) -> Result<usize> {
+    if observed >= MAX_SEGMENT_FILES {
+        return Err(corrupt(path, "v4 segment observed-file limit exceeded"));
+    }
+    observed
+        .checked_add(1)
+        .ok_or_else(|| corrupt(path, "v4 segment observed-file limit exceeded"))
+}
+
 fn inventory(
     root: &Path,
     manifest: &Manifest,
@@ -1477,13 +1486,7 @@ fn inventory(
             }
             let level = parse_level(&level_path)?;
             for file_entry in fs::read_dir(&level_path)? {
-                if observed == MAX_SEGMENT_FILES {
-                    return Err(corrupt(
-                        &level_path,
-                        "v4 segment observed-file limit exceeded",
-                    ));
-                }
-                observed += 1;
+                observed = next_observed_file(&level_path, observed)?;
                 let path = file_entry?.path();
                 check_real(&path)?;
                 if !fs::symlink_metadata(&path)?.is_file() {
@@ -1541,6 +1544,17 @@ fn inventory(
             retained_witness_bytes,
         })
     })()
+}
+
+#[cfg(test)]
+pub(super) fn inventory_count_for_test(
+    root: &Path,
+    manifest: &Manifest,
+    budget: &mut PhysicalWitnessBudget,
+) -> Result<usize> {
+    let mut attempt = WitnessAttempt::new(root, budget);
+    let admitted = inventory(root, manifest, &mut attempt)?;
+    Ok(admitted.locators.len())
 }
 
 #[derive(Clone, Copy)]
@@ -3162,13 +3176,7 @@ fn recheck_namespace(root: &Path, admitted: &mut SegmentInventory) -> Result<()>
         }
         let level = parse_level(&level_path)?;
         for file_entry in fs::read_dir(&level_path)? {
-            if observed == MAX_SEGMENT_FILES {
-                return Err(corrupt(
-                    &level_path,
-                    "v4 segment observed-file limit exceeded",
-                ));
-            }
-            observed += 1;
+            observed = next_observed_file(&level_path, observed)?;
             let path = file_entry?.path();
             check_real(&path)?;
             if !fs::symlink_metadata(&path)?.is_file() {
@@ -3227,7 +3235,7 @@ fn visit_v4_segments_with_receipt(
         manifest,
         budget,
         PRODUCTION_COMPRESSED_PROOF_PROFILE,
-        |_| Ok(()),
+        |_, _| Ok(()),
         visit,
     )
 }
@@ -3238,10 +3246,42 @@ pub(super) fn visit_v4_segments_with_profile_and_hook_for_test(
     manifest: &Manifest,
     budget: &mut PhysicalWitnessBudget,
     profile: ProofProfile,
-    on_lz4_discovered: impl FnMut(&Path) -> Result<()>,
+    mut on_lz4_discovered: impl FnMut(&Path) -> Result<()>,
     visit: impl FnMut(ObservedSegmentRow) -> Result<()>,
 ) -> Result<(Vec<SegmentFileWitness>, usize)> {
-    visit_v4_segments_with_receipt_inner(root, manifest, budget, profile, on_lz4_discovered, visit)
+    visit_v4_segments_with_receipt_inner(
+        root,
+        manifest,
+        budget,
+        profile,
+        |path, tag| {
+            if tag == 1 {
+                on_lz4_discovered(path)
+            } else {
+                Ok(())
+            }
+        },
+        visit,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn visit_v4_segments_with_profile_and_tag_hook_for_test(
+    root: &Path,
+    manifest: &Manifest,
+    budget: &mut PhysicalWitnessBudget,
+    profile: ProofProfile,
+    on_compressed_discovered: impl FnMut(&Path, u8) -> Result<()>,
+    visit: impl FnMut(ObservedSegmentRow) -> Result<()>,
+) -> Result<(Vec<SegmentFileWitness>, usize)> {
+    visit_v4_segments_with_receipt_inner(
+        root,
+        manifest,
+        budget,
+        profile,
+        on_compressed_discovered,
+        visit,
+    )
 }
 
 fn visit_v4_segments_with_receipt_inner(
@@ -3249,7 +3289,7 @@ fn visit_v4_segments_with_receipt_inner(
     manifest: &Manifest,
     budget: &mut PhysicalWitnessBudget,
     profile: ProofProfile,
-    mut on_lz4_discovered: impl FnMut(&Path) -> Result<()>,
+    mut on_compressed_discovered: impl FnMut(&Path, u8) -> Result<()>,
     mut visit: impl FnMut(ObservedSegmentRow) -> Result<()>,
 ) -> Result<(Vec<SegmentFileWitness>, usize)> {
     // This guard starts before inventory. On every Err or Rust unwind, later
@@ -3263,9 +3303,7 @@ fn visit_v4_segments_with_receipt_inner(
         let scanned = match discover_segment_compression(locator)? {
             0 => scan_literal_segment(locator, meta, &mut visit)?,
             tag @ (1 | 2) => {
-                if tag == 1 {
-                    on_lz4_discovered(&locator.path)?;
-                }
+                on_compressed_discovered(&locator.path, tag)?;
                 let expected_identity = locator.identity.ok_or_else(|| {
                     corrupt(&locator.path, "v4 segment lacks admitted physical identity")
                 })?;

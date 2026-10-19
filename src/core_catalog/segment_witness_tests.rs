@@ -6,9 +6,11 @@ use super::segment_witness::{
     PROTECTED_STAGE_LIMITS, PhysicalRowClass, ProofProfile, ProtectedRole, ProtectedStage,
     ProtectedStageLimits, ScratchLedger, ScratchSlot, SegmentFileWitness, SegmentSource,
     WorkLedger, ZstdPassProbe, collect_protected_segment_candidate,
-    collect_protected_segment_candidate_for_test, decode_bounded_block, physical_id,
-    scan_lz4_pass1, scan_lz4_pass2, scan_lz4_pass3, scan_zstd_pass1, scan_zstd_pass2,
-    scan_zstd_pass3, visit_v4_segments, visit_v4_segments_with_profile_and_hook_for_test,
+    collect_protected_segment_candidate_for_test, decode_bounded_block, inventory_count_for_test,
+    next_observed_file, physical_id, scan_lz4_pass1, scan_lz4_pass2, scan_lz4_pass3,
+    scan_zstd_pass1, scan_zstd_pass2, scan_zstd_pass3, visit_v4_segments,
+    visit_v4_segments_with_profile_and_hook_for_test,
+    visit_v4_segments_with_profile_and_tag_hook_for_test,
 };
 use crate::accel::cpu::scalar::CpuAccelerator;
 use crate::config::{Compression, PraxisConfig};
@@ -153,6 +155,7 @@ struct TreeEntry {
     is_dir: bool,
     bytes: Option<Vec<u8>>,
     file_id: Option<Vec<u8>>,
+    alias_target: Option<PathBuf>,
 }
 
 #[cfg(windows)]
@@ -197,14 +200,31 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, TreeEntry> {
             let path = entry.path();
             let relative = path.strip_prefix(root).unwrap().to_path_buf();
             let meta = fs::symlink_metadata(&path).unwrap();
-            assert!(!meta.file_type().is_symlink());
-            if meta.is_dir() {
+            #[cfg(windows)]
+            let alias = {
+                use std::os::windows::fs::MetadataExt;
+                meta.file_attributes() & 0x400 != 0
+            };
+            #[cfg(not(windows))]
+            let alias = meta.file_type().is_symlink();
+            if alias {
+                out.insert(
+                    relative,
+                    TreeEntry {
+                        is_dir: false,
+                        bytes: None,
+                        file_id: None,
+                        alias_target: Some(fs::read_link(&path).unwrap()),
+                    },
+                );
+            } else if meta.is_dir() {
                 out.insert(
                     relative,
                     TreeEntry {
                         is_dir: true,
                         bytes: None,
                         file_id: None,
+                        alias_target: None,
                     },
                 );
                 walk(root, &path, out);
@@ -225,6 +245,7 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, TreeEntry> {
                             fs::read(&path).unwrap()
                         }),
                         file_id: if lock { None } else { Some(file_id(&path)) },
+                        alias_target: None,
                     },
                 );
             }
@@ -601,6 +622,96 @@ fn external_segment_hardlink_refuses_before_callbacks_without_mutation() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn segment_leaf_symlink_refuses_without_following_parked_file() {
+    use std::os::unix::fs::symlink;
+
+    let (dir, _config, lease, _) = two_literal_segments(false);
+    let root = lease.root();
+    let layout = DiskLayout::at(root);
+    let path = layout.segment_path(0, 1);
+    let parked = root.join("parked-segment");
+    fs::rename(&path, &parked).unwrap();
+    symlink(&parked, &path).unwrap();
+    assert!(
+        fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    let manifest_path = layout.manifest_path();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    let before = snapshot(dir.path());
+    let mut callbacks = 0;
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let error = visit_v4_segments(root, &manifest, budget, |_| {
+            callbacks += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&error, PraxisError::Corrupt { path: failed_path, reason }
+                if failed_path.as_path() == path.as_path() && reason == "v4 segment path crosses a symbolic link"),
+            "{error}"
+        );
+        assert_eq!(budget.remaining_bytes(), balance);
+    });
+    assert_eq!(callbacks, 0);
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[cfg(windows)]
+#[test]
+fn segment_level_junction_refuses_without_following_parked_directory() {
+    use std::os::windows::fs::MetadataExt;
+
+    let (dir, _config, lease, _) = two_literal_segments(false);
+    let root = lease.root();
+    let layout = DiskLayout::at(root);
+    let level_path = layout.segment_root().join("0");
+    let parked = root.join("parked-level");
+    fs::rename(&level_path, &parked).unwrap();
+    let output = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&level_path)
+        .arg(&parked)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "junction creation failed: {output:?}"
+    );
+    assert_ne!(
+        fs::symlink_metadata(&level_path).unwrap().file_attributes() & 0x400,
+        0
+    );
+    let manifest_path = layout.manifest_path();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    let before = snapshot(dir.path());
+    let mut callbacks = 0;
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let error = visit_v4_segments(root, &manifest, budget, |_| {
+            callbacks += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&error, PraxisError::Corrupt { path: failed_path, reason }
+                if failed_path.as_path() == level_path.as_path()
+                    && (reason == "v4 segment path crosses a reparse point"
+                        || reason == "v4 segment path crosses a symbolic link")),
+            "{error}"
+        );
+        assert_eq!(budget.remaining_bytes(), balance);
+    });
+    assert_eq!(callbacks, 0);
+    assert_eq!(snapshot(dir.path()), before);
+    fs::remove_dir(&level_path).unwrap();
+}
+
 #[derive(Clone, Copy)]
 struct FooterFieldPositions {
     first_key: usize,
@@ -813,6 +924,107 @@ fn unlisted_canonical_segment_refuses_before_visiting_any_row() {
     assert!(matches!(&error, PraxisError::Corrupt { .. }), "{error}");
     assert_eq!(callbacks, 0);
     assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn inventory_accepts_4096_and_refuses_4097_listed_or_observed_files() {
+    let started = std::time::Instant::now();
+    let (dir, _config, lease, _) = two_literal_segments(false);
+    let root = lease.root();
+    let layout = DiskLayout::at(root);
+    let manifest_path = layout.manifest_path();
+    let mut listed = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    let template = listed.segments[0].clone();
+    for id in 3_u64..=4096 {
+        let path = layout.segment_path(0, id);
+        File::create(&path).unwrap();
+        let mut meta = template.clone();
+        meta.id = id;
+        meta.level = 0;
+        meta.path = path.to_str().unwrap().to_owned();
+        listed.segments.push(meta);
+    }
+    listed.next_segment_id = 4097;
+    assert_eq!(listed.segments.len(), 4096);
+    let baseline = snapshot(dir.path());
+    with_wal_budget(root, &listed, |budget| {
+        let balance = budget.remaining_bytes();
+        assert_eq!(
+            inventory_count_for_test(root, &listed, budget).unwrap(),
+            4096
+        );
+        assert_eq!(budget.remaining_bytes(), balance);
+    });
+    assert_eq!(snapshot(dir.path()), baseline);
+
+    let extra_path = layout.segment_path(0, 4097);
+    let mut overlisted = listed.clone();
+    let mut extra_meta = template;
+    extra_meta.id = 4097;
+    extra_meta.level = 0;
+    extra_meta.path = extra_path.to_str().unwrap().to_owned();
+    overlisted.segments.push(extra_meta);
+    assert_eq!(overlisted.segments.len(), 4097);
+    with_wal_budget(root, &overlisted, |budget| {
+        let balance = budget.remaining_bytes();
+        let mut callbacks = 0;
+        let error = visit_v4_segments(root, &overlisted, budget, |_| {
+            callbacks += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&error, PraxisError::Corrupt { path, reason }
+                if path.as_path() == root && reason == "v4 segment listed-file limit exceeded"),
+            "{error}"
+        );
+        assert_eq!(callbacks, 0);
+        assert_eq!(budget.remaining_bytes(), balance);
+    });
+    assert_eq!(snapshot(dir.path()), baseline);
+
+    let level_path = layout.segment_root().join("0");
+    assert_eq!(next_observed_file(&level_path, 4095).unwrap(), 4096);
+    let error = next_observed_file(&level_path, 4096).unwrap_err();
+    assert!(
+        matches!(&error, PraxisError::Corrupt { path, reason }
+            if path.as_path() == level_path.as_path() && reason == "v4 segment observed-file limit exceeded"),
+        "{error}"
+    );
+
+    File::create(&extra_path).unwrap();
+    let mut with_extra = baseline;
+    with_extra.insert(
+        extra_path.strip_prefix(root).unwrap().to_path_buf(),
+        TreeEntry {
+            is_dir: false,
+            bytes: Some(Vec::new()),
+            file_id: Some(file_id(&extra_path)),
+            alias_target: None,
+        },
+    );
+    with_wal_budget(root, &listed, |budget| {
+        let balance = budget.remaining_bytes();
+        let mut callbacks = 0;
+        let error = visit_v4_segments(root, &listed, budget, |_| {
+            callbacks += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&error, PraxisError::Corrupt { reason, .. }
+                if reason == "unlisted v4 segment file"
+                    || reason == "v4 segment observed-file limit exceeded"),
+            "{error}"
+        );
+        assert_eq!(callbacks, 0);
+        assert_eq!(budget.remaining_bytes(), balance);
+    });
+    assert_eq!(snapshot(dir.path()), with_extra);
+    eprintln!(
+        "4,096/4,097 segment inventory fixture: {:?}",
+        started.elapsed()
+    );
 }
 
 #[test]
@@ -1664,6 +1876,128 @@ fn lz4_discovery_retag_before_pass1_is_rejected_by_reopened_parser() {
     assert_eq!(callbacks, 0);
     assert_eq!(file_id(path), identity);
     assert_eq!(fs::read(path).unwrap(), retagged);
+    assert_eq!(snapshot(dir.path()), expected);
+}
+
+#[test]
+fn zstd_discovery_retag_before_pass1_is_rejected_by_reopened_parser() {
+    let (dir, _config, lease, metadata) = two_segments(Compression::Zstd, false);
+    let root = lease.root();
+    let manifest_path = DiskLayout::at(root).manifest_path();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    let path = Path::new(&metadata[0].path);
+    let original = fs::read(path).unwrap();
+    assert_eq!(original[8], 2);
+    let identity = file_id(path);
+    let mut retagged = original.clone();
+    retagged[8] = 0;
+    let mut expected = snapshot(dir.path());
+    expected
+        .get_mut(path.strip_prefix(root).unwrap())
+        .unwrap()
+        .bytes = Some(retagged.clone());
+    let mut writer = OpenOptions::new().write(true).open(path).unwrap();
+    let mut hooks = 0;
+    let mut callbacks = 0;
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let error = visit_v4_segments_with_profile_and_tag_hook_for_test(
+            root,
+            &manifest,
+            budget,
+            PRODUCTION_COMPRESSED_PROOF_PROFILE,
+            |discovered, tag| {
+                assert_eq!(discovered, path);
+                assert_eq!(tag, 2);
+                hooks += 1;
+                assert_eq!(hooks, 1);
+                writer.seek(SeekFrom::Start(8)).unwrap();
+                writer.write_all(&[0]).unwrap();
+                writer.sync_data().unwrap();
+                Ok(())
+            },
+            |_| {
+                callbacks += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, PraxisError::Corrupt { path: failed_path, reason }
+                if failed_path.as_path() == path && reason == "compressed v4 pass expected Zstd tag"),
+            "{error}"
+        );
+        assert_eq!(budget.remaining_bytes(), balance);
+    });
+    drop(writer);
+    assert_eq!(hooks, 1);
+    assert_eq!(callbacks, 0);
+    assert_eq!(file_id(path), identity);
+    assert_eq!(fs::read(path).unwrap(), retagged);
+    assert_eq!(snapshot(dir.path()), expected);
+}
+
+#[test]
+fn zstd_discovery_path_substitution_refuses_before_pass1() {
+    let (dir, _config, lease, metadata) = two_segments(Compression::Zstd, false);
+    let root = lease.root();
+    let manifest_path = DiskLayout::at(root).manifest_path();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    let path = Path::new(&metadata[0].path);
+    let original = fs::read(path).unwrap();
+    assert_eq!(original[8], 2);
+    let identity = file_id(path);
+    // Keep the temporary file outside segments/ so inventory never sees it.
+    let replacement = root.join("discovery-replacement");
+    assert!(!replacement.exists());
+    let mut expected = snapshot(dir.path());
+    let mut replacement_identity = None;
+    let mut hooks = 0;
+    let mut callbacks = 0;
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let error = visit_v4_segments_with_profile_and_tag_hook_for_test(
+            root,
+            &manifest,
+            budget,
+            PRODUCTION_COMPRESSED_PROOF_PROFILE,
+            |discovered, tag| {
+                assert_eq!(discovered, path);
+                assert_eq!(tag, 2);
+                hooks += 1;
+                assert_eq!(hooks, 1);
+                fs::write(&replacement, &original).unwrap();
+                // file_id closes its handle before either rename operation.
+                let new_identity = file_id(&replacement);
+                assert_ne!(new_identity, identity);
+                fs::remove_file(path).unwrap();
+                fs::rename(&replacement, path).unwrap();
+                assert_eq!(file_id(path), new_identity);
+                expected
+                    .get_mut(path.strip_prefix(root).unwrap())
+                    .unwrap()
+                    .file_id = Some(new_identity.clone());
+                replacement_identity = Some(new_identity);
+                Ok(())
+            },
+            |_| {
+                callbacks += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, PraxisError::Corrupt { path: failed_path, reason }
+                if failed_path.as_path() == path && reason == "compressed v4 identity changed before pass"),
+            "{error}"
+        );
+        assert_eq!(budget.remaining_bytes(), balance);
+    });
+    assert_eq!(hooks, 1);
+    assert_eq!(callbacks, 0);
+    assert_eq!(fs::read(path).unwrap(), original);
+    assert_eq!(file_id(path), replacement_identity.unwrap());
+    assert!(!replacement.exists());
     assert_eq!(snapshot(dir.path()), expected);
 }
 
