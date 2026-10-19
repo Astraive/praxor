@@ -2059,6 +2059,55 @@ pub(super) enum Lz4PassProbe {
     AfterContiguousRead { digest: blake3::Hash },
 }
 
+// The Zstd file passes deliberately remain private and unsupported until the
+// same-handle parser is proved against the direct test-first contracts.
+#[allow(dead_code)]
+pub(super) type AuthenticatedZstdPass = AuthenticatedLz4Pass;
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ZstdPassProbe {
+    AfterFooterPreread,
+    AfterContiguousRead {
+        digest: blake3::Hash,
+    },
+    /// Emitted only when `check_next_block` refuses a file-level decoded
+    /// claim, before any encoded/output Vec or native Zstd context has been
+    /// reserved. The scanner must report its actual local capacities and
+    /// charge; bounded footer preread is separate.
+    #[cfg(test)]
+    RefusedDecodedClaimBeforeReserve {
+        encoded_capacity: usize,
+        decoded_capacity: usize,
+        native_zstd_bytes: usize,
+    },
+}
+
+#[allow(dead_code)]
+pub(super) fn scan_zstd_pass1(
+    _path: &Path,
+    _expected_identity: SegmentPhysicalId,
+    _meta: &SegmentMetadata,
+    _work: &mut WorkLedger,
+    _probe: impl FnMut(ZstdPassProbe),
+) -> Result<AuthenticatedZstdPass> {
+    Err(unsupported("compressed v4 Zstd first pass not yet proven"))
+}
+
+#[allow(dead_code)]
+pub(super) fn scan_zstd_pass2(
+    _path: &Path,
+    _expected_identity: SegmentPhysicalId,
+    _meta: &SegmentMetadata,
+    _work: &WorkLedger,
+    _first: AuthenticatedZstdPass,
+    _probe: impl FnMut(ZstdPassProbe),
+) -> Result<AuthenticatedZstdPass> {
+    Err(unsupported(
+        "compressed v4 Zstd Bloom replay not yet proven",
+    ))
+}
+
 /// Private, callback-free first pass. The visitor remains fenced until the
 /// separate Bloom and provisional row passes have been proved. A later caller
 /// may commit `work` only after this function returns its integrated digest.
