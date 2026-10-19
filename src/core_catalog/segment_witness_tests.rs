@@ -846,7 +846,7 @@ fn protected_stage_preserves_physical_copies_while_owner_refuses() {
             let candidate = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
             assert_eq!(
                 before_budget - budget.remaining_bytes(),
-                candidate.retained_witness_bytes
+                candidate.retained_witness_bytes()
             );
             assert_eq!(candidate.witnesses.len(), 2);
             assert_eq!(candidate.rows.len(), 4);
@@ -900,6 +900,8 @@ fn protected_stage_preserves_physical_copies_while_owner_refuses() {
                     ),
                 ]
             );
+            candidate.discard(root, budget).unwrap();
+            assert_eq!(budget.remaining_bytes(), before_budget);
         });
         assert!(matches!(
             inspect_v4_owner(&lease, &config, &CpuAccelerator),
@@ -943,6 +945,7 @@ fn protected_stage_row_cap_is_all_or_nothing() {
     });
     assert_eq!(staged, 3);
     with_wal_budget(root, &manifest, |budget| {
+        let before_budget = budget.remaining_bytes();
         let candidate = collect_protected_segment_candidate_for_test(
             root,
             &manifest,
@@ -956,6 +959,8 @@ fn protected_stage_row_cap_is_all_or_nothing() {
         .unwrap();
         assert_eq!(candidate.rows.len(), 4);
         assert_eq!(candidate.witnesses.len(), 2);
+        candidate.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), before_budget);
     });
     assert_eq!(snapshot(dir.path()), before);
 }
@@ -995,7 +1000,57 @@ fn protected_stage_bytes_charge_actual_row_capacity() {
         Err(PraxisError::UnsupportedCatalogFeature { .. })
     ));
     assert_eq!(low.len(), 0);
+    assert_eq!(low.capacity(), 0);
     assert_eq!(low.used_bytes(), 0);
+
+    let make_plain_row = || ObservedSegmentRow {
+        source: SegmentSource {
+            level: 0,
+            id: 1,
+            manifest_ordinal: 0,
+        },
+        block_offset: 21,
+        row_ordinal: 0,
+        classification: PhysicalRowClass::BoundProtected(ProtectedRole::Catalog),
+        cf: CATALOG_CF.into(),
+        key: vec![0],
+        sequence: 2,
+        value: ObservedSegmentValue::Delete,
+    };
+    let mut oversized_cf = make_plain_row();
+    let mut cf = String::with_capacity(8 * 1024);
+    cf.push_str(CATALOG_CF);
+    oversized_cf.cf = cf;
+    let mut oversized_key = make_plain_row();
+    let mut key = Vec::with_capacity(8 * 1024);
+    key.push(0);
+    oversized_key.key = key;
+    let mut oversized_pointer_path = make_plain_row();
+    let mut pointer_path = String::with_capacity(8 * 1024);
+    pointer_path.push_str("p");
+    oversized_pointer_path.value = ObservedSegmentValue::Pointer {
+        pointer: ValuePointer {
+            path: pointer_path,
+            offset: 17,
+            len: 19,
+            checksum: 23,
+        },
+        expires_at_ms: Some(29),
+    };
+    for row in [oversized_cf, oversized_key, oversized_pointer_path] {
+        let mut stage = ProtectedStage::new(ProtectedStageLimits {
+            max_rows: 1,
+            max_bytes: 4 * 1024,
+        });
+        assert!(matches!(
+            stage.push(row),
+            Err(PraxisError::UnsupportedCatalogFeature { .. })
+        ));
+        assert_eq!(
+            (stage.len(), stage.capacity(), stage.used_bytes()),
+            (0, 0, 0)
+        );
+    }
 
     let mut admitted = ProtectedStage::new(PROTECTED_STAGE_LIMITS);
     let admitted_row = make_row();
@@ -1105,6 +1160,7 @@ fn protected_stage_keeps_five_bound_roles_and_reserved_but_drops_other() {
     );
     let before = snapshot(dir.path());
     with_wal_budget(root, &manifest, |budget| {
+        let before_budget = budget.remaining_bytes();
         let candidate = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
         assert_eq!(candidate.rows.len(), 8); // Six first-file protected/reserved plus two catalog copies.
         for (cf, role) in [
@@ -1147,6 +1203,8 @@ fn protected_stage_keeps_five_bound_roles_and_reserved_but_drops_other() {
                 expires_at_ms: None,
             }
         );
+        candidate.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), before_budget);
     });
     assert_eq!(snapshot(dir.path()), before);
 }

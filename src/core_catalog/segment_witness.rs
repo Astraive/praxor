@@ -954,12 +954,12 @@ fn recheck_namespace(root: &Path, admitted: &mut SegmentInventory) -> Result<()>
     Ok(())
 }
 
-pub(crate) fn visit_v4_segments(
+fn visit_v4_segments_with_receipt(
     root: &Path,
     manifest: &Manifest,
     budget: &mut PhysicalWitnessBudget,
     mut visit: impl FnMut(ObservedSegmentRow) -> Result<()>,
-) -> Result<Vec<SegmentFileWitness>> {
+) -> Result<(Vec<SegmentFileWitness>, usize)> {
     let mut admitted = inventory(root, manifest, budget)?;
     let result = (|| -> Result<()> {
         let (locators, witnesses) = (&mut admitted.locators, &mut admitted.witnesses);
@@ -1000,7 +1000,7 @@ pub(crate) fn visit_v4_segments(
             let witnesses = std::mem::take(&mut admitted.witnesses);
             drop(admitted);
             budget.release(root, temporary)?;
-            Ok(witnesses)
+            Ok((witnesses, retained))
         }
         Err(error) => {
             drop(admitted);
@@ -1010,8 +1010,17 @@ pub(crate) fn visit_v4_segments(
     }
 }
 
+#[cfg(test)]
+pub(crate) fn visit_v4_segments(
+    root: &Path,
+    manifest: &Manifest,
+    budget: &mut PhysicalWitnessBudget,
+    visit: impl FnMut(ObservedSegmentRow) -> Result<()>,
+) -> Result<Vec<SegmentFileWitness>> {
+    visit_v4_segments_with_receipt(root, manifest, budget, visit).map(|(witnesses, _)| witnesses)
+}
+
 #[derive(Clone, Copy)]
-#[allow(dead_code)] // Fields are consumed by the upcoming private stage implementation.
 pub(super) struct ProtectedStageLimits {
     pub(super) max_rows: usize,
     pub(super) max_bytes: usize,
@@ -1024,23 +1033,221 @@ pub(super) const PROTECTED_STAGE_LIMITS: ProtectedStageLimits = ProtectedStageLi
 
 /// A candidate remains private and carries no installed or effective owner claim.
 #[derive(Debug)]
-#[allow(dead_code)] // The test-first adapter is intentionally RED until this private cut lands.
+#[allow(dead_code)] // Composed only after the later protected-copy and installed-owner proofs.
 pub(crate) struct ProtectedSegmentCandidate {
     pub(crate) rows: Vec<ObservedSegmentRow>,
     pub(crate) witnesses: Vec<SegmentFileWitness>,
-    pub(crate) retained_witness_bytes: usize,
+    retained_witness_bytes: usize,
+}
+
+#[allow(dead_code)] // The later owner composer consumes or discards this candidate.
+impl ProtectedSegmentCandidate {
+    pub(crate) fn retained_witness_bytes(&self) -> usize {
+        self.retained_witness_bytes
+    }
+
+    /// Keep the WAL ledger live until the retained file witnesses have dropped.
+    pub(crate) fn discard(self, root: &Path, budget: &mut PhysicalWitnessBudget) -> Result<()> {
+        let Self {
+            rows,
+            witnesses,
+            retained_witness_bytes,
+        } = self;
+        drop(rows);
+        drop(witnesses);
+        budget.release(root, retained_witness_bytes)
+    }
+}
+
+fn protected_stage_limit() -> PraxisError {
+    unsupported("protected segment staging exceeds the private row or byte proof profile")
+}
+
+fn protected_allocation_charge(capacity: usize) -> Result<usize> {
+    if capacity == 0 {
+        return Ok(0);
+    }
+    capacity
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(64))
+        .ok_or_else(protected_stage_limit)
+}
+
+fn protected_row_heap_charge(row: &ObservedSegmentRow) -> Result<usize> {
+    let value_capacity = match &row.value {
+        ObservedSegmentValue::Put(value)
+        | ObservedSegmentValue::PutWithExpiry { value, .. }
+        | ObservedSegmentValue::Merge(value) => value.capacity(),
+        ObservedSegmentValue::Pointer { pointer, .. } => pointer.path.capacity(),
+        ObservedSegmentValue::Delete => 0,
+    };
+    [row.cf.capacity(), row.key.capacity(), value_capacity]
+        .into_iter()
+        .try_fold(0_usize, |total, capacity| {
+            total
+                .checked_add(protected_allocation_charge(capacity)?)
+                .ok_or_else(protected_stage_limit)
+        })
+}
+
+fn protected_vector_charge(capacity: usize) -> Result<usize> {
+    vector_charge::<ObservedSegmentRow>(Path::new("protected segment stage"), capacity)
+        .map_err(|_| protected_stage_limit())
+}
+
+pub(super) struct ProtectedStage {
+    rows: Vec<ObservedSegmentRow>,
+    used_bytes: usize,
+    limits: ProtectedStageLimits,
+    poisoned: bool,
+}
+
+impl ProtectedStage {
+    pub(super) fn new(limits: ProtectedStageLimits) -> Self {
+        Self {
+            rows: Vec::new(),
+            used_bytes: 0,
+            limits,
+            poisoned: false,
+        }
+    }
+
+    fn poison(&mut self) {
+        self.rows = Vec::new();
+        self.used_bytes = 0;
+        self.poisoned = true;
+    }
+
+    fn grow(&mut self, incoming_heap: usize) -> Result<()> {
+        let old_capacity = self.rows.capacity();
+        let target = if old_capacity == 0 {
+            1
+        } else {
+            old_capacity
+                .checked_mul(2)
+                .ok_or_else(protected_stage_limit)?
+        }
+        .min(self.limits.max_rows);
+        if target <= old_capacity {
+            return Err(protected_stage_limit());
+        }
+        let allowance_capacity = target.checked_mul(2).ok_or_else(protected_stage_limit)?;
+        let allowance = protected_vector_charge(allowance_capacity)?;
+        self.used_bytes
+            .checked_add(incoming_heap)
+            .and_then(|bytes| bytes.checked_add(allowance))
+            .filter(|bytes| *bytes <= self.limits.max_bytes)
+            .ok_or_else(protected_stage_limit)?;
+        let old_vector_charge = protected_vector_charge(old_capacity)?;
+        let additional = target
+            .checked_sub(self.rows.len())
+            .ok_or_else(protected_stage_limit)?;
+        if self.rows.try_reserve_exact(additional).is_err() {
+            self.poison();
+            return Err(protected_stage_limit());
+        }
+        let actual_capacity = self.rows.capacity();
+        let actual_charge = match protected_vector_charge(actual_capacity) {
+            Ok(charge) => charge,
+            Err(error) => {
+                self.poison();
+                return Err(error);
+            }
+        };
+        let live_without_row = self
+            .used_bytes
+            .checked_sub(old_vector_charge)
+            .and_then(|bytes| bytes.checked_add(actual_charge));
+        if actual_capacity > allowance_capacity
+            || actual_capacity <= old_capacity
+            || actual_charge > allowance
+            || live_without_row
+                .and_then(|bytes| bytes.checked_add(incoming_heap))
+                .is_none_or(|bytes| bytes > self.limits.max_bytes)
+        {
+            self.poison();
+            return Err(protected_stage_limit());
+        }
+        self.used_bytes = live_without_row.ok_or_else(protected_stage_limit)?;
+        Ok(())
+    }
+
+    pub(super) fn push(&mut self, row: ObservedSegmentRow) -> Result<()> {
+        if self.poisoned || self.rows.len() >= self.limits.max_rows {
+            return Err(protected_stage_limit());
+        }
+        let incoming_heap = protected_row_heap_charge(&row)?;
+        self.used_bytes
+            .checked_add(incoming_heap)
+            .filter(|bytes| *bytes <= self.limits.max_bytes)
+            .ok_or_else(protected_stage_limit)?;
+        if self.rows.len() == self.rows.capacity() {
+            self.grow(incoming_heap)?;
+        }
+        if self.rows.len() == self.rows.capacity() {
+            self.poison();
+            return Err(protected_stage_limit());
+        }
+        self.used_bytes = self
+            .used_bytes
+            .checked_add(incoming_heap)
+            .ok_or_else(protected_stage_limit)?;
+        self.rows.push(row);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn used_bytes(&self) -> usize {
+        self.used_bytes
+    }
+
+    #[cfg(test)]
+    pub(super) fn capacity(&self) -> usize {
+        self.rows.capacity()
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_max_bytes_for_test(&mut self, max_bytes: usize) {
+        assert!(max_bytes <= PROTECTED_STAGE_LIMITS.max_bytes);
+        self.limits.max_bytes = max_bytes;
+    }
 }
 
 fn collect_protected_segment_candidate_inner(
-    _root: &Path,
-    _manifest: &Manifest,
-    _budget: &mut PhysicalWitnessBudget,
-    _limits: ProtectedStageLimits,
-    _after_staged: impl FnMut(usize) -> Result<()>,
+    root: &Path,
+    manifest: &Manifest,
+    budget: &mut PhysicalWitnessBudget,
+    limits: ProtectedStageLimits,
+    mut after_staged: impl FnMut(usize) -> Result<()>,
 ) -> Result<ProtectedSegmentCandidate> {
-    Err(unsupported(
-        "bounded protected segment candidate staging is not yet admitted",
-    ))
+    let before = budget.remaining_bytes();
+    let mut stage = ProtectedStage::new(limits);
+    let (witnesses, retained_witness_bytes) =
+        visit_v4_segments_with_receipt(root, manifest, budget, |row| {
+            if row.classification == PhysicalRowClass::Other {
+                return Ok(());
+            }
+            stage.push(row)?;
+            after_staged(stage.rows.len())
+        })?;
+    if before.checked_sub(budget.remaining_bytes()) != Some(retained_witness_bytes) {
+        drop(witnesses);
+        budget.release(root, retained_witness_bytes)?;
+        return Err(corrupt(
+            root,
+            "protected segment witness budget receipt mismatch",
+        ));
+    }
+    Ok(ProtectedSegmentCandidate {
+        rows: stage.rows,
+        witnesses,
+        retained_witness_bytes,
+    })
 }
 
 #[allow(dead_code)] // Used by the next private owner-composition cut.
@@ -1069,45 +1276,4 @@ pub(super) fn collect_protected_segment_candidate_for_test(
     assert!(limits.max_rows <= PROTECTED_STAGE_LIMITS.max_rows);
     assert!(limits.max_bytes <= PROTECTED_STAGE_LIMITS.max_bytes);
     collect_protected_segment_candidate_inner(root, manifest, budget, limits, after_staged)
-}
-
-#[cfg(test)]
-pub(super) struct ProtectedStage {
-    rows: Vec<ObservedSegmentRow>,
-    used_bytes: usize,
-    limits: ProtectedStageLimits,
-}
-
-#[cfg(test)]
-impl ProtectedStage {
-    pub(super) fn new(limits: ProtectedStageLimits) -> Self {
-        Self {
-            rows: Vec::new(),
-            used_bytes: 0,
-            limits,
-        }
-    }
-
-    pub(super) fn push(&mut self, _row: ObservedSegmentRow) -> Result<()> {
-        Err(unsupported(
-            "bounded protected segment candidate staging is not yet admitted",
-        ))
-    }
-
-    pub(super) fn len(&self) -> usize {
-        self.rows.len()
-    }
-
-    pub(super) fn used_bytes(&self) -> usize {
-        self.used_bytes
-    }
-
-    pub(super) fn capacity(&self) -> usize {
-        self.rows.capacity()
-    }
-
-    pub(super) fn set_max_bytes_for_test(&mut self, max_bytes: usize) {
-        assert!(max_bytes <= PROTECTED_STAGE_LIMITS.max_bytes);
-        self.limits.max_bytes = max_bytes;
-    }
 }
