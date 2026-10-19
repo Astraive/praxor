@@ -3596,7 +3596,7 @@ fn private_zstd_pass3_refuses_whole_block_row_cap_before_callbacks() {
     .unwrap_err();
     assert!(
         matches!(&error, PraxisError::UnsupportedCatalogFeature { feature }
-        if feature == "compressed v4 file row count exceeds proof profile"),
+        if *feature == "compressed v4 file row count exceeds proof profile"),
         "{error}"
     );
     assert_eq!(callbacks, 0);
