@@ -228,7 +228,7 @@ impl Manifest {
         Ok(())
     }
 
-    fn validate_v4(&self, source: &Path) -> Result<()> {
+    pub(crate) fn validate_v4(&self, source: &Path) -> Result<()> {
         let corrupt = |reason: &str| PraxisError::Corrupt {
             path: source.to_path_buf(),
             reason: reason.to_string(),
