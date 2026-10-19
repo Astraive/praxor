@@ -10,11 +10,11 @@ use crate::accel::cpu::scalar::CpuAccelerator;
 use crate::config::{Compression, PraxisConfig};
 use crate::disk::DiskLayout;
 use crate::errors::PraxisError;
-use crate::io::crc32c;
+use crate::io::{BinaryReader, crc32c};
 use crate::manifest::{Manifest, ManifestStore, SegmentMetadata};
 use crate::segments::block::SegmentEntry;
 use crate::segments::codec::decode_segment;
-use crate::segments::{SegmentWriteOptions, SegmentWriter};
+use crate::segments::{BloomFilter, SegmentWriteOptions, SegmentWriter};
 use crate::types::{ColumnFamily, StoredValue, ValuePointer, VersionedValue};
 use crate::values::ValueLog;
 use crate::wal::catalog_witness::{
@@ -318,6 +318,88 @@ fn replace_segment_bytes(root: &Path, level: u32, id: u64, bytes: &[u8]) -> Mani
 
 fn replace_first_segment_bytes(root: &Path, bytes: &[u8]) -> Manifest {
     replace_segment_bytes(root, 0, 1, bytes)
+}
+
+fn save_strict_manifest(root: &Path, manifest: &Manifest) -> Manifest {
+    let path = DiskLayout::at(root).manifest_path();
+    ManifestStore::new(path.clone()).save(manifest).unwrap();
+    let saved = Manifest::decode(&fs::read(&path).unwrap(), &path).unwrap();
+    assert_eq!(saved.format_version, 4);
+    saved
+}
+
+fn assert_segment_corrupt_without_mutation(
+    root: &Path,
+    manifest: &Manifest,
+    segment_path: &Path,
+    expected_reason: &str,
+) {
+    let before = snapshot(root);
+    with_wal_budget(root, manifest, |budget| {
+        let wal_balance = budget.remaining_bytes();
+        let mut callbacks = 0;
+        let error = visit_v4_segments(root, manifest, budget, |_| {
+            callbacks += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&error, PraxisError::Corrupt { path, reason }
+                if path.as_path() == segment_path && reason.as_str() == expected_reason),
+            "{error}"
+        );
+        assert_eq!(callbacks, 0);
+        assert_eq!(budget.remaining_bytes(), wal_balance);
+    });
+    assert_eq!(snapshot(root), before);
+}
+
+#[derive(Clone, Copy)]
+struct FooterFieldPositions {
+    first_key: usize,
+    last_key: usize,
+    offset: usize,
+    len: usize,
+    original_offset: u64,
+    original_len: u64,
+}
+
+fn three_block_footer_positions(
+    bytes: &[u8],
+    path: &Path,
+) -> (usize, usize, [FooterFieldPositions; 3]) {
+    let trailer = bytes.len().checked_sub(12).unwrap();
+    let footer_len = u32::from_le_bytes(bytes[trailer..trailer + 4].try_into().unwrap()) as usize;
+    let footer_start = trailer.checked_sub(footer_len).unwrap();
+    assert!(footer_start >= 21);
+    assert_eq!(footer_len, 82);
+    let mut footer = BinaryReader::new(&bytes[footer_start..trailer], path);
+    assert_eq!(footer.read_u32().unwrap(), 3);
+    let fields: [FooterFieldPositions; 3] = std::array::from_fn(|index| {
+        let first_key = footer_start + footer.position() + 4;
+        assert_eq!(footer.read_len_slice().unwrap(), &[index as u8][..]);
+        let last_key = footer_start + footer.position() + 4;
+        assert_eq!(footer.read_len_slice().unwrap(), &[index as u8][..]);
+        let offset = footer_start + footer.position();
+        let original_offset = footer.read_u64().unwrap();
+        let len = footer_start + footer.position();
+        let original_len = footer.read_u64().unwrap();
+        FooterFieldPositions {
+            first_key,
+            last_key,
+            offset,
+            len,
+            original_offset,
+            original_len,
+        }
+    });
+    assert_eq!(footer.remaining(), 0);
+    assert_eq!(fields[1].first_key - footer_start, 34);
+    assert_eq!(fields[1].last_key - footer_start, 39);
+    assert_eq!(fields[1].offset - footer_start, 40);
+    assert_eq!(fields[1].len - footer_start, 48);
+    assert_eq!(fields[2].len - footer_start, 74);
+    (footer_start, trailer, fields)
 }
 
 #[test]
@@ -695,6 +777,200 @@ fn forged_manifest_row_count_does_not_drive_allocation() {
     assert!(matches!(&error, PraxisError::Corrupt { .. }), "{error}");
     assert_eq!(callbacks, 0);
     assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn wrong_manifest_min_and_max_refuse_before_callbacks() {
+    for wrong_min in [true, false] {
+        let (_dir, _config, lease, metadata) = two_literal_segments(false);
+        let root = lease.root();
+        let path = DiskLayout::at(root).segment_path(0, 1);
+        let original_bytes = fs::read(&path).unwrap();
+        let manifest_path = DiskLayout::at(root).manifest_path();
+        let mut manifest =
+            Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+        let mut expected_meta = metadata[0].clone();
+        if wrong_min {
+            expected_meta.min_key = vec![1];
+        } else {
+            expected_meta.max_key = vec![0];
+        }
+        manifest.segments[0] = expected_meta.clone();
+        let saved = save_strict_manifest(root, &manifest);
+        assert_eq!(saved.segments[0], expected_meta);
+        assert_eq!(saved.segments[1], metadata[1]);
+        assert_eq!(saved.segments[0].entries, 2);
+        assert_eq!(saved.segments[0].bloom_filter, metadata[0].bloom_filter);
+        assert_eq!(saved.segments[0].file_digest, metadata[0].file_digest);
+        assert_eq!(fs::read(&path).unwrap(), original_bytes);
+        assert_segment_corrupt_without_mutation(
+            root,
+            &saved,
+            &path,
+            "v4 segment observed count or key range mismatch",
+        );
+    }
+}
+
+#[test]
+fn wrong_manifest_bloom_bit_and_legal_shape_refuse_before_callbacks() {
+    for single_bit in [true, false] {
+        let (_dir, _config, lease, metadata) = two_literal_segments(false);
+        let root = lease.root();
+        let path = DiskLayout::at(root).segment_path(0, 1);
+        let original_bytes = fs::read(&path).unwrap();
+        let manifest_path = DiskLayout::at(root).manifest_path();
+        let mut manifest =
+            Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+        let original_wire = serde_json::to_value(&metadata[0].bloom_filter).unwrap();
+        let changed_bloom = if single_bit {
+            let mut wire = original_wire.clone();
+            let word = wire["bits"][0].as_u64().unwrap();
+            wire["bits"][0] = serde_json::Value::from(word ^ 1_u64);
+            let changed_wire = wire.clone();
+            assert_eq!(changed_wire["bit_count"], original_wire["bit_count"]);
+            assert_eq!(changed_wire["hash_count"], original_wire["hash_count"]);
+            assert_eq!(
+                changed_wire["bits"].as_array().unwrap().len(),
+                original_wire["bits"].as_array().unwrap().len()
+            );
+            assert_eq!(
+                (word ^ changed_wire["bits"][0].as_u64().unwrap()).count_ones(),
+                1
+            );
+            serde_json::from_value::<BloomFilter>(wire).unwrap()
+        } else {
+            let changed = BloomFilter::with_expected_items(1);
+            let changed_wire = serde_json::to_value(&changed).unwrap();
+            assert_eq!(original_wire["bit_count"].as_u64(), Some(32));
+            assert_eq!(changed_wire["bit_count"].as_u64(), Some(16));
+            assert_eq!(changed_wire["hash_count"], original_wire["hash_count"]);
+            changed
+        };
+        assert_ne!(changed_bloom, metadata[0].bloom_filter);
+        let mut expected_meta = metadata[0].clone();
+        expected_meta.bloom_filter = changed_bloom;
+        manifest.segments[0] = expected_meta.clone();
+        let saved = save_strict_manifest(root, &manifest);
+        assert_eq!(saved.segments[0], expected_meta);
+        assert_eq!(saved.segments[1], metadata[1]);
+        assert_eq!(saved.segments[0].entries, 2);
+        assert_eq!(saved.segments[0].min_key, metadata[0].min_key);
+        assert_eq!(saved.segments[0].max_key, metadata[0].max_key);
+        assert_eq!(saved.segments[0].file_digest, metadata[0].file_digest);
+        assert_eq!(fs::read(&path).unwrap(), original_bytes);
+        assert_segment_corrupt_without_mutation(
+            root,
+            &saved,
+            &path,
+            "v4 segment Bloom or semantic pass mismatch",
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FooterMutation {
+    MiddleFirstKey,
+    MiddleLastKey,
+    MiddleOffsetGap,
+    MiddleOffsetOverlap,
+    LastBlockPastFooter,
+}
+
+#[test]
+fn repaired_middle_footer_keys_and_block_boundaries_refuse_before_callbacks() {
+    for mutation in [
+        FooterMutation::MiddleFirstKey,
+        FooterMutation::MiddleLastKey,
+        FooterMutation::MiddleOffsetGap,
+        FooterMutation::MiddleOffsetOverlap,
+        FooterMutation::LastBlockPastFooter,
+    ] {
+        let (_dir, config, lease, _) = two_literal_segments(false);
+        let root = lease.root();
+        let writer_manifest = rewrite_first_segment(
+            root,
+            vec![
+                row(0, StoredValue::Delete),
+                row(1, StoredValue::Delete),
+                row(2, StoredValue::Delete),
+            ],
+            Compression::None,
+            config.large_value_threshold,
+            1,
+        );
+        let path = DiskLayout::at(root).segment_path(0, 1);
+        let mut bytes = fs::read(&path).unwrap();
+        let decoded = decode_segment(&bytes, &path, &CpuAccelerator).unwrap();
+        assert_eq!(decoded.blocks.len(), 3);
+        assert!(decoded.blocks.iter().all(|block| block.len() == 1));
+        let original_bytes = bytes.clone();
+        let (footer_start, trailer, fields) = three_block_footer_positions(&bytes, &path);
+        assert_eq!(
+            crc32c(&bytes[footer_start..trailer]),
+            u32::from_le_bytes(bytes[trailer + 4..trailer + 8].try_into().unwrap())
+        );
+        let reason = match mutation {
+            FooterMutation::MiddleFirstKey => {
+                bytes[fields[1].first_key] = 9;
+                "v4 segment block key range or framing mismatch"
+            }
+            FooterMutation::MiddleLastKey => {
+                bytes[fields[1].last_key] = 9;
+                "v4 segment block key range or framing mismatch"
+            }
+            FooterMutation::MiddleOffsetGap => {
+                bytes[fields[1].offset..fields[1].offset + 8].copy_from_slice(
+                    &fields[1]
+                        .original_offset
+                        .checked_add(1)
+                        .unwrap()
+                        .to_le_bytes(),
+                );
+                "v4 segment block is not contiguous"
+            }
+            FooterMutation::MiddleOffsetOverlap => {
+                bytes[fields[1].offset..fields[1].offset + 8].copy_from_slice(
+                    &fields[1]
+                        .original_offset
+                        .checked_sub(1)
+                        .unwrap()
+                        .to_le_bytes(),
+                );
+                "v4 segment block is not contiguous"
+            }
+            FooterMutation::LastBlockPastFooter => {
+                assert_eq!(
+                    fields[2].original_offset + fields[2].original_len,
+                    footer_start as u64
+                );
+                bytes[fields[2].len..fields[2].len + 8]
+                    .copy_from_slice(&fields[2].original_len.checked_add(1).unwrap().to_le_bytes());
+                "v4 segment block is not contiguous"
+            }
+        };
+        assert_eq!(&bytes[..footer_start], &original_bytes[..footer_start]);
+        assert_ne!(
+            &bytes[footer_start..trailer],
+            &original_bytes[footer_start..trailer]
+        );
+        let footer_checksum = crc32c(&bytes[footer_start..trailer]);
+        bytes[trailer + 4..trailer + 8].copy_from_slice(&footer_checksum.to_le_bytes());
+        assert_eq!(
+            crc32c(&bytes[footer_start..trailer]),
+            u32::from_le_bytes(bytes[trailer + 4..trailer + 8].try_into().unwrap())
+        );
+        let saved = replace_first_segment_bytes(root, &bytes);
+        let mut expected_meta = writer_manifest.segments[0].clone();
+        expected_meta.file_digest = blake3::hash(&bytes).to_hex().to_string();
+        assert_eq!(saved.segments[0], expected_meta);
+        assert_eq!(saved.segments[1], writer_manifest.segments[1]);
+        assert_eq!(saved.segments[0].entries, 3);
+        assert_eq!(saved.segments[0].min_key, vec![0]);
+        assert_eq!(saved.segments[0].max_key, vec![2]);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_segment_corrupt_without_mutation(root, &saved, &path, reason);
+    }
 }
 
 #[test]
