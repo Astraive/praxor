@@ -2057,9 +2057,9 @@ pub(super) enum Lz4PassProbe {
     AfterContiguousRead { digest: blake3::Hash },
 }
 
-// The Zstd file passes deliberately remain private and unsupported until the
-// same-handle parser is proved against the direct test-first contracts.
-#[allow(dead_code)]
+// The Zstd passes use the same authenticated framing as LZ4, but do not yet
+// grant either visitor or installed-owner authority.
+#[allow(dead_code)] // Exercised by private tests; visitor admission is a later cut.
 pub(super) type AuthenticatedZstdPass = AuthenticatedLz4Pass;
 
 #[allow(dead_code)]
@@ -2069,10 +2069,11 @@ pub(super) enum ZstdPassProbe {
     AfterContiguousRead {
         digest: blake3::Hash,
     },
-    /// Emitted only when `check_next_block` refuses a file-level decoded
-    /// claim, before any encoded/output Vec or native Zstd context has been
-    /// reserved. The scanner must report its actual local capacities and
-    /// charge; bounded footer preread is separate.
+    /// Emitted when `check_next_block` refuses a block's claims before this
+    /// block reserves further encoded/output capacity or decodes. Reports the
+    /// scanner's actual local capacities and native Zstd charge, which may
+    /// include storage retained from earlier successful blocks. Bounded footer
+    /// preread is separate.
     #[cfg(test)]
     RefusedDecodedClaimBeforeReserve {
         encoded_capacity: usize,
@@ -2081,29 +2082,127 @@ pub(super) enum ZstdPassProbe {
     },
 }
 
-#[allow(dead_code)]
-pub(super) fn scan_zstd_pass1(
-    _path: &Path,
-    _expected_identity: SegmentPhysicalId,
-    _meta: &SegmentMetadata,
-    _work: &mut WorkLedger,
-    _probe: impl FnMut(ZstdPassProbe),
-) -> Result<AuthenticatedZstdPass> {
-    Err(unsupported("compressed v4 Zstd first pass not yet proven"))
+/// Scanner-local events let both codecs share the authenticated byte walk
+/// while keeping their existing private probe contracts separate.
+#[derive(Clone, Copy)]
+enum CompressedPassProbe {
+    AfterFooterPreread,
+    AfterContiguousRead {
+        digest: blake3::Hash,
+    },
+    #[cfg(test)]
+    RefusedDecodedClaimBeforeReserve {
+        encoded_capacity: usize,
+        decoded_capacity: usize,
+        native_zstd_bytes: usize,
+    },
 }
 
-#[allow(dead_code)]
-pub(super) fn scan_zstd_pass2(
-    _path: &Path,
-    _expected_identity: SegmentPhysicalId,
-    _meta: &SegmentMetadata,
-    _work: &WorkLedger,
-    _first: AuthenticatedZstdPass,
-    _probe: impl FnMut(ZstdPassProbe),
+impl CompressedPassProbe {
+    fn dispatch_lz4(self, probe: &mut impl FnMut(Lz4PassProbe)) {
+        match self {
+            Self::AfterFooterPreread => probe(Lz4PassProbe::AfterFooterPreread),
+            Self::AfterContiguousRead { digest } => {
+                probe(Lz4PassProbe::AfterContiguousRead { digest });
+            }
+            #[cfg(test)]
+            Self::RefusedDecodedClaimBeforeReserve { .. } => {}
+        }
+    }
+
+    fn into_zstd(self) -> ZstdPassProbe {
+        match self {
+            Self::AfterFooterPreread => ZstdPassProbe::AfterFooterPreread,
+            Self::AfterContiguousRead { digest } => ZstdPassProbe::AfterContiguousRead { digest },
+            #[cfg(test)]
+            Self::RefusedDecodedClaimBeforeReserve {
+                encoded_capacity,
+                decoded_capacity,
+                native_zstd_bytes,
+            } => ZstdPassProbe::RefusedDecodedClaimBeforeReserve {
+                encoded_capacity,
+                decoded_capacity,
+                native_zstd_bytes,
+            },
+        }
+    }
+}
+
+#[allow(dead_code)] // Exercised by private tests; visitor admission is a later cut.
+pub(super) fn scan_zstd_pass1(
+    path: &Path,
+    expected_identity: SegmentPhysicalId,
+    meta: &SegmentMetadata,
+    work: &mut WorkLedger,
+    mut probe: impl FnMut(ZstdPassProbe),
 ) -> Result<AuthenticatedZstdPass> {
-    Err(unsupported(
-        "compressed v4 Zstd Bloom replay not yet proven",
-    ))
+    check_real(path)?;
+    let mut file = File::open(path)?;
+    if !file.metadata()?.is_file() || physical_id(&file, path)? != expected_identity {
+        return Err(corrupt(path, "compressed v4 identity changed before pass"));
+    }
+    let len = file.metadata()?.len();
+    if len < (SEGMENT_HEADER_BYTES + SEGMENT_TRAILER_BYTES) as u64 {
+        return Err(corrupt(path, "short compressed v4 segment"));
+    }
+    work.admit_compressed_file(len, path)?;
+    let pass = work.first_pass();
+    scan_compressed_opened_pass(
+        &mut file,
+        path,
+        expected_identity,
+        meta,
+        work,
+        pass,
+        None,
+        len,
+        Compression::Zstd,
+        |event| probe(event.into_zstd()),
+    )
+}
+
+#[allow(dead_code)] // Exercised by private tests; visitor admission is a later cut.
+pub(super) fn scan_zstd_pass2(
+    path: &Path,
+    expected_identity: SegmentPhysicalId,
+    meta: &SegmentMetadata,
+    work: &WorkLedger,
+    first: AuthenticatedZstdPass,
+    mut probe: impl FnMut(ZstdPassProbe),
+) -> Result<AuthenticatedZstdPass> {
+    check_real(path)?;
+    let mut file = File::open(path)?;
+    if !file.metadata()?.is_file() || physical_id(&file, path)? != expected_identity {
+        return Err(corrupt(
+            path,
+            "compressed v4 identity changed before replay",
+        ));
+    }
+    let len = file.metadata()?.len();
+    if len < (SEGMENT_HEADER_BYTES + SEGMENT_TRAILER_BYTES) as u64 {
+        return Err(corrupt(path, "short compressed v4 segment"));
+    }
+    if len != first.len {
+        return Err(corrupt(path, "compressed v4 replay length changed"));
+    }
+    if len > work.profile.max_physical_file_bytes {
+        return Err(unsupported(
+            "compressed v4 physical file exceeds proof profile",
+        ));
+    }
+    let pass = work.replay_pass(first.work)?;
+    scan_compressed_opened_pass(
+        &mut file,
+        path,
+        expected_identity,
+        meta,
+        work,
+        pass,
+        Some(first),
+        len,
+        Compression::Zstd,
+        |event| probe(event.into_zstd()),
+    )
 }
 
 /// Callback-free first pass. Its work can be committed only after the
@@ -2113,7 +2212,7 @@ pub(super) fn scan_lz4_pass1(
     expected_identity: SegmentPhysicalId,
     meta: &SegmentMetadata,
     work: &mut WorkLedger,
-    probe: impl FnMut(Lz4PassProbe),
+    mut probe: impl FnMut(Lz4PassProbe),
 ) -> Result<AuthenticatedLz4Pass> {
     check_real(path)?;
     let mut file = File::open(path)?;
@@ -2126,7 +2225,7 @@ pub(super) fn scan_lz4_pass1(
     }
     work.admit_compressed_file(len, path)?;
     let pass = work.first_pass();
-    scan_lz4_opened_pass(
+    scan_compressed_opened_pass(
         &mut file,
         path,
         expected_identity,
@@ -2135,14 +2234,15 @@ pub(super) fn scan_lz4_pass1(
         pass,
         None,
         len,
-        probe,
+        Compression::Lz4,
+        |event| event.dispatch_lz4(&mut probe),
     )
 }
 
-/// Both passes parse and hash every byte through their own admitted handle.
+/// Both codecs parse and hash every byte through their own admitted handle.
 /// Replay alone builds a provisional Bloom, which cannot leave this function.
 #[allow(clippy::too_many_arguments)]
-fn scan_lz4_opened_pass(
+fn scan_compressed_opened_pass(
     file: &mut File,
     path: &Path,
     expected_identity: SegmentPhysicalId,
@@ -2151,8 +2251,14 @@ fn scan_lz4_opened_pass(
     pass: CompressedPassContext,
     first: Option<AuthenticatedLz4Pass>,
     len: u64,
-    mut probe: impl FnMut(Lz4PassProbe),
+    codec: Compression,
+    mut probe: impl FnMut(CompressedPassProbe),
 ) -> Result<AuthenticatedLz4Pass> {
+    let tag = match codec {
+        Compression::Lz4 => 1,
+        Compression::Zstd => 2,
+        _ => return Err(unsupported("compressed v4 pass codec is not supported")),
+    };
     let mut scratch = ScratchLedger::new(work.profile);
     let mut bloom = match first {
         Some(first) => Some(scratch.reserve_observed_bloom(first.work.rows, path)?),
@@ -2212,7 +2318,7 @@ fn scan_lz4_opened_pass(
         ));
     }
 
-    probe(Lz4PassProbe::AfterFooterPreread);
+    probe(CompressedPassProbe::AfterFooterPreread);
     file.seek(SeekFrom::Start(0))?;
     let mut reader = CompressedPassReader {
         file,
@@ -2227,8 +2333,13 @@ fn scan_lz4_opened_pass(
     if header_reader.read_u32()? != SEGMENT_MAGIC || header_reader.read_u32()? != SEGMENT_VERSION {
         return Err(corrupt(path, "bad compressed v4 segment magic or version"));
     }
-    if header_reader.read_u8()? != 1 {
-        return Err(corrupt(path, "compressed v4 pass expected LZ4 tag"));
+    if header_reader.read_u8()? != tag {
+        let reason = if codec == Compression::Lz4 {
+            "compressed v4 pass expected LZ4 tag"
+        } else {
+            "compressed v4 pass expected Zstd tag"
+        };
+        return Err(corrupt(path, reason));
     }
     if header_reader.read_u32()? != meta.level || header_reader.read_u64()? != meta.id {
         return Err(corrupt(path, "compressed v4 header level or id mismatch"));
@@ -2277,7 +2388,17 @@ fn scan_lz4_opened_pass(
             ));
         }
         // Refuse forged output claims before encoded or decoded allocation.
-        work.check_next_block(facts, decoded_len, pass, path)?;
+        if let Err(error) = work.check_next_block(facts, decoded_len, pass, path) {
+            #[cfg(test)]
+            if codec == Compression::Zstd {
+                probe(CompressedPassProbe::RefusedDecodedClaimBeforeReserve {
+                    encoded_capacity: encoded.capacity(),
+                    decoded_capacity: decoded.capacity(),
+                    native_zstd_bytes: scratch.native_zstd_bytes(),
+                });
+            }
+            return Err(error);
+        }
         let encoded_len_usize = usize::try_from(encoded_len)
             .map_err(|_| unsupported("compressed v4 encoded block exceeds platform range"))?;
         encoded.clear();
@@ -2286,7 +2407,7 @@ fn scan_lz4_opened_pass(
         reader.read_hashed(&mut encoded)?;
         facts = decode_bounded_block(
             BlockFrame {
-                codec: Compression::Lz4,
+                codec,
                 encoded: &encoded,
                 checksum,
                 decoded_len,
@@ -2414,7 +2535,7 @@ fn scan_lz4_opened_pass(
         ));
     }
     let digest = reader.hasher.finalize();
-    probe(Lz4PassProbe::AfterContiguousRead { digest });
+    probe(CompressedPassProbe::AfterContiguousRead { digest });
     if digest.to_hex().as_str() != meta.file_digest.as_str() {
         return Err(corrupt(
             path,
@@ -2729,7 +2850,7 @@ pub(super) fn scan_lz4_pass2(
     meta: &SegmentMetadata,
     work: &WorkLedger,
     first: AuthenticatedLz4Pass,
-    probe: impl FnMut(Lz4PassProbe),
+    mut probe: impl FnMut(Lz4PassProbe),
 ) -> Result<AuthenticatedLz4Pass> {
     check_real(path)?;
     let mut file = File::open(path)?;
@@ -2752,7 +2873,7 @@ pub(super) fn scan_lz4_pass2(
         ));
     }
     let pass = work.replay_pass(first.work)?;
-    scan_lz4_opened_pass(
+    scan_compressed_opened_pass(
         &mut file,
         path,
         expected_identity,
@@ -2761,7 +2882,8 @@ pub(super) fn scan_lz4_pass2(
         pass,
         Some(first),
         len,
-        probe,
+        Compression::Lz4,
+        |event| event.dispatch_lz4(&mut probe),
     )
 }
 
