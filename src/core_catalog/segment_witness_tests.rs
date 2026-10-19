@@ -1027,7 +1027,7 @@ fn protected_stage_bytes_charge_actual_row_capacity() {
     oversized_key.key = key;
     let mut oversized_pointer_path = make_plain_row();
     let mut pointer_path = String::with_capacity(8 * 1024);
-    pointer_path.push_str("p");
+    pointer_path.push('p');
     oversized_pointer_path.value = ObservedSegmentValue::Pointer {
         pointer: ValuePointer {
             path: pointer_path,
