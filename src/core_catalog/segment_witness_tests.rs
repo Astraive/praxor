@@ -3471,6 +3471,100 @@ fn protected_stage_callback_error_discards_the_candidate() {
 }
 
 #[test]
+fn protected_stage_panic_after_first_push_refunds_witness_attempt_and_retries() {
+    let (dir, _config, lease, _) = two_literal_segments(false);
+    let root = lease.root();
+    let manifest_path = DiskLayout::at(root).manifest_path();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    let before = snapshot(dir.path());
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let mut reached = 0;
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = collect_protected_segment_candidate_for_test(
+                root,
+                &manifest,
+                budget,
+                PROTECTED_STAGE_LIMITS,
+                |count| {
+                    reached = count;
+                    assert_eq!(count, 1);
+                    panic!("injected after-stage panic");
+                },
+            );
+        }));
+        assert!(caught.is_err());
+        assert_eq!(reached, 1);
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(snapshot(dir.path()), before);
+
+        let candidate = collect_protected_segment_candidate_for_test(
+            root,
+            &manifest,
+            budget,
+            PROTECTED_STAGE_LIMITS,
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(candidate.rows.len(), 4);
+        assert_eq!(candidate.witnesses.len(), 2);
+        assert_eq!(
+            balance - budget.remaining_bytes(),
+            candidate.retained_witness_bytes()
+        );
+        candidate.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(snapshot(dir.path()), before);
+    });
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn direct_visitor_panic_after_first_witness_refunds_and_retries() {
+    let (dir, _config, lease, _) = two_literal_segments(false);
+    let root = lease.root();
+    let manifest_path = DiskLayout::at(root).manifest_path();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    let before = snapshot(dir.path());
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let mut seen = 0;
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = visit_v4_segments(root, &manifest, budget, |row| {
+                seen += 1;
+                if row.source.id == 2 {
+                    panic!("injected second-file visitor panic");
+                }
+                Ok(())
+            });
+        }));
+        assert!(caught.is_err());
+        assert_eq!(seen, 3);
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(snapshot(dir.path()), before);
+
+        let candidate = collect_protected_segment_candidate_for_test(
+            root,
+            &manifest,
+            budget,
+            PROTECTED_STAGE_LIMITS,
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(candidate.rows.len(), 4);
+        assert_eq!(candidate.witnesses.len(), 2);
+        assert_eq!(
+            balance - budget.remaining_bytes(),
+            candidate.retained_witness_bytes()
+        );
+        candidate.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(snapshot(dir.path()), before);
+    });
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
 fn later_file_corruption_discards_the_protected_candidate() {
     let (dir, _config, lease, _) = two_literal_segments(true);
     let root = lease.root();
