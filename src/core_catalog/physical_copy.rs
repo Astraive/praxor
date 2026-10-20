@@ -392,10 +392,10 @@ fn preflight_row(root: &Path, manifest: &Manifest, row: &ObservedSegmentRow) -> 
             "protected copy has an invalid wire operation",
         ));
     }
-    if let ObservedSegmentValue::Pointer { expires_at_ms, .. } = &row.value {
-        if expires_at_ms.is_some() {
-            return Err(corrupt(root, "protected copy pointer expires"));
-        }
+    if let ObservedSegmentValue::Pointer { expires_at_ms, .. } = &row.value
+        && expires_at_ms.is_some()
+    {
+        return Err(corrupt(root, "protected copy pointer expires"));
     }
     if role == ProtectedRole::Catalog {
         let authority = manifest
