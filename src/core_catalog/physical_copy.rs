@@ -33,6 +33,7 @@ const CATALOG_NAME_LITERAL_BYTES: usize = 12;
 const CATALOG_NAMESPACE_LITERAL_BYTES: usize = 16;
 const CATALOG_ANCHOR_BYTES: usize = 72;
 const RECORD_BINDING_LITERAL_BYTES: usize = 80;
+const RECORD_STATE_LITERAL_BYTES: usize = 24;
 const RECORD_ALLOCATOR_LITERAL_BYTES: usize = 56;
 const RECORD_INDEX_HEAD_LITERAL_BYTES: usize = 40;
 // Vec capacity can exceed logical length; debit both buffers before replay.
@@ -1053,6 +1054,67 @@ fn replay_fixed_binding_value(
     Ok(bytes)
 }
 
+/// Read one fixed PRS1 State value again from its selected physical locator;
+/// the visitor's earlier value is not the equality proof. Bytes remain
+/// provisional until every retained segment and value source is fenced.
+fn replay_fixed_state_value(
+    root: &Path,
+    manifest: &Manifest,
+    segment: &ProtectedSegmentCandidate,
+    value: Option<&ValueWitnessCandidate>,
+    copy: &CopyDescriptor,
+    budget: &mut PhysicalWitnessBudget,
+    work: &mut CopyReplayWork,
+) -> Result<[u8; RECORD_STATE_LITERAL_BYTES]> {
+    if copy.cf != RecordRole::State.cf() || copy.sequence <= 1 {
+        return Err(corrupt(
+            root,
+            "fixed Record State copy has an invalid role or sequence",
+        ));
+    }
+    let key = RecordKey::decode(RecordRole::State, &copy.key, root)?;
+    if !matches!(&key, RecordKey::State(_)) {
+        return Err(corrupt(
+            root,
+            "fixed Record State copy has an unexpected key",
+        ));
+    }
+    let mut bytes = [0_u8; RECORD_STATE_LITERAL_BYTES];
+    let mut copied = 0_usize;
+    with_authenticated_singleton_copy(
+        root,
+        manifest,
+        segment,
+        value,
+        copy,
+        RECORD_STATE_LITERAL_BYTES,
+        budget,
+        work,
+        |chunk| {
+            let end = copied
+                .checked_add(chunk.len())
+                .filter(|end| *end <= RECORD_STATE_LITERAL_BYTES)
+                .ok_or_else(|| corrupt(root, "replayed fixed Record State exceeds width"))?;
+            bytes[copied..end].copy_from_slice(chunk);
+            copied = end;
+            Ok(())
+        },
+    )?;
+    if copied != RECORD_STATE_LITERAL_BYTES {
+        return Err(corrupt(root, "replayed fixed Record State length changed"));
+    }
+    if !matches!(
+        RecordRow::decode(&key, &bytes, root)?,
+        RecordRow::State { .. }
+    ) {
+        return Err(corrupt(
+            root,
+            "replayed fixed Record State has an unexpected row",
+        ));
+    }
+    Ok(bytes)
+}
+
 #[allow(clippy::too_many_arguments)] // Segment/value receipts and replay limits are distinct proof inputs.
 fn replay_fixed_copy_groups(
     root: &Path,
@@ -1130,6 +1192,32 @@ fn replay_fixed_copy_groups(
             for copy in &copies[1..] {
                 let peer =
                     replay_fixed_binding_value(root, manifest, segment, value, copy, budget, work)?;
+                if canonical != peer {
+                    actual_bytes_conflict = true;
+                }
+            }
+            continue;
+        }
+        if copies[0].cf == RecordRole::State.cf()
+            && matches!(
+                RecordKey::decode(RecordRole::State, &copies[0].key, root)?,
+                RecordKey::State(_)
+            )
+        {
+            // This slice proves only one State row per physical source. A
+            // co-resident group can encode repeated operations, so its
+            // pairing topology remains unsupported here.
+            if copies
+                .windows(2)
+                .any(|pair| source_order(pair[0].source, pair[1].source) != Ordering::Less)
+            {
+                return Err(unproven_copy_group());
+            }
+            let canonical =
+                replay_fixed_state_value(root, manifest, segment, value, &copies[0], budget, work)?;
+            for copy in &copies[1..] {
+                let peer =
+                    replay_fixed_state_value(root, manifest, segment, value, copy, budget, work)?;
                 if canonical != peer {
                     actual_bytes_conflict = true;
                 }
