@@ -3109,3 +3109,302 @@ fn writer_separate_external_catalog_name_equal_reaches_private_gate() {
 fn writer_separate_external_catalog_name_valid_conflict_requires_corrupt() {
     writer_external_catalog_name_pair_case(CatalogNameExternalTopology::SeparateValueFiles, true);
 }
+
+fn writer_mixed_catalog_name_pair_case(first_external: bool, conflicting: bool) {
+    let (dir, config, lease) = flushed_create_fixture();
+    let root = lease.root();
+    let layout = DiskLayout::at(root);
+    let manifest_path = layout.manifest_path();
+    let mut manifest =
+        Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    assert_eq!(manifest.segments.len(), 1);
+    let first_path = layout.segment_path(0, 1);
+    let first_original = fs::read(&first_path).unwrap();
+    assert_eq!(
+        manifest.segments[0].file_digest,
+        blake3::hash(&first_original).to_hex().to_string()
+    );
+    let original = decode_segment(&first_original, &first_path, &CpuAccelerator).unwrap();
+    let mut first_rows = original
+        .blocks
+        .into_iter()
+        .flatten()
+        .map(|row| row.entry)
+        .collect::<Vec<_>>();
+    assert_eq!(first_rows.len(), 7);
+    let name_key = CatalogKey::Name("accounts");
+    let key_bytes = name_key.encode().unwrap();
+    let name_position = first_rows
+        .iter()
+        .position(|row| {
+            row.cf.0 == CATALOG_CF
+                && row.key.as_ref() == key_bytes.as_slice()
+                && row.version.sequence == 2
+        })
+        .expect("flushed CREATE has Name@2");
+    let original_bytes = fixed_copy_oracle(
+        "create_tag7",
+        "catalog_name_accounts",
+        CATALOG_CF,
+        &key_bytes,
+        2,
+    );
+    assert_eq!(original_bytes.len(), 12);
+    assert_eq!(
+        first_rows[name_position].version.value,
+        StoredValue::Put(original_bytes.clone())
+    );
+    assert!(matches!(
+        CatalogValue::decode(&name_key, &original_bytes, root),
+        Ok(CatalogValue::Name(_))
+    ));
+    let peer_bytes = if conflicting {
+        let changed = CatalogValue::Name(CollectionId::new(3).unwrap())
+            .encode()
+            .unwrap();
+        assert_eq!(changed.len(), original_bytes.len());
+        assert_ne!(changed, original_bytes);
+        assert!(matches!(
+            CatalogValue::decode(&name_key, &changed, root),
+            Ok(CatalogValue::Name(_))
+        ));
+        changed
+    } else {
+        original_bytes.clone()
+    };
+
+    // One writer-framed value is external; the other remains a literal Put.
+    // Value file 2 is independent of the first segment writer's output file.
+    let value_path = layout.value_log_path(2);
+    let external_bytes = if first_external {
+        &original_bytes
+    } else {
+        &peer_bytes
+    };
+    let pointer = append_catalog_value_frame(&value_path, external_bytes);
+    assert_eq!(Path::new(&pointer.path), value_path.as_path());
+    assert_eq!(pointer.offset, 0);
+    if first_external {
+        first_rows[name_position].version.value = StoredValue::BlobPointer(pointer.clone());
+    }
+    let first_entry = first_rows[name_position].clone();
+    let mut second_entry = first_entry.clone();
+    second_entry.version.value = if first_external {
+        StoredValue::Put(peer_bytes.clone())
+    } else {
+        StoredValue::BlobPointer(pointer.clone())
+    };
+
+    let first_value_path = layout.value_log_path(1);
+    let mut first_value_log = ValueLog::open(&first_value_path).unwrap();
+    let first_meta = SegmentWriter::write(
+        SegmentWriteOptions {
+            path: &first_path,
+            id: 1,
+            level: 0,
+            compression: Compression::None,
+            accelerator: &CpuAccelerator,
+            value_log: &mut first_value_log,
+            large_value_threshold: config.large_value_threshold,
+            block_size: config.block_size,
+            partitioned_bloom: None,
+            direct_io: false,
+        },
+        first_rows,
+    )
+    .unwrap();
+    drop(first_value_log);
+    fs::remove_file(&first_value_path).unwrap();
+    let second_path = layout.segment_path(1, 2);
+    fs::create_dir_all(second_path.parent().unwrap()).unwrap();
+    let mut second_value_log = ValueLog::open(&value_path).unwrap();
+    let second_meta = SegmentWriter::write(
+        SegmentWriteOptions {
+            path: &second_path,
+            id: 2,
+            level: 1,
+            compression: Compression::None,
+            accelerator: &CpuAccelerator,
+            value_log: &mut second_value_log,
+            large_value_threshold: config.large_value_threshold,
+            block_size: config.block_size,
+            partitioned_bloom: None,
+            direct_io: false,
+        },
+        vec![second_entry.clone()],
+    )
+    .unwrap();
+    drop(second_value_log);
+
+    // Recheck framing after both segment writers, including the exact EOF.
+    assert_catalog_value_frame(&pointer, external_bytes);
+    let value_raw = fs::read(&value_path).unwrap();
+    assert_eq!(value_raw.len() as u64, 12 + pointer.len);
+    let value_digest = blake3::hash(&value_raw);
+    let first_written = fs::read(&first_path).unwrap();
+    let second_written = fs::read(&second_path).unwrap();
+    assert_eq!(
+        first_meta.file_digest,
+        blake3::hash(&first_written).to_hex().to_string()
+    );
+    assert_eq!(
+        second_meta.file_digest,
+        blake3::hash(&second_written).to_hex().to_string()
+    );
+    let first_decoded = decode_segment(&first_written, &first_path, &CpuAccelerator).unwrap();
+    let second_decoded = decode_segment(&second_written, &second_path, &CpuAccelerator).unwrap();
+    assert_eq!(second_decoded.blocks.iter().flatten().count(), 1);
+    assert_eq!(second_decoded.blocks[0][0].entry, second_entry);
+    let first_offsets = literal_block_offsets(&first_written, 0, 1, first_decoded.blocks.len());
+    let second_offsets = literal_block_offsets(&second_written, 1, 2, second_decoded.blocks.len());
+    let locations = [
+        exact_entry_location(&first_decoded, &first_offsets, &first_entry),
+        exact_entry_location(&second_decoded, &second_offsets, &second_entry),
+    ];
+    assert_ne!(
+        physical_id(&File::open(&first_path).unwrap(), &first_path).unwrap(),
+        physical_id(&File::open(&second_path).unwrap(), &second_path).unwrap()
+    );
+    manifest.segments[0] = first_meta;
+    manifest.segments.push(second_meta);
+    manifest.next_segment_id = 3;
+    ManifestStore::new(manifest_path.clone())
+        .save(&manifest)
+        .unwrap();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    manifest.validate_v4(root).unwrap();
+    assert!(matches!(
+        inspect_v4_owner(&lease, &config, &CpuAccelerator),
+        Err(PraxisError::UnsupportedCatalogFeature {
+            feature: "v4 installed cut beyond narrow D0 bootstrap"
+        })
+    ));
+    let before = snapshot(dir.path());
+
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let segment = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+        let copies = segment
+            .rows
+            .iter()
+            .filter(|row| row.cf == CATALOG_CF && row.key == key_bytes && row.sequence == 2)
+            .collect::<Vec<_>>();
+        assert_eq!(copies.len(), 2);
+        for (index, (row, expected)) in copies.iter().zip([&first_entry, &second_entry]).enumerate()
+        {
+            assert_eq!(
+                row.source,
+                SegmentSource {
+                    level: index as u32,
+                    id: index as u64 + 1,
+                    manifest_ordinal: index,
+                }
+            );
+            assert_eq!((row.block_offset, row.row_ordinal), locations[index]);
+            assert_eq!(
+                row.classification,
+                PhysicalRowClass::BoundProtected(ProtectedRole::Catalog)
+            );
+            let expected_value = match &expected.version.value {
+                StoredValue::Put(bytes) => ObservedSegmentValue::Put(bytes.clone()),
+                StoredValue::BlobPointer(pointer) => ObservedSegmentValue::Pointer {
+                    pointer: pointer.clone(),
+                    expires_at_ms: None,
+                },
+                other => panic!("Name copy has an unexpected wire operation: {other:?}"),
+            };
+            assert_eq!(row.value, expected_value);
+        }
+        let mut probe = ValueFileScanProbe::default();
+        let value = collect_value_witness(root, &manifest, &segment.rows, budget, &mut probe)
+            .expect("mixed writer-framed Name pointer must authenticate");
+        assert_eq!(value.files.len(), 1);
+        assert_eq!(value.extents.len(), 1);
+        assert_eq!(probe.proof_full_file_hashes, 1);
+        let file = &value.files[0];
+        assert_eq!(file.path.as_path(), value_path.as_path());
+        assert_eq!(file.len, value_raw.len() as u64);
+        assert_eq!(file.digest, value_digest);
+        assert_eq!(
+            file.identity,
+            physical_id(&File::open(&value_path).unwrap(), &value_path).unwrap()
+        );
+        let external_index = if first_external { 0 } else { 1 };
+        let external_row = copies[external_index];
+        let extent = &value.extents[0];
+        assert_eq!(extent.file_id, file.id);
+        assert_eq!(
+            extent.locator,
+            ValueRowLocator {
+                source: external_row.source,
+                block_offset: external_row.block_offset,
+                row_ordinal: external_row.row_ordinal,
+            }
+        );
+        assert_ne!(
+            extent.locator,
+            ValueRowLocator {
+                source: copies[1 - external_index].source,
+                block_offset: copies[1 - external_index].block_offset,
+                row_ordinal: copies[1 - external_index].row_ordinal,
+            }
+        );
+        assert_eq!(
+            (extent.offset, extent.len, extent.checksum),
+            (pointer.offset, pointer.len, pointer.checksum)
+        );
+        value.discard(root, budget).unwrap();
+        segment.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(snapshot(dir.path()), before);
+
+        let error = match collect_protected_copy_ledger(root, &manifest, budget) {
+            Err(error) => error,
+            Ok(candidate) => {
+                candidate.discard(root, budget).unwrap();
+                panic!("mixed Name pair unexpectedly reached a private candidate")
+            }
+        };
+        assert_eq!(
+            budget.remaining_bytes(),
+            balance,
+            "refusal must refund exactly"
+        );
+        assert_eq!(snapshot(dir.path()), before, "refusal must not edit files");
+        if conflicting {
+            match error {
+                PraxisError::Corrupt { reason, .. }
+                    if reason == "protected physical-copy actual bytes conflict" => {}
+                other => panic!("valid mixed Name bytes must conflict: {other:?}"),
+            }
+        } else {
+            assert!(matches!(
+                error,
+                PraxisError::UnsupportedCatalogFeature {
+                    feature: "protected physical-copy bytes await authenticated replay"
+                }
+            ));
+        }
+    });
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn writer_inline_then_external_catalog_name_equal_reaches_private_gate() {
+    writer_mixed_catalog_name_pair_case(false, false);
+}
+
+#[test]
+fn writer_inline_then_external_catalog_name_valid_conflict_requires_corrupt() {
+    writer_mixed_catalog_name_pair_case(false, true);
+}
+
+#[test]
+fn writer_external_then_inline_catalog_name_equal_reaches_private_gate() {
+    writer_mixed_catalog_name_pair_case(true, false);
+}
+
+#[test]
+fn writer_external_then_inline_catalog_name_valid_conflict_requires_corrupt() {
+    writer_mixed_catalog_name_pair_case(true, true);
+}
