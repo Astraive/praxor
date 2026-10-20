@@ -47,6 +47,9 @@ const CATALOG_CF: &str = "__praxor_record_catalog_v1";
 // The public installed owner remains fenced while #81 is incomplete.
 mod value_file_witness_red;
 
+// Private same-(CF,key,S) copy ledger RED; no public owner is granted.
+mod physical_copy_ledger_red;
+
 fn row(key: u8, value: StoredValue) -> SegmentEntry {
     SegmentEntry {
         cf: ColumnFamily(CATALOG_CF.into()),
