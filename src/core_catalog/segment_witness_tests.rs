@@ -2,7 +2,8 @@ use super::codec::{
     CatalogKey, CatalogValue, CollectionId, Field, Head, NamespaceId, ScalarType, Schema,
 };
 use super::external_value::{
-    ValuePayloadProbe, resolve_catalog_external_caps, resolve_catalog_head_external,
+    UnwitnessedRecordValue, ValuePayloadProbe, resolve_catalog_external_caps,
+    resolve_catalog_head_external, resolve_record_external_caps,
 };
 use super::physical::inspect_v4_owner;
 use super::physical_tests::flushed_create_fixture;
@@ -7619,36 +7620,6 @@ mod record_external_caps_red {
     use super::*;
     use crate::core_records::codec::{Decision, Key as RecordKey, Role as RecordRole, Row};
 
-    #[derive(Debug, Eq, PartialEq)]
-    enum UnwitnessedRecordValue {
-        Fixed {
-            len: usize,
-            bytes: [u8; 80],
-        },
-        Descriptor {
-            encoded_len: u64,
-            encoded_digest: blake3::Hash,
-            name_len: u64,
-            namespace_len: u64,
-        },
-        Payload {
-            user_len: u64,
-            digest: blake3::Hash,
-        },
-    }
-
-    fn resolve_record_external_caps_red(
-        _root: &Path,
-        _manifest: &Manifest,
-        _row: &ObservedSegmentRow,
-        _budget: &mut PhysicalWitnessBudget,
-        _probe: &mut ValuePayloadProbe,
-    ) -> crate::errors::Result<UnwitnessedRecordValue> {
-        Err(PraxisError::UnsupportedCatalogFeature {
-            feature: "external record key-cap resolver is not implemented",
-        })
-    }
-
     fn role(key: &RecordKey<'_>) -> RecordRole {
         match key {
             RecordKey::Binding | RecordKey::Allocator | RecordKey::Descriptor(_) => {
@@ -7875,14 +7846,14 @@ mod record_external_caps_red {
             };
             assert_eq!(pointer.len, len as u64);
             let mut probe = ValuePayloadProbe::default();
-            let result =
-                resolve_record_external_caps_red(root, &manifest, target, budget, &mut probe);
+            let result = resolve_record_external_caps(root, &manifest, target, budget, &mut probe);
             candidate.discard(root, budget).unwrap();
             assert_eq!(budget.remaining_bytes(), balance);
             assert_eq!(snapshot(dir.path()), before);
             assert_eq!(result.unwrap(), expected);
             assert_eq!(probe.open_attempts, 1);
             assert!(probe.read_attempts >= 2);
+            assert_eq!(probe.reserve_attempts, 0);
         });
         assert_eq!(snapshot(dir.path()), before);
     }
@@ -7949,8 +7920,7 @@ mod record_external_caps_red {
             };
             assert_eq!(pointer.len, claimed_len);
             let mut probe = ValuePayloadProbe::default();
-            let result =
-                resolve_record_external_caps_red(root, &manifest, target, budget, &mut probe);
+            let result = resolve_record_external_caps(root, &manifest, target, budget, &mut probe);
             candidate.discard(root, budget).unwrap();
             assert_eq!(budget.remaining_bytes(), balance);
             assert_eq!(snapshot(dir.path()), before);
@@ -8020,6 +7990,15 @@ mod record_external_caps_red {
         .unwrap()
     }
 
+    fn descriptor_with_namespace(namespace: &str) -> Vec<u8> {
+        Row::Descriptor {
+            name: "idx",
+            namespace,
+        }
+        .encode()
+        .unwrap()
+    }
+
     fn payload_value() -> Vec<u8> {
         let user = vec![0x5a; 256 * 1024];
         Row::Payload(&user).encode().unwrap()
@@ -8056,6 +8035,32 @@ mod record_external_caps_red {
             RecordKey::Descriptor(1),
             Some(descriptor_value()),
             1024 * 1024 + 35,
+        );
+    }
+
+    #[test]
+    fn private_record_descriptor_streams_valid_utf8_across_chunk_boundary() {
+        let mut namespace = "x".repeat(64 * 1024 - 1);
+        namespace.push('é');
+        namespace.push('z');
+        let encoded = descriptor_with_namespace(&namespace);
+        assert_eq!(encoded.len(), namespace.len() + 35);
+        assert_positive(
+            RecordKey::Descriptor(1),
+            Some(encoded),
+            namespace.len() + 35,
+        );
+    }
+
+    #[test]
+    fn private_record_descriptor_streams_past_half_of_shared_budget() {
+        let namespace = "n".repeat(33 * 1024 * 1024);
+        let encoded = descriptor_with_namespace(&namespace);
+        assert_eq!(encoded.len(), namespace.len() + 35);
+        assert_positive(
+            RecordKey::Descriptor(1),
+            Some(encoded),
+            namespace.len() + 35,
         );
     }
 
