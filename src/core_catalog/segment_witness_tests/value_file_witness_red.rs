@@ -190,8 +190,15 @@ fn private_value_file_witnesses_head_and_near_cap_schema_as_distinct_extents_in_
     assert_eq!(snapshot(dir.path()), before);
 }
 
-#[test]
-fn private_value_inventory_witnesses_two_writer_files_once_each() {
+fn writer_two_file_catalog_external_fixture() -> (
+    tempfile::TempDir,
+    WriterLease,
+    Manifest,
+    Vec<u8>,
+    Vec<u8>,
+    ValuePointer,
+    PraxisConfig,
+) {
     let (dir, lease, mut manifest, schema_key, schema_bytes) = writer_catalog_external_fixture(
         CatalogKey::Schema(CollectionId::new(2).unwrap()),
         Some(schema_value_at_limit(true)),
@@ -269,6 +276,27 @@ fn private_value_inventory_witnesses_two_writer_files_once_each() {
             .to_hex()
             .to_string()
     );
+    (
+        dir,
+        lease,
+        manifest,
+        schema_key,
+        schema_bytes,
+        second_pointer,
+        config,
+    )
+}
+
+#[test]
+fn private_value_inventory_witnesses_two_writer_files_once_each() {
+    let (dir, lease, manifest, schema_key, schema_bytes, second_pointer, config) =
+        writer_two_file_catalog_external_fixture();
+    let root = lease.root();
+    let layout = DiskLayout::at(root);
+    let first_path = layout.value_log_path(1);
+    let second_path = layout.value_log_path(2);
+    let first_spelling = first_path.to_str().unwrap();
+    let second_spelling = second_path.to_str().unwrap();
 
     let first_bytes = fs::read(&first_path).unwrap();
     let second_bytes = fs::read(&second_path).unwrap();
@@ -421,6 +449,127 @@ fn private_value_inventory_witnesses_two_writer_files_once_each() {
         assert_eq!(snapshot(dir.path()), before);
     });
     assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn private_value_inventory_refunds_after_second_file_corruption() {
+    #[derive(Clone, Copy, Debug)]
+    enum Damage {
+        Missing,
+        ShortHeader,
+        ShortPayload,
+        HeaderLength,
+        HeaderChecksum,
+        Payload,
+    }
+
+    for damage in [
+        Damage::Missing,
+        Damage::ShortHeader,
+        Damage::ShortPayload,
+        Damage::HeaderLength,
+        Damage::HeaderChecksum,
+        Damage::Payload,
+    ] {
+        let (dir, lease, manifest, schema_key, schema_bytes, second_pointer, config) =
+            writer_two_file_catalog_external_fixture();
+        let root = lease.root();
+        let layout = DiskLayout::at(root);
+        let first_path = layout.value_log_path(1);
+        let second_path = layout.value_log_path(2);
+        assert_eq!(Path::new(&second_pointer.path), second_path);
+        assert_eq!(second_pointer.len, schema_bytes.len() as u64);
+        let intact_tree = snapshot(dir.path());
+
+        let flip = |offset: u64| {
+            let original = fs::read(&second_path).unwrap();
+            let at = usize::try_from(offset).unwrap();
+            assert!(at < original.len());
+            let mut file = OpenOptions::new().write(true).open(&second_path).unwrap();
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            file.write_all(&[original[at] ^ 1]).unwrap();
+            file.flush().unwrap();
+        };
+        match damage {
+            Damage::Missing => fs::remove_file(&second_path).unwrap(),
+            Damage::ShortHeader => {
+                OpenOptions::new()
+                    .write(true)
+                    .open(&second_path)
+                    .unwrap()
+                    .set_len(second_pointer.offset + 11)
+                    .unwrap();
+            }
+            Damage::ShortPayload => {
+                OpenOptions::new()
+                    .write(true)
+                    .open(&second_path)
+                    .unwrap()
+                    .set_len(second_pointer.offset + 12 + second_pointer.len - 1)
+                    .unwrap();
+            }
+            Damage::HeaderLength => flip(second_pointer.offset),
+            Damage::HeaderChecksum => flip(second_pointer.offset + 8),
+            Damage::Payload => flip(second_pointer.offset + 12 + 16_384),
+        }
+        let damaged_tree = snapshot(dir.path());
+        assert_ne!(damaged_tree, intact_tree, "{damage:?}");
+
+        let owner_result = inspect_v4_owner(&lease, &config, &CpuAccelerator);
+        assert!(
+            matches!(
+                &owner_result,
+                Err(PraxisError::UnsupportedCatalogFeature {
+                    feature: "v4 installed cut beyond narrow D0 bootstrap"
+                }) | Err(PraxisError::Corrupt { .. })
+            ),
+            "the public owner admitted a damaged private fixture: {owner_result:?}"
+        );
+        assert_eq!(snapshot(dir.path()), damaged_tree, "{damage:?}");
+
+        with_wal_budget(root, &manifest, |budget| {
+            let wal_balance = budget.remaining_bytes();
+            let segments = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+            let segment_balance = budget.remaining_bytes();
+            assert!(segment_balance < wal_balance);
+            assert_eq!(
+                catalog_pointer(&segments.rows, &[0]).path,
+                first_path.to_str().unwrap()
+            );
+            assert_eq!(
+                catalog_pointer(&segments.rows, &schema_key),
+                &second_pointer
+            );
+
+            let mut probe = ValueFileScanProbeRed::default();
+            let error =
+                collect_value_witness_red(root, &manifest, &segments.rows, budget, &mut probe)
+                    .unwrap_err();
+            assert!(
+                matches!(&error, PraxisError::Corrupt { .. }),
+                "{damage:?} failed before the value witness corruption path: {error}"
+            );
+            let PraxisError::Corrupt { path, .. } = &error else {
+                unreachable!("the preceding assertion checked the error variant")
+            };
+            assert_eq!(path, &second_path, "{damage:?} must fail at file 2");
+            assert_eq!(
+                probe.proof_full_file_hashes,
+                if matches!(damage, Damage::Missing) {
+                    1
+                } else {
+                    2
+                },
+                "{damage:?} must reach the second file after witnessing the first"
+            );
+            assert_eq!(probe.recheck_full_file_hashes, 0);
+            assert_eq!(budget.remaining_bytes(), segment_balance, "{damage:?}");
+            segments.discard(root, budget).unwrap();
+            assert_eq!(budget.remaining_bytes(), wal_balance, "{damage:?}");
+            assert_eq!(snapshot(dir.path()), damaged_tree, "{damage:?}");
+        });
+        assert_eq!(snapshot(dir.path()), damaged_tree, "{damage:?}");
+    }
 }
 
 #[test]
