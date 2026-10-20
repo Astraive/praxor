@@ -43,6 +43,10 @@ use zstd::zstd_safe::zstd_sys as zstd_ffi;
 
 const CATALOG_CF: &str = "__praxor_record_catalog_v1";
 
+// Private test-first contract for full-file and per-extent value witnesses.
+// The public installed owner remains fenced while #81 is incomplete.
+mod value_file_witness_red;
+
 fn row(key: u8, value: StoredValue) -> SegmentEntry {
     SegmentEntry {
         cf: ColumnFamily(CATALOG_CF.into()),
