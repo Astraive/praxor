@@ -1,75 +1,9 @@
 use super::*;
-use crate::core_catalog::segment_witness::SegmentPhysicalId;
-
-// Test-only shape for the next private witness cut. A GREEN implementation
-// replaces the Unsupported seam with a charged, opened-file proof; neither
-// this shape nor the tests grant public installed-owner authority.
-#[derive(Debug)]
-struct ValueFileWitnessRed {
-    id: u64,
-    path: PathBuf,
-    identity: SegmentPhysicalId,
-    len: u64,
-    digest: blake3::Hash,
-}
-
-#[derive(Debug)]
-struct ValueExtentWitnessRed {
-    file_id: u64,
-    offset: u64,
-    len: u64,
-    checksum: u32,
-    payload_digest: blake3::Hash,
-}
-
-#[derive(Debug)]
-struct ValueWitnessCandidateRed {
-    files: Vec<ValueFileWitnessRed>,
-    extents: Vec<ValueExtentWitnessRed>,
-    retained_bytes: usize,
-}
-
-impl ValueWitnessCandidateRed {
-    fn discard(self, root: &Path, budget: &mut PhysicalWitnessBudget) -> crate::errors::Result<()> {
-        let Self {
-            files,
-            extents,
-            retained_bytes,
-        } = self;
-        drop(files);
-        drop(extents);
-        budget.release(root, retained_bytes)
-    }
-}
-
-#[derive(Default)]
-struct ValueFileScanProbeRed {
-    proof_full_file_hashes: usize,
-    recheck_full_file_hashes: usize,
-}
-
-fn collect_value_witness_red(
-    _root: &Path,
-    _manifest: &Manifest,
-    _rows: &[ObservedSegmentRow],
-    _budget: &mut PhysicalWitnessBudget,
-    _probe: &mut ValueFileScanProbeRed,
-) -> crate::errors::Result<ValueWitnessCandidateRed> {
-    Err(PraxisError::UnsupportedCatalogFeature {
-        feature: "external value-file and extent witness is not implemented",
-    })
-}
-
-fn recheck_value_witness_red(
-    _root: &Path,
-    _manifest: &Manifest,
-    _candidate: &ValueWitnessCandidateRed,
-    _probe: &mut ValueFileScanProbeRed,
-) -> crate::errors::Result<()> {
-    Err(PraxisError::UnsupportedCatalogFeature {
-        feature: "external value-file and extent recheck is not implemented",
-    })
-}
+use crate::core_catalog::value_witness::{
+    ValueFileScanProbe as ValueFileScanProbeRed,
+    collect_value_witness as collect_value_witness_red,
+    recheck_value_witness as recheck_value_witness_red,
+};
 
 fn catalog_pointer<'a>(rows: &'a [ObservedSegmentRow], key: &[u8]) -> &'a ValuePointer {
     let row = rows
@@ -252,6 +186,113 @@ fn private_value_file_witnesses_head_and_near_cap_schema_as_distinct_extents_in_
         segments.discard(root, budget).unwrap();
         assert_eq!(budget.remaining_bytes(), balance);
         assert_eq!(snapshot(dir.path()), before);
+    });
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn private_value_file_rejects_normalized_path_aliases_before_scanning() {
+    let (dir, lease, manifest, _, _) =
+        writer_catalog_external_fixture(CatalogKey::Name("accounts"), None, 12);
+    let root = lease.root();
+    let value_path = DiskLayout::at(root).value_log_path(1);
+    let canonical = value_path.to_str().unwrap();
+    let parent = value_path.parent().unwrap().to_str().unwrap();
+    let name = value_path.file_name().unwrap().to_str().unwrap();
+    let sep = std::path::MAIN_SEPARATOR;
+    let before = snapshot(dir.path());
+
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let segments = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+        let segment_balance = budget.remaining_bytes();
+        assert!(
+            segments
+                .rows
+                .iter()
+                .filter(|row| matches!(&row.value, ObservedSegmentValue::Pointer { .. }))
+                .count()
+                >= 2
+        );
+
+        // The writer's own spelling is accepted and leaves no retained debit.
+        assert!(
+            segments
+                .rows
+                .iter()
+                .filter_map(|row| match &row.value {
+                    ObservedSegmentValue::Pointer { pointer, .. } => Some(pointer.path.as_str()),
+                    _ => None,
+                })
+                .all(|path| path == canonical)
+        );
+        let mut good_probe = ValueFileScanProbeRed::default();
+        let good =
+            collect_value_witness_red(root, &manifest, &segments.rows, budget, &mut good_probe)
+                .unwrap();
+        assert_eq!(good_probe.proof_full_file_hashes, 1);
+        good.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), segment_balance);
+
+        let aliases = [
+            format!("{parent}{sep}{sep}{name}"),
+            format!("{parent}{sep}.{sep}{name}"),
+        ];
+        for alias in aliases {
+            assert_ne!(alias, canonical);
+            for all_pointers in [true, false] {
+                let mut aliased = segments.rows.clone();
+                if all_pointers {
+                    for row in &mut aliased {
+                        if let ObservedSegmentValue::Pointer { pointer, .. } = &mut row.value {
+                            pointer.path = alias.clone();
+                        }
+                    }
+                } else {
+                    let last = aliased
+                        .iter_mut()
+                        .rev()
+                        .find_map(|row| match &mut row.value {
+                            ObservedSegmentValue::Pointer { pointer, .. } => Some(pointer),
+                            _ => None,
+                        })
+                        .unwrap();
+                    last.path = alias.clone();
+                }
+                let mut probe = ValueFileScanProbeRed::default();
+                let error =
+                    collect_value_witness_red(root, &manifest, &aliased, budget, &mut probe)
+                        .unwrap_err();
+                assert!(matches!(error, PraxisError::Corrupt { .. }), "{error}");
+                assert_eq!(probe.proof_full_file_hashes, 0);
+                drop(aliased);
+                assert_eq!(budget.remaining_bytes(), segment_balance);
+                assert_eq!(snapshot(dir.path()), before);
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            let alias = format!("{parent}/{name}");
+            assert_ne!(alias, canonical);
+            let mut aliased = segments.rows.clone();
+            for row in &mut aliased {
+                if let ObservedSegmentValue::Pointer { pointer, .. } = &mut row.value {
+                    pointer.path = alias.clone();
+                }
+            }
+            let mut probe = ValueFileScanProbeRed::default();
+            let error = collect_value_witness_red(root, &manifest, &aliased, budget, &mut probe)
+                .unwrap_err();
+            assert!(matches!(error, PraxisError::Corrupt { .. }), "{error}");
+            assert_eq!(probe.proof_full_file_hashes, 0);
+            drop(aliased);
+            assert_eq!(budget.remaining_bytes(), segment_balance);
+            assert_eq!(snapshot(dir.path()), before);
+        }
+
+        segments.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), balance);
     });
     assert_eq!(snapshot(dir.path()), before);
 }
