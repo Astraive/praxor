@@ -3,6 +3,7 @@
 //! No caller may turn these observations into an owner proof until the later
 //! protected-copy, installed-relation, and WAL-history proofs are complete.
 
+use super::authority::CATALOG_CF;
 use crate::config::Compression;
 use crate::disk::DiskLayout;
 use crate::errors::{PraxisError, Result};
@@ -33,6 +34,26 @@ const SEGMENT_HEADER_BYTES: usize = 21;
 const SEGMENT_TRAILER_BYTES: usize = 12;
 const BLOCK_HEADER_BYTES: usize = 12;
 const HASH_CHUNK_BYTES: usize = 64 * 1024;
+const LZ4_HEAD_BYTES: usize = 48;
+const LZ4_HEAD_REPLAY_TRANSIENT_BYTES: usize = 12 * 1024 * 1024;
+
+// A selected compressed Head remains a small private proof. Keep the existing
+// three-pass parser below CopyReplayWork's 16 MiB transient ceiling.
+const LZ4_HEAD_REPLAY_PROFILE: ProofProfile = ProofProfile {
+    max_physical_file_bytes: MAX_LITERAL_SEGMENT_BYTES as u64,
+    max_physical_visit_bytes: MAX_LITERAL_SEGMENT_BYTES as u64,
+    max_encoded_block_bytes: MAX_LITERAL_SEGMENT_BYTES as u64,
+    max_decoded_block_bytes: MAX_LITERAL_SEGMENT_BYTES as u64,
+    max_footer_bytes: MAX_LITERAL_SEGMENT_BYTES as u64,
+    max_decoded_file_bytes: (4 * MAX_LITERAL_SEGMENT_BYTES) as u64,
+    max_decoded_visit_bytes: (4 * MAX_LITERAL_SEGMENT_BYTES) as u64,
+    max_blocks_file: 4_096,
+    max_blocks_visit: 4_096,
+    max_rows_file: 65_536,
+    max_rows_visit: 65_536,
+    max_parser_owned_peak_bytes: 8 * 1024 * 1024,
+    max_zstd_native_workspace_bytes: 0,
+};
 
 /// Private proof policy for compressed files only. Literal admission is unchanged.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1284,6 +1305,22 @@ impl Drop for LiteralReplayCapture<'_> {
     }
 }
 
+/// Keep the parser's charged workspace live across all three authenticated
+/// passes and the callback. Errors and unwinds refund it after allocations drop.
+struct CompressedReplayCharge<'a> {
+    budget: &'a mut PhysicalWitnessBudget,
+    path: &'a Path,
+    charge: usize,
+}
+
+impl Drop for CompressedReplayCharge<'_> {
+    fn drop(&mut self) {
+        if self.budget.release(self.path, self.charge).is_err() {
+            std::process::abort();
+        }
+    }
+}
+
 struct SegmentLocator {
     source: SegmentSource,
     path: PathBuf,
@@ -2448,11 +2485,11 @@ pub(crate) fn recheck_all_copy_replay_witnesses(
     })
 }
 
-/// Replay one exact writer-framed literal Put. `on_value` receives a borrow
-/// into authenticated captured bytes; its return is provisional until this
-/// function finishes selected-file checks. A successful call is insufficient
-/// for ledger admission: `recheck_all_copy_replay_witnesses` must run over the
-/// complete retained candidate after all row callbacks and at consumption.
+/// Replay one exact writer-framed Put: an uncompressed literal or the narrow
+/// LZ4 Catalog Head. The callback receives authenticated selected bytes, but
+/// its return is provisional until selected-file checks finish. A successful
+/// call is insufficient for ledger admission: complete witness fences must
+/// cover all retained files after callbacks and again at consumption.
 #[allow(dead_code)] // The private copy ledger calls this after its GREEN slice.
 #[allow(clippy::too_many_arguments)] // The source, locator, work, and shared receipt are independent proof inputs.
 pub(crate) fn with_authenticated_literal_put<F>(
@@ -2545,6 +2582,11 @@ where
     }
     match compression {
         0 => {}
+        1 if expected.cf == CATALOG_CF && expected.key == [0_u8].as_slice() => {
+            return with_authenticated_lz4_head_put(
+                path, meta, witness, locator, expected, work, budget, file, on_value,
+            );
+        }
         1 | 2 => {
             return Err(unsupported(
                 "compressed physical-copy replay not implemented",
@@ -2625,6 +2667,119 @@ where
         || physical_id(&reopened, path)? != witness.identity
     {
         return Err(corrupt(path, "literal replay namespace identity changed"));
+    }
+    replay_check_real(path)?;
+    Ok(())
+}
+
+/// A narrow LZ4 Head replay uses the already bounded segment parser. Its
+/// callback sees only a fixed stack copy after every pass has authenticated
+/// the complete selected file. The caller still owes complete witness fences.
+#[allow(clippy::too_many_arguments)] // The exact row, manifest receipt, and two ledgers are distinct proof inputs.
+fn with_authenticated_lz4_head_put<F>(
+    path: &Path,
+    meta: &SegmentMetadata,
+    witness: &SegmentFileWitness,
+    locator: PhysicalRowLocator,
+    expected: ExpectedLiteralPut<'_>,
+    work: &mut CopyReplayWork,
+    budget: &mut PhysicalWitnessBudget,
+    mut opened: File,
+    on_value: F,
+) -> Result<()>
+where
+    F: FnOnce(&[u8]) -> Result<()>,
+{
+    // The caller already reserved two opens and 2*(len+1)+header bytes.
+    // Each parser pass may preread a trailer and footer before its contiguous
+    // full-file read. Five more file lengths cover all three passes and the
+    // final same-handle hash; three more opens cover the passes and namespace.
+    let additional_reads = witness
+        .len
+        .checked_mul(5)
+        .and_then(|bytes| bytes.checked_add(2))
+        .ok_or_else(|| unsupported("compressed Head replay physical reads exceed proof profile"))?;
+    work.reserve(additional_reads, 3, LZ4_HEAD_REPLAY_TRANSIENT_BYTES)?;
+    budget.charge(path, LZ4_HEAD_REPLAY_TRANSIENT_BYTES)?;
+    let _charge = CompressedReplayCharge {
+        budget,
+        path,
+        charge: LZ4_HEAD_REPLAY_TRANSIENT_BYTES,
+    };
+
+    let mut parser = WorkLedger::new(LZ4_HEAD_REPLAY_PROFILE);
+    let first = scan_lz4_pass1(path, witness.identity, meta, &mut parser, |_| {})?;
+    if first.len != witness.len
+        || first.digest != witness.digest
+        || first.work.rows != witness.observed_rows
+    {
+        return Err(corrupt(
+            path,
+            "compressed Head replay differs from segment witness",
+        ));
+    }
+    let first_pass = parser.first_pass();
+    parser.accept_authenticated_file(first_pass, first.work, path)?;
+    let second = scan_lz4_pass2(path, witness.identity, meta, &parser, first, |_| {})?;
+    if second != first {
+        return Err(corrupt(path, "compressed Head Bloom replay changed"));
+    }
+
+    let mut selected = [0_u8; LZ4_HEAD_BYTES];
+    let mut selected_count = 0_u8;
+    let mut invalid_selected = false;
+    let third = scan_lz4_pass3(
+        path,
+        witness.identity,
+        meta,
+        locator.source,
+        &parser,
+        first,
+        |row| {
+            if (row.block_offset, row.row_ordinal) != (locator.block_offset, locator.row_ordinal) {
+                return Ok(());
+            }
+            selected_count = selected_count.saturating_add(1);
+            if row.source != locator.source
+                || row.cf.as_str() != expected.cf
+                || row.key.as_slice() != expected.key
+                || row.sequence != expected.sequence
+            {
+                invalid_selected = true;
+            } else if let ObservedSegmentValue::Put(value) = row.value {
+                if value.len() == LZ4_HEAD_BYTES {
+                    selected.copy_from_slice(&value);
+                } else {
+                    invalid_selected = true;
+                }
+            } else {
+                invalid_selected = true;
+            }
+            Ok(())
+        },
+    )?;
+    if third != first || third != second {
+        return Err(corrupt(path, "compressed Head selected-row replay changed"));
+    }
+    if selected_count != 1 || invalid_selected {
+        return Err(corrupt(path, "compressed Head exact row locator changed"));
+    }
+    on_value(&selected)?;
+
+    opened.seek(SeekFrom::Start(0))?;
+    if hash_exact(&mut opened, witness.len, path)? != witness.digest
+        || opened.metadata()?.len() != witness.len
+        || physical_id(&opened, path)? != witness.identity
+    {
+        return Err(corrupt(path, "compressed Head same-handle recheck failed"));
+    }
+    replay_check_real(path)?;
+    let reopened = replay_existing(path, "v4 segment file disappeared", File::open(path))?;
+    if !reopened.metadata()?.is_file()
+        || reopened.metadata()?.len() != witness.len
+        || physical_id(&reopened, path)? != witness.identity
+    {
+        return Err(corrupt(path, "compressed Head namespace identity changed"));
     }
     replay_check_real(path)?;
     Ok(())
