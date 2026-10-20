@@ -7,7 +7,7 @@ use super::authority::CATALOG_CF;
 use super::codec::{CatalogKey, CatalogValue, Field};
 use super::segment_witness::{
     ObservedSegmentRow, ObservedSegmentValue, PhysicalRowClass, ProtectedRole, SegmentPhysicalId,
-    physical_id,
+    SegmentSource, physical_id,
 };
 use crate::core_records::codec::{Key as RecordKey, Role as RecordRole, Row as RecordRow};
 use crate::core_records::variable_stream::{VariableKind, VariableRowStream, VariableSummary};
@@ -19,7 +19,7 @@ use crate::wal::catalog_witness::{PhysicalWitnessBudget, path_charge, vector_cha
 use crate::wal::record::MAX_WAL_PAYLOAD_BYTES;
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 const HEADER_BYTES: u64 = 12;
@@ -28,6 +28,10 @@ const MAX_SCHEMA_FIELDS: usize = 128;
 const HASH_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_REFERENCED_VALUE_FILES: usize = 4_096;
 const MAX_STAGED_VALUE_POINTERS: usize = 65_536;
+const MAX_COPY_REPLAY_READ_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_COPY_REPLAY_OPENS: usize = 8_192;
+const COPY_REPLAY_SCRATCH_BYTES: usize =
+    HASH_CHUNK_BYTES + CATALOG_MAX_BYTES + HEADER_BYTES as usize + 1;
 
 struct PreparedValueFile {
     id: u64,
@@ -53,7 +57,37 @@ pub(super) struct ValueExtentWitness {
     pub(super) checksum: u32,
     pub(super) kind: Option<VariableKind>,
     pub(super) payload_digest: blake3::Hash,
+    pub(super) locator: ValueRowLocator,
     row_index: usize,
+}
+
+/// The original segment position remains attached to its value extent after
+/// the staged `ObservedSegmentRow` vector has been discarded by the copy ledger.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ValueRowLocator {
+    pub(super) source: SegmentSource,
+    pub(super) block_offset: u64,
+    pub(super) row_ordinal: u32,
+}
+
+impl ValueRowLocator {
+    fn from_row(row: &ObservedSegmentRow) -> Self {
+        Self {
+            source: row.source,
+            block_offset: row.block_offset,
+            row_ordinal: row.row_ordinal,
+        }
+    }
+
+    fn sort_key(self) -> (u32, u64, usize, u64, u32) {
+        (
+            self.source.level,
+            self.source.id,
+            self.source.manifest_ordinal,
+            self.block_offset,
+            self.row_ordinal,
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -66,6 +100,7 @@ pub(super) struct ValueRecordSummaryWitness {
 pub(super) struct ValueWitnessCandidate {
     pub(super) files: Vec<ValueFileWitness>,
     pub(super) extents: Vec<ValueExtentWitness>,
+    locator_order: Vec<usize>,
     pub(super) variable_summaries: Vec<ValueRecordSummaryWitness>,
     pub(super) retained_bytes: usize,
 }
@@ -75,11 +110,13 @@ impl ValueWitnessCandidate {
         let Self {
             files,
             extents,
+            locator_order,
             variable_summaries,
             retained_bytes,
         } = self;
         drop(files);
         drop(extents);
+        drop(locator_order);
         drop(variable_summaries);
         budget.release(root, retained_bytes)
     }
@@ -121,6 +158,71 @@ fn corrupt(path: &Path, reason: &'static str) -> PraxisError {
 
 fn budget_error(path: &Path) -> PraxisError {
     corrupt(path, "external value witness metadata budget exceeded")
+}
+
+fn replay_limit() -> PraxisError {
+    PraxisError::UnsupportedCatalogFeature {
+        feature: "external value copy replay exceeds the bounded private profile",
+    }
+}
+
+/// Cumulative physical work is charged before any selected-file replay. An
+/// attempt that fails still consumes its reserved work allowance.
+#[allow(dead_code)] // Used when the private #82 copy ledger integrates replay.
+#[derive(Default)]
+pub(super) struct ValueReplayWork {
+    pub(super) read_bytes: u64,
+    pub(super) open_attempts: usize,
+}
+
+#[allow(dead_code)] // Used when the private #82 copy ledger integrates replay.
+#[derive(Default)]
+pub(super) struct ValueReplayContext {
+    pub(super) work: ValueReplayWork,
+    pub(super) probe: ValueFileScanProbe,
+}
+
+impl ValueReplayWork {
+    fn reserve(&mut self, file_len: u64) -> Result<()> {
+        let read_bytes = file_len
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(2))
+            .and_then(|bytes| self.read_bytes.checked_add(bytes))
+            .filter(|bytes| *bytes <= MAX_COPY_REPLAY_READ_BYTES)
+            .ok_or_else(replay_limit)?;
+        let open_attempts = self
+            .open_attempts
+            .checked_add(3)
+            .filter(|opens| *opens <= MAX_COPY_REPLAY_OPENS)
+            .ok_or_else(replay_limit)?;
+        self.read_bytes = read_bytes;
+        self.open_attempts = open_attempts;
+        Ok(())
+    }
+}
+
+struct ReplayScratch<'a> {
+    budget: &'a mut PhysicalWitnessBudget,
+    path: &'a Path,
+}
+
+impl<'a> ReplayScratch<'a> {
+    fn new(path: &'a Path, budget: &'a mut PhysicalWitnessBudget) -> Result<Self> {
+        budget.charge(path, COPY_REPLAY_SCRATCH_BYTES)?;
+        Ok(ReplayScratch { budget, path })
+    }
+}
+
+impl Drop for ReplayScratch<'_> {
+    fn drop(&mut self) {
+        if self
+            .budget
+            .release(self.path, COPY_REPLAY_SCRATCH_BYTES)
+            .is_err()
+        {
+            std::process::abort();
+        }
+    }
 }
 
 /// Own every debit until the backing paths and vectors have dropped. A
@@ -221,6 +323,50 @@ fn count_distinct_sorted_ids(path: &Path, extents: &[ValueExtentWitness]) -> Res
         }
     }
     Ok(count)
+}
+
+fn validate_extent_layout(path: &Path, extents: &[ValueExtentWitness]) -> Result<()> {
+    for pair in extents.windows(2) {
+        if pair[0].file_id == pair[1].file_id {
+            let end = pair[0]
+                .offset
+                .checked_add(HEADER_BYTES)
+                .and_then(|n| n.checked_add(pair[0].len))
+                .ok_or_else(|| corrupt(path, "external value extent overflows"))?;
+            if end > pair[1].offset {
+                return Err(corrupt(path, "external value extents overlap"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The index is a charged permutation of extents, sorted by physical segment
+/// locator. Repeated locators cannot silently bind two different value ranges.
+fn validate_locator_order(
+    path: &Path,
+    extents: &[ValueExtentWitness],
+    order: &[usize],
+) -> Result<()> {
+    if order.len() != extents.len() {
+        return Err(corrupt(path, "external value locator index count changed"));
+    }
+    let mut previous = None;
+    for &index in order {
+        let key = extents
+            .get(index)
+            .ok_or_else(|| corrupt(path, "external value locator index is out of range"))?
+            .locator
+            .sort_key();
+        if previous.is_some_and(|prior| prior >= key) {
+            return Err(corrupt(
+                path,
+                "external value locator is duplicated or unordered",
+            ));
+        }
+        previous = Some(key);
+    }
+    Ok(())
 }
 
 /// A sorted, precharged Vec avoids HashSet's speculative bucket allocation.
@@ -601,6 +747,7 @@ fn scan_file(
     observed_len: u64,
     extents: &mut impl ExtentSink,
     mut validate: impl FnMut(usize, &[u8]) -> Result<()>,
+    mut on_chunk: impl FnMut(usize, &[u8]) -> Result<()>,
 ) -> Result<blake3::Hash> {
     let mut full = blake3::Hasher::new();
     let mut buffer = [0_u8; HASH_CHUNK_BYTES];
@@ -659,6 +806,7 @@ fn scan_file(
             } else if spec.kind.is_none() && extents.proof() {
                 catalog[copied..copied + count].copy_from_slice(&buffer[..count]);
             }
+            on_chunk(index, &buffer[..count])?;
             copied += count;
         }
         if crc.finalize() != spec.checksum {
@@ -736,6 +884,30 @@ fn validate_catalog_payload(
     Ok(())
 }
 
+/// Reuse the value-witness Schema decoder's checked field-vector charge for an
+/// inline protected Schema Put in the physical-copy ledger. This only checks
+/// the row's syntax; it grants neither copy equivalence nor owner authority.
+#[allow(dead_code)] // Used by the later private #82 ledger integrator.
+pub(super) fn validate_inline_catalog_schema_put(
+    root: &Path,
+    row: &ObservedSegmentRow,
+    budget: &mut PhysicalWitnessBudget,
+) -> Result<()> {
+    if row.cf != CATALOG_CF
+        || row.classification != PhysicalRowClass::BoundProtected(ProtectedRole::Catalog)
+        || !matches!(CatalogKey::decode(&row.key, root)?, CatalogKey::Schema(_))
+    {
+        return Err(corrupt(
+            root,
+            "inline Schema Put lacks a bound catalog role",
+        ));
+    }
+    let ObservedSegmentValue::Put(bytes) = &row.value else {
+        return Err(corrupt(root, "inline Schema has the wrong operation"));
+    };
+    validate_catalog_payload(row, bytes, root, budget)
+}
+
 pub(super) fn collect_value_witness(
     root: &Path,
     manifest: &Manifest,
@@ -779,6 +951,7 @@ pub(super) fn collect_value_witness(
                 checksum: pointer.checksum,
                 kind,
                 payload_digest: blake3::hash(&[]),
+                locator: ValueRowLocator::from_row(row),
                 row_index,
             });
         }
@@ -787,24 +960,23 @@ pub(super) fn collect_value_witness(
         return Err(corrupt(root, "external value pointer count changed"));
     }
     extents.sort_unstable_by_key(|item| (item.file_id, item.offset));
+    let (mut locator_order, locator_charge) =
+        reserve_value_vec::<usize>(root, count, &mut attempt)?;
+    for index in 0..extents.len() {
+        if locator_order.len() == locator_order.capacity() {
+            return Err(budget_error(root));
+        }
+        locator_order.push(index);
+    }
+    locator_order.sort_unstable_by_key(|&index| extents[index].locator.sort_key());
+    validate_locator_order(root, &extents, &locator_order)?;
     let (mut variable_summaries, summary_charge) = if variable_count == 0 {
         (Vec::new(), 0)
     } else {
         reserve_value_vec::<ValueRecordSummaryWitness>(root, variable_count, &mut attempt)?
     };
     let referenced_files = count_distinct_sorted_ids(root, &extents)?;
-    for pair in extents.windows(2) {
-        if pair[0].file_id == pair[1].file_id {
-            let end = pair[0]
-                .offset
-                .checked_add(HEADER_BYTES)
-                .and_then(|n| n.checked_add(pair[0].len))
-                .ok_or_else(|| corrupt(root, "external value extent overflows"))?;
-            if end > pair[1].offset {
-                return Err(corrupt(root, "external value extents overlap"));
-            }
-        }
-    }
+    validate_extent_layout(root, &extents)?;
 
     // Prepare and compare every exact raw pointer spelling before opening or
     // hashing the first file. Each retained path has its own live debit.
@@ -833,7 +1005,14 @@ pub(super) fn collect_value_witness(
             let Some((pointer_id, pointer, kind)) = pointer_spec(root, manifest, row)? else {
                 return Err(corrupt(&path, "external value row lost its pointer"));
             };
-            if pointer_id != id || pointer.path.as_str() != canonical || kind != extent.kind {
+            if pointer_id != id
+                || pointer.path.as_str() != canonical
+                || pointer.offset != extent.offset
+                || pointer.len != extent.len
+                || pointer.checksum != extent.checksum
+                || kind != extent.kind
+                || ValueRowLocator::from_row(row) != extent.locator
+            {
                 return Err(corrupt(
                     &path,
                     "external value pointer path is not the exact canonical spelling",
@@ -887,12 +1066,19 @@ pub(super) fn collect_value_witness(
                 summaries: &mut variable_summaries,
                 base_index: extent_start,
             };
-            scan_file(&mut opened, &path, len, &mut sink, |row_index, bytes| {
-                let row = rows
-                    .get(row_index)
-                    .ok_or_else(|| corrupt(&path, "external value row index is unowned"))?;
-                validate_catalog_payload(row, bytes, &path, attempt.budget)
-            })?
+            scan_file(
+                &mut opened,
+                &path,
+                len,
+                &mut sink,
+                |row_index, bytes| {
+                    let row = rows
+                        .get(row_index)
+                        .ok_or_else(|| corrupt(&path, "external value row index is unowned"))?;
+                    validate_catalog_payload(row, bytes, &path, attempt.budget)
+                },
+                |_, _| Ok(()),
+            )?
         };
         recheck_opened_path(&path, &opened, identity, len, probe)?;
         drop(opened);
@@ -917,7 +1103,8 @@ pub(super) fn collect_value_witness(
     }
 
     let mut retained_bytes = extent_charge
-        .checked_add(file_charge)
+        .checked_add(locator_charge)
+        .and_then(|bytes| bytes.checked_add(file_charge))
         .and_then(|bytes| bytes.checked_add(summary_charge))
         .ok_or_else(|| budget_error(root))?;
     for file in &files {
@@ -929,6 +1116,7 @@ pub(super) fn collect_value_witness(
     Ok(ValueWitnessCandidate {
         files,
         extents,
+        locator_order,
         variable_summaries,
         retained_bytes,
     })
@@ -947,6 +1135,8 @@ pub(super) fn recheck_value_witness(
     {
         return Err(corrupt(root, "external value candidate count is invalid"));
     }
+    validate_locator_order(root, &candidate.extents, &candidate.locator_order)?;
+    validate_extent_layout(root, &candidate.extents)?;
     let mut summary_index = 0;
     for (index, extent) in candidate.extents.iter().enumerate() {
         if let Some(kind) = extent.kind {
@@ -1023,7 +1213,14 @@ pub(super) fn recheck_value_witness(
                     )
                 })?;
         let mut sink = CheckExtents(&candidate.extents[extent_start..extent_end]);
-        let digest = scan_file(&mut opened, &witness.path, len, &mut sink, |_, _| Ok(()))?;
+        let digest = scan_file(
+            &mut opened,
+            &witness.path,
+            len,
+            &mut sink,
+            |_, _| Ok(()),
+            |_, _| Ok(()),
+        )?;
         recheck_opened_path(&witness.path, &opened, identity, len, probe)?;
         if digest != witness.digest {
             return Err(corrupt(
@@ -1042,6 +1239,138 @@ pub(super) fn recheck_value_witness(
     Ok(())
 }
 
+/// Stream one witnessed external payload by its original physical segment
+/// locator. Bytes handed to `on_chunk` are provisional: the caller must not
+/// publish a comparison or mutate owner state until this returns `Ok(())` and
+/// the whole candidate receives its final `recheck_value_witness` fence.
+///
+/// Both passes use the same opened file handle. Each pass verifies all extents,
+/// gaps, tail and the full-file digest, followed by path/identity/length checks.
+/// A cumulative work allowance prevents repeated same-file lookups from
+/// turning this selected-row API into unbounded quadratic physical I/O.
+#[allow(dead_code)] // Called by the later private #82 equality integrator.
+pub(super) fn with_authenticated_value_payload(
+    root: &Path,
+    manifest: &Manifest,
+    candidate: &ValueWitnessCandidate,
+    locator: ValueRowLocator,
+    context: &mut ValueReplayContext,
+    budget: &mut PhysicalWitnessBudget,
+    mut on_chunk: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    if candidate.files.is_empty()
+        || candidate.files.len() > MAX_REFERENCED_VALUE_FILES
+        || candidate.extents.is_empty()
+        || candidate.extents.len() > MAX_STAGED_VALUE_POINTERS
+        || candidate.locator_order.len() != candidate.extents.len()
+    {
+        return Err(corrupt(
+            root,
+            "external value replay candidate count is invalid",
+        ));
+    }
+    let position = candidate
+        .locator_order
+        .binary_search_by_key(&locator.sort_key(), |&index| {
+            candidate.extents[index].locator.sort_key()
+        })
+        .map_err(|_| corrupt(root, "external value row locator is unwitnessed"))?;
+    let extent_index = candidate.locator_order[position];
+    let extent = &candidate.extents[extent_index];
+    if extent.locator != locator {
+        return Err(corrupt(root, "external value row locator changed"));
+    }
+    let file_index = candidate
+        .files
+        .binary_search_by_key(&extent.file_id, |file| file.id)
+        .map_err(|_| corrupt(root, "external value extent has no file witness"))?;
+    let witness = &candidate.files[file_index];
+    if canonical_id(
+        root,
+        manifest,
+        witness
+            .path
+            .to_str()
+            .ok_or_else(|| corrupt(&witness.path, "external value path is not UTF-8"))?,
+    )? != witness.id
+    {
+        return Err(corrupt(
+            &witness.path,
+            "external value witness path is unowned",
+        ));
+    }
+    let extent_start = candidate
+        .extents
+        .partition_point(|item| item.file_id < witness.id);
+    let extent_end = candidate
+        .extents
+        .partition_point(|item| item.file_id <= witness.id);
+    if extent_index < extent_start || extent_index >= extent_end {
+        return Err(corrupt(
+            &witness.path,
+            "external value extent/file binding changed",
+        ));
+    }
+    let relative_index = extent_index - extent_start;
+    let _scratch = ReplayScratch::new(&witness.path, budget)?;
+    context.work.reserve(witness.len)?;
+    let (mut opened, identity, len) = open_checked(&witness.path, &mut context.probe)?;
+    if identity != witness.identity || len != witness.len {
+        return Err(corrupt(
+            &witness.path,
+            "external value replay file identity or length changed",
+        ));
+    }
+    context.probe.recheck_full_file_hashes = context
+        .probe
+        .recheck_full_file_hashes
+        .checked_add(2)
+        .ok_or_else(|| corrupt(&witness.path, "external value replay counter overflows"))?;
+    let mut streamed = 0_u64;
+    let mut first_sink = CheckExtents(&candidate.extents[extent_start..extent_end]);
+    let first_digest = scan_file(
+        &mut opened,
+        &witness.path,
+        len,
+        &mut first_sink,
+        |_, _| Ok(()),
+        |index, bytes| {
+            if index == relative_index {
+                streamed = streamed
+                    .checked_add(bytes.len() as u64)
+                    .filter(|count| *count <= extent.len)
+                    .ok_or_else(|| corrupt(&witness.path, "external value replay overflowed"))?;
+                on_chunk(bytes)?;
+            }
+            Ok(())
+        },
+    )?;
+    if first_digest != witness.digest || streamed != extent.len {
+        return Err(corrupt(
+            &witness.path,
+            "external value replay digest changed",
+        ));
+    }
+    recheck_opened_path(&witness.path, &opened, identity, len, &mut context.probe)?;
+    opened.seek(SeekFrom::Start(0))?;
+    let mut second_sink = CheckExtents(&candidate.extents[extent_start..extent_end]);
+    let second_digest = scan_file(
+        &mut opened,
+        &witness.path,
+        len,
+        &mut second_sink,
+        |_, _| Ok(()),
+        |_, _| Ok(()),
+    )?;
+    if second_digest != witness.digest {
+        return Err(corrupt(
+            &witness.path,
+            "external value final digest changed",
+        ));
+    }
+    recheck_opened_path(&witness.path, &opened, identity, len, &mut context.probe)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1054,8 +1383,78 @@ mod tests {
             checksum: 0,
             kind: None,
             payload_digest: blake3::hash(&[]),
+            locator: ValueRowLocator {
+                source: SegmentSource {
+                    level: 0,
+                    id: file_id,
+                    manifest_ordinal: file_id as usize,
+                },
+                block_offset: 0,
+                row_ordinal: 0,
+            },
             row_index: 0,
         }
+    }
+
+    #[test]
+    fn locator_index_distinguishes_equal_bytes_and_rejects_reused_position_or_alias() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("two-equal-values.tval");
+        let payload = b"x";
+        let checksum = crc32fast::hash(payload);
+        let mut file_bytes = Vec::new();
+        for _ in 0..2 {
+            file_bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+            file_bytes.extend_from_slice(&checksum.to_le_bytes());
+            file_bytes.extend_from_slice(payload);
+        }
+        std::fs::write(&path, &file_bytes).unwrap();
+        let root = dir.path();
+        let mut first = test_extent(1);
+        first.checksum = checksum;
+        first.payload_digest = blake3::hash(payload);
+        let mut second = test_extent(1);
+        second.offset = HEADER_BYTES + first.len;
+        second.checksum = checksum;
+        second.payload_digest = first.payload_digest;
+        second.locator.row_ordinal = 1;
+        second.row_index = 1;
+        let mut extents = [first, second];
+        let mut order = [1, 0];
+        order.sort_unstable_by_key(|&index| extents[index].locator.sort_key());
+        validate_locator_order(root, &extents, &order).unwrap();
+        validate_extent_layout(root, &extents).unwrap();
+        assert_eq!(order, [0, 1]);
+        assert_eq!(extents[0].payload_digest, extents[1].payload_digest);
+        assert_ne!(extents[0].locator, extents[1].locator);
+        let mut observed = Vec::new();
+        let mut sink = CheckExtents(&extents);
+        let digest = scan_file(
+            &mut std::fs::File::open(&path).unwrap(),
+            &path,
+            file_bytes.len() as u64,
+            &mut sink,
+            |_, _| Ok(()),
+            |index, bytes| {
+                observed.push((index, bytes.to_vec()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(digest, blake3::hash(&file_bytes));
+        assert_eq!(observed, vec![(0, payload.to_vec()), (1, payload.to_vec())]);
+
+        extents[1].locator = extents[0].locator;
+        assert!(matches!(
+            validate_locator_order(root, &extents, &order),
+            Err(PraxisError::Corrupt { .. })
+        ));
+        extents[1].locator.row_ordinal = 1;
+        extents[1].offset = extents[0].offset;
+        assert!(matches!(
+            validate_extent_layout(root, &extents),
+            Err(PraxisError::Corrupt { .. })
+        ));
     }
 
     #[test]
