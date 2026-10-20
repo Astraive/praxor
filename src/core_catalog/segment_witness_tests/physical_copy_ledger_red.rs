@@ -2771,7 +2771,16 @@ fn writer_identical_catalog_namespace_pair_reaches_next_private_gate() {
     writer_fixed_catalog_pair_case(FixedCatalogPair::Namespace, false);
 }
 
-fn writer_shared_external_catalog_name_pair_case(conflicting: bool) {
+#[derive(Clone, Copy, Debug)]
+enum CatalogNameExternalTopology {
+    SharedValueFile,
+    SeparateValueFiles,
+}
+
+fn writer_external_catalog_name_pair_case(
+    topology: CatalogNameExternalTopology,
+    conflicting: bool,
+) {
     let (dir, config, lease) = flushed_create_fixture();
     let root = lease.root();
     let layout = DiskLayout::at(root);
@@ -2834,13 +2843,28 @@ fn writer_shared_external_catalog_name_pair_case(conflicting: bool) {
         original_bytes.clone()
     };
 
-    // The value writer creates two distinct, contiguous frames in one file.
-    let value_path = layout.value_log_path(2);
-    let first_pointer = append_catalog_value_frame(&value_path, &original_bytes);
-    let second_pointer = append_catalog_value_frame(&value_path, &peer_bytes);
-    assert_eq!(first_pointer.path, second_pointer.path);
+    let first_value_path = match topology {
+        CatalogNameExternalTopology::SharedValueFile => layout.value_log_path(2),
+        CatalogNameExternalTopology::SeparateValueFiles => layout.value_log_path(1),
+    };
+    let second_value_path = layout.value_log_path(2);
+    let first_pointer = append_catalog_value_frame(&first_value_path, &original_bytes);
+    let second_pointer = append_catalog_value_frame(&second_value_path, &peer_bytes);
     assert_eq!(first_pointer.offset, 0);
-    assert_eq!(second_pointer.offset, 12 + first_pointer.len);
+    match topology {
+        CatalogNameExternalTopology::SharedValueFile => {
+            assert_eq!(first_pointer.path, second_pointer.path);
+            assert_eq!(second_pointer.offset, 12 + first_pointer.len);
+        }
+        CatalogNameExternalTopology::SeparateValueFiles => {
+            assert_ne!(first_pointer.path, second_pointer.path);
+            assert_eq!(second_pointer.offset, 0);
+            assert_ne!(
+                physical_id(&File::open(&first_value_path).unwrap(), &first_value_path).unwrap(),
+                physical_id(&File::open(&second_value_path).unwrap(), &second_value_path).unwrap()
+            );
+        }
+    }
     first_rows[name_position].version.value = StoredValue::BlobPointer(first_pointer.clone());
     let first_entry = first_rows[name_position].clone();
     let mut second_entry = first_entry.clone();
@@ -2864,10 +2888,12 @@ fn writer_shared_external_catalog_name_pair_case(conflicting: bool) {
     )
     .unwrap();
     drop(first_value_log);
-    fs::remove_file(layout.value_log_path(1)).unwrap();
+    if matches!(topology, CatalogNameExternalTopology::SharedValueFile) {
+        fs::remove_file(layout.value_log_path(1)).unwrap();
+    }
     let second_path = layout.segment_path(1, 2);
     fs::create_dir_all(second_path.parent().unwrap()).unwrap();
-    let mut second_value_log = ValueLog::open(&value_path).unwrap();
+    let mut second_value_log = ValueLog::open(&second_value_path).unwrap();
     let second_meta = SegmentWriter::write(
         SegmentWriteOptions {
             path: &second_path,
@@ -2890,12 +2916,21 @@ fn writer_shared_external_catalog_name_pair_case(conflicting: bool) {
     // value witness. The full-file digest is then compared with its receipt.
     assert_catalog_value_frame(&first_pointer, &original_bytes);
     assert_catalog_value_frame(&second_pointer, &peer_bytes);
-    let value_raw = fs::read(&value_path).unwrap();
-    assert_eq!(
-        value_raw.len() as u64,
-        second_pointer.offset + 12 + second_pointer.len
-    );
-    let value_digest = blake3::hash(&value_raw);
+    let first_value_raw = fs::read(&first_value_path).unwrap();
+    let second_value_raw = fs::read(&second_value_path).unwrap();
+    match topology {
+        CatalogNameExternalTopology::SharedValueFile => {
+            assert_eq!(first_value_raw, second_value_raw);
+            assert_eq!(
+                first_value_raw.len() as u64,
+                second_pointer.offset + 12 + second_pointer.len
+            );
+        }
+        CatalogNameExternalTopology::SeparateValueFiles => {
+            assert_eq!(first_value_raw.len() as u64, 12 + first_pointer.len);
+            assert_eq!(second_value_raw.len() as u64, 12 + second_pointer.len);
+        }
+    }
     let first_written = fs::read(&first_path).unwrap();
     let second_written = fs::read(&second_path).unwrap();
     assert_eq!(
@@ -2968,17 +3003,31 @@ fn writer_shared_external_catalog_name_pair_case(conflicting: bool) {
         let mut probe = ValueFileScanProbe::default();
         let value = collect_value_witness(root, &manifest, &segment.rows, budget, &mut probe)
             .expect("two writer-framed Name pointers must authenticate");
-        assert_eq!(value.files.len(), 1);
+        let expected_files = if matches!(topology, CatalogNameExternalTopology::SharedValueFile) {
+            1
+        } else {
+            2
+        };
+        assert_eq!(value.files.len(), expected_files);
         assert_eq!(value.extents.len(), 2);
-        assert_eq!(probe.proof_full_file_hashes, 1);
-        let file = &value.files[0];
-        assert_eq!(file.path.as_path(), value_path.as_path());
-        assert_eq!(file.len, value_raw.len() as u64);
-        assert_eq!(file.digest, value_digest);
-        assert_eq!(
-            file.identity,
-            physical_id(&File::open(&value_path).unwrap(), &value_path).unwrap()
-        );
+        assert_eq!(probe.proof_full_file_hashes, expected_files);
+        for file in &value.files {
+            let raw = if file.path == first_value_path {
+                &first_value_raw
+            } else {
+                assert_eq!(file.path, second_value_path);
+                &second_value_raw
+            };
+            assert_eq!(file.len, raw.len() as u64);
+            assert_eq!(file.digest, blake3::hash(raw));
+            assert_eq!(
+                file.identity,
+                physical_id(&File::open(&file.path).unwrap(), &file.path).unwrap()
+            );
+        }
+        if matches!(topology, CatalogNameExternalTopology::SeparateValueFiles) {
+            assert_ne!(value.files[0].identity, value.files[1].identity);
+        }
         for (row, pointer) in copies.iter().zip([&first_pointer, &second_pointer]) {
             let locator = ValueRowLocator {
                 source: row.source,
@@ -2992,7 +3041,12 @@ fn writer_shared_external_catalog_name_pair_case(conflicting: bool) {
                 .collect::<Vec<_>>();
             assert_eq!(extents.len(), 1);
             let extent = extents[0];
-            assert_eq!(extent.file_id, file.id);
+            let file = value
+                .files
+                .iter()
+                .find(|file| file.id == extent.file_id)
+                .unwrap();
+            assert_eq!(file.path.as_path(), Path::new(&pointer.path));
             assert_eq!(
                 (extent.offset, extent.len, extent.checksum),
                 (pointer.offset, pointer.len, pointer.checksum)
@@ -3007,7 +3061,7 @@ fn writer_shared_external_catalog_name_pair_case(conflicting: bool) {
             Err(error) => error,
             Ok(candidate) => {
                 candidate.discard(root, budget).unwrap();
-                panic!("shared external Name pair unexpectedly reached a private candidate")
+                panic!("{topology:?} external Name pair unexpectedly reached a private candidate")
             }
         };
         assert_eq!(
@@ -3020,14 +3074,16 @@ fn writer_shared_external_catalog_name_pair_case(conflicting: bool) {
             match error {
                 PraxisError::Corrupt { reason, .. }
                     if reason == "protected physical-copy actual bytes conflict" => {}
-                other => panic!("shared external Name bytes must conflict: {other:?}"),
+                other => panic!("{topology:?} external Name bytes must conflict: {other:?}"),
             }
         } else {
             match error {
                 PraxisError::UnsupportedCatalogFeature {
                     feature: "protected physical-copy bytes await authenticated replay",
                 } => {}
-                other => panic!("equal shared external Name copies must reach pending: {other:?}"),
+                other => {
+                    panic!("equal {topology:?} external Name copies must reach pending: {other:?}")
+                }
             }
         }
     });
@@ -3036,10 +3092,20 @@ fn writer_shared_external_catalog_name_pair_case(conflicting: bool) {
 
 #[test]
 fn writer_shared_external_catalog_name_equal_reaches_private_gate() {
-    writer_shared_external_catalog_name_pair_case(false);
+    writer_external_catalog_name_pair_case(CatalogNameExternalTopology::SharedValueFile, false);
 }
 
 #[test]
 fn writer_shared_external_catalog_name_valid_conflict_requires_corrupt() {
-    writer_shared_external_catalog_name_pair_case(true);
+    writer_external_catalog_name_pair_case(CatalogNameExternalTopology::SharedValueFile, true);
+}
+
+#[test]
+fn writer_separate_external_catalog_name_equal_reaches_private_gate() {
+    writer_external_catalog_name_pair_case(CatalogNameExternalTopology::SeparateValueFiles, false);
+}
+
+#[test]
+fn writer_separate_external_catalog_name_valid_conflict_requires_corrupt() {
+    writer_external_catalog_name_pair_case(CatalogNameExternalTopology::SeparateValueFiles, true);
 }
