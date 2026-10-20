@@ -1,7 +1,9 @@
 use super::codec::{
     CatalogKey, CatalogValue, CollectionId, Field, Head, NamespaceId, ScalarType, Schema,
 };
-use super::external_value::{ValuePayloadProbe, resolve_catalog_head_external};
+use super::external_value::{
+    ValuePayloadProbe, resolve_catalog_external_caps, resolve_catalog_head_external,
+};
 use super::physical::inspect_v4_owner;
 use super::physical_tests::flushed_create_fixture;
 use super::segment_witness::{
@@ -7166,20 +7168,6 @@ fn private_external_head_rejects_atomic_cap_claim_before_payload_read_or_reserve
     assert_eq!(snapshot(dir.path()), before);
 }
 
-// #81 catalog key-cap RED. This deliberately has no implementation: a later
-// private resolver must replace the seam only after these real writer-produced
-// pointer tests fail with UnsupportedCatalogFeature.
-fn resolve_catalog_external_caps_red(
-    _root: &Path,
-    _manifest: &Manifest,
-    _row: &ObservedSegmentRow,
-    _probe: &mut ValuePayloadProbe,
-) -> crate::errors::Result<Vec<u8>> {
-    Err(PraxisError::UnsupportedCatalogFeature {
-        feature: "external catalog key-cap resolver is not implemented",
-    })
-}
-
 fn writer_catalog_external_fixture(
     key: CatalogKey<'_>,
     replacement: Option<Vec<u8>>,
@@ -7392,11 +7380,11 @@ fn assert_private_catalog_external_positive(
         };
         assert_eq!(pointer.len, expected_len as u64);
         let mut probe = ValuePayloadProbe::default();
-        let result = resolve_catalog_external_caps_red(root, &manifest, target, &mut probe);
+        let result = resolve_catalog_external_caps(root, &manifest, target, budget, &mut probe);
         candidate.discard(root, budget).unwrap();
         assert_eq!(budget.remaining_bytes(), balance);
         assert_eq!(snapshot(dir.path()), before);
-        assert_eq!(result.unwrap(), expected);
+        assert_eq!(result.unwrap().as_bytes(), expected.as_slice());
         assert_eq!(probe.open_attempts, 1);
         assert!(probe.read_attempts >= 2);
     });
@@ -7459,7 +7447,7 @@ fn assert_private_catalog_external_cap_plus_one(
         };
         assert_eq!(pointer.len, (cap + 1) as u64);
         let mut probe = ValuePayloadProbe::default();
-        let result = resolve_catalog_external_caps_red(root, &manifest, target, &mut probe);
+        let result = resolve_catalog_external_caps(root, &manifest, target, budget, &mut probe);
         candidate.discard(root, budget).unwrap();
         assert_eq!(budget.remaining_bytes(), balance);
         assert_eq!(snapshot(dir.path()), before);
@@ -7540,4 +7528,87 @@ fn private_external_schema_rejects_33948_byte_claim_before_io() {
         Some(schema_value_at_limit(false)),
         33_947,
     );
+}
+
+#[test]
+fn private_external_head_generalized_resolves_writer_produced_48_bytes() {
+    assert_private_catalog_external_positive(CatalogKey::Head, None, 48, 2);
+}
+
+#[test]
+fn private_external_head_generalized_rejects_opened_hardlink_alias() {
+    let (dir, lease, manifest, key_bytes, _) =
+        writer_catalog_external_fixture(CatalogKey::Head, None, 48);
+    let root = lease.root();
+    let value_path = DiskLayout::at(root).value_log_path(1);
+    let alias = root.join("external-value-hardlink-alias");
+    fs::hard_link(&value_path, &alias).unwrap();
+    assert!(value_path.is_file());
+    assert!(alias.is_file());
+    assert_eq!(file_id(&value_path), file_id(&alias));
+    let before = snapshot(dir.path());
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let candidate = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+        let target = candidate
+            .rows
+            .iter()
+            .find(|row| row.source.id == 1 && row.cf == CATALOG_CF && row.key == key_bytes)
+            .unwrap();
+        assert_eq!(target.sequence, 2);
+        let mut probe = ValuePayloadProbe::default();
+        let result = resolve_catalog_external_caps(root, &manifest, target, budget, &mut probe);
+        candidate.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(snapshot(dir.path()), before);
+        assert_eq!(probe.open_attempts, 1);
+        assert_eq!(probe.read_attempts, 0);
+        assert_eq!(probe.reserve_attempts, 0);
+        assert!(
+            matches!(&result, Err(PraxisError::Corrupt { .. })),
+            "{result:?}"
+        );
+    });
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn private_external_schema_refuses_before_decoder_reserve_at_budget_edge() {
+    let (dir, lease, manifest, key_bytes, _) = writer_catalog_external_fixture(
+        CatalogKey::Schema(CollectionId::new(2).unwrap()),
+        Some(schema_value_at_limit(false)),
+        33_947,
+    );
+    let root = lease.root();
+    let before = snapshot(dir.path());
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let candidate = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+        let target = candidate
+            .rows
+            .iter()
+            .find(|row| row.source.id == 1 && row.cf == CATALOG_CF && row.key == key_bytes)
+            .unwrap();
+        let raw_capacity_bytes = 256 * std::mem::size_of::<Field<'static>>();
+        let policy_allowance = vector_charge::<Field<'static>>(root, 256).unwrap();
+        assert!(policy_allowance > raw_capacity_bytes);
+        let available = budget.remaining_bytes();
+        assert!(available > raw_capacity_bytes);
+        let held = available - raw_capacity_bytes;
+        budget.charge(root, held).unwrap();
+        let mut probe = ValuePayloadProbe::default();
+        let result = resolve_catalog_external_caps(root, &manifest, target, budget, &mut probe);
+        budget.release(root, held).unwrap();
+        candidate.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(snapshot(dir.path()), before);
+        assert_eq!(probe.open_attempts, 1);
+        assert_eq!(probe.read_attempts, 2);
+        assert_eq!(probe.reserve_attempts, 0);
+        assert!(
+            matches!(&result, Err(PraxisError::Corrupt { .. })),
+            "{result:?}"
+        );
+    });
+    assert_eq!(snapshot(dir.path()), before);
 }
