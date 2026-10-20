@@ -1,5 +1,7 @@
 use super::*;
-use crate::core_catalog::physical_copy::admit_protected_physical_copies;
+use crate::core_catalog::physical_copy::{
+    admit_protected_physical_copies, collect_protected_copy_ledger,
+};
 use crate::segments::format::SEGMENT_FOOTER_MAGIC;
 
 const FIXED_ORACLE: &str = include_str!("../../../tests/fixtures/catalog_v4_wal_oracle.json");
@@ -748,4 +750,47 @@ fn writer_produced_duplicate_allocator_at_s1_requires_private_copy_admission() {
 #[test]
 fn rechecksummed_equal_length_head_at_s2_conflict_requires_private_copy_corrupt() {
     exercise_next_copy_case(NextCopyCase::ConflictingHead);
+}
+
+#[test]
+fn duplicate_allocator_metadata_reaches_pending_replay_and_refunds() {
+    let fixture = next_copy_fixture(NextCopyCase::IdenticalAllocator);
+    let root = fixture.lease.root();
+    assert_eq!(fixture.original, fixture.written);
+    assert_eq!(fixture.original.version.sequence, 1);
+    assert_eq!(fixture.manifest.segments.len(), 2);
+    assert_eq!(fixture.manifest.segments[0].entries, 7);
+    assert_eq!(fixture.manifest.segments[1].entries, 1);
+    assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+    assert!(matches!(
+        inspect_v4_owner(&fixture.lease, &fixture.config, &CpuAccelerator),
+        Err(PraxisError::UnsupportedCatalogFeature {
+            feature: "v4 installed cut beyond narrow D0 bootstrap"
+        })
+    ));
+
+    with_wal_budget(root, &fixture.manifest, |budget| {
+        let before = budget.remaining_bytes();
+        let result = collect_protected_copy_ledger(root, &fixture.manifest, budget);
+        assert!(matches!(
+            result,
+            Err(PraxisError::UnsupportedCatalogFeature {
+                feature: "protected physical-copy bytes await authenticated replay"
+            })
+        ));
+        assert_eq!(
+            budget.remaining_bytes(),
+            before,
+            "collector must refund its receipts"
+        );
+        assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+    });
+
+    assert!(matches!(
+        inspect_v4_owner(&fixture.lease, &fixture.config, &CpuAccelerator),
+        Err(PraxisError::UnsupportedCatalogFeature {
+            feature: "v4 installed cut beyond narrow D0 bootstrap"
+        })
+    ));
+    assert_eq!(snapshot(fixture.dir.path()), fixture.before);
 }
