@@ -191,6 +191,239 @@ fn private_value_file_witnesses_head_and_near_cap_schema_as_distinct_extents_in_
 }
 
 #[test]
+fn private_value_inventory_witnesses_two_writer_files_once_each() {
+    let (dir, lease, mut manifest, schema_key, schema_bytes) = writer_catalog_external_fixture(
+        CatalogKey::Schema(CollectionId::new(2).unwrap()),
+        Some(schema_value_at_limit(true)),
+        33_946,
+    );
+    let root = lease.root();
+    let layout = DiskLayout::at(root);
+    let first_path = layout.value_log_path(1);
+    let second_path = layout.value_log_path(2);
+    let first_spelling = first_path.to_str().unwrap();
+    let second_spelling = second_path.to_str().unwrap();
+    let segment_path = layout.segment_path(0, 1);
+
+    let mut second_log = ValueLog::open(&second_path).unwrap();
+    let second_pointer = second_log.append(&schema_bytes).unwrap();
+    drop(second_log);
+    assert_eq!(second_pointer.path, second_spelling);
+    assert_eq!(second_pointer.len, 33_946);
+    assert_eq!(second_pointer.checksum, crc32c(&schema_bytes));
+    let mut rows = decode_segment(
+        &fs::read(&segment_path).unwrap(),
+        &segment_path,
+        &CpuAccelerator,
+    )
+    .unwrap()
+    .blocks
+    .into_iter()
+    .flatten()
+    .map(|raw| raw.entry)
+    .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 7);
+    let schema_row = rows
+        .iter_mut()
+        .find(|row| row.cf.0 == CATALOG_CF && row.key.as_ref() == schema_key.as_slice())
+        .unwrap();
+    let StoredValue::BlobPointer(original) = &schema_row.version.value else {
+        panic!("the first writer must externalize Schema")
+    };
+    assert_eq!(original.path, first_spelling);
+    assert_eq!(original.len, second_pointer.len);
+    schema_row.version.value = StoredValue::BlobPointer(second_pointer.clone());
+
+    let mut config = PraxisConfig::new(root);
+    config.compression = Compression::None;
+    config.large_value_threshold = 11;
+    config.validate().unwrap();
+    assert_eq!(manifest.effective_config, config.persisted());
+    let mut first_log = ValueLog::open(&first_path).unwrap();
+    let rewritten = SegmentWriter::write(
+        SegmentWriteOptions {
+            path: &segment_path,
+            id: 1,
+            level: 0,
+            compression: Compression::None,
+            accelerator: &CpuAccelerator,
+            value_log: &mut first_log,
+            large_value_threshold: config.large_value_threshold,
+            block_size: config.block_size,
+            partitioned_bloom: None,
+            direct_io: false,
+        },
+        rows,
+    )
+    .unwrap();
+    drop(first_log);
+    manifest.segments[0] = rewritten;
+    manifest.next_segment_id = 3;
+    manifest = save_strict_manifest(root, &manifest);
+    assert_eq!(manifest.segments.len(), 1);
+    assert_eq!(manifest.segments[0].id, 1);
+    assert!(2 < manifest.next_segment_id);
+    assert_eq!(
+        manifest.segments[0].file_digest,
+        blake3::hash(&fs::read(&segment_path).unwrap())
+            .to_hex()
+            .to_string()
+    );
+
+    let first_bytes = fs::read(&first_path).unwrap();
+    let second_bytes = fs::read(&second_path).unwrap();
+    let second_offset = usize::try_from(second_pointer.offset).unwrap();
+    assert_eq!(
+        &second_bytes[second_offset + 12..second_offset + 12 + schema_bytes.len()],
+        schema_bytes.as_slice()
+    );
+    let first_opened = File::open(&first_path).unwrap();
+    let second_opened = File::open(&second_path).unwrap();
+    let first_identity = physical_id(&first_opened, &first_path).unwrap();
+    let second_identity = physical_id(&second_opened, &second_path).unwrap();
+    assert_ne!(first_identity, second_identity);
+    drop(first_opened);
+    drop(second_opened);
+    let before = snapshot(dir.path());
+
+    let owner_result = inspect_v4_owner(&lease, &config, &CpuAccelerator);
+    assert!(
+        matches!(
+            &owner_result,
+            Err(PraxisError::UnsupportedCatalogFeature {
+                feature: "v4 installed cut beyond narrow D0 bootstrap"
+            })
+        ),
+        "the public owner admitted a private two-file fixture: {owner_result:?}"
+    );
+    assert_eq!(snapshot(dir.path()), before);
+
+    with_wal_budget(root, &manifest, |budget| {
+        let wal_balance = budget.remaining_bytes();
+        let segments = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+        let segment_balance = budget.remaining_bytes();
+        assert!(segment_balance < wal_balance);
+        assert_eq!(segments.witnesses.len(), 1);
+        let head = catalog_pointer(&segments.rows, &[0]);
+        let schema = catalog_pointer(&segments.rows, &schema_key);
+        assert_eq!(head.len, 48);
+        assert_eq!(head.path, first_spelling);
+        assert_eq!(schema, &second_pointer);
+
+        let mut expected = Vec::new();
+        for row in &segments.rows {
+            let ObservedSegmentValue::Pointer {
+                pointer,
+                expires_at_ms: None,
+            } = &row.value
+            else {
+                continue;
+            };
+            assert_ne!(row.classification, PhysicalRowClass::Other);
+            let (id, bytes) = match pointer.path.as_str() {
+                path if path == first_spelling => (1, first_bytes.as_slice()),
+                path if path == second_spelling => (2, second_bytes.as_slice()),
+                other => panic!("writer emitted a noncanonical value path: {other}"),
+            };
+            let offset = usize::try_from(pointer.offset).unwrap();
+            let len = usize::try_from(pointer.len).unwrap();
+            let end = offset.checked_add(12).unwrap().checked_add(len).unwrap();
+            assert!(end <= bytes.len());
+            assert_eq!(
+                u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap()),
+                pointer.len
+            );
+            assert_eq!(
+                u32::from_le_bytes(bytes[offset + 8..offset + 12].try_into().unwrap()),
+                pointer.checksum
+            );
+            let payload = &bytes[offset + 12..end];
+            assert_eq!(crc32c(payload), pointer.checksum);
+            expected.push((
+                id,
+                pointer.offset,
+                pointer.len,
+                pointer.checksum,
+                blake3::hash(payload),
+            ));
+        }
+        expected.sort_by_key(|extent| (extent.0, extent.1));
+        assert!(expected.iter().filter(|extent| extent.0 == 1).count() >= 2);
+        assert_eq!(expected.iter().filter(|extent| extent.0 == 2).count(), 1);
+        assert!(expected.windows(2).all(|pair| {
+            pair[0].0 != pair[1].0
+                || pair[0]
+                    .1
+                    .checked_add(12)
+                    .and_then(|end| end.checked_add(pair[0].2))
+                    .is_some_and(|end| end <= pair[1].1)
+        }));
+
+        let mut probe = ValueFileScanProbeRed::default();
+        let values =
+            match collect_value_witness_red(root, &manifest, &segments.rows, budget, &mut probe) {
+                Ok(values) => values,
+                Err(error) => {
+                    assert!(
+                        matches!(
+                            error,
+                            PraxisError::UnsupportedCatalogFeature {
+                                feature: "multiple referenced value files await the inventory cut"
+                            }
+                        ),
+                        "the fixture failed before the intended multi-file seam: {error}"
+                    );
+                    assert_eq!(probe.proof_full_file_hashes, 0);
+                    assert_eq!(budget.remaining_bytes(), segment_balance);
+                    segments.discard(root, budget).unwrap();
+                    assert_eq!(budget.remaining_bytes(), wal_balance);
+                    assert_eq!(snapshot(dir.path()), before);
+                    panic!("two writer-produced value files reached the inventory seam: {error}");
+                }
+            };
+        assert_eq!(probe.proof_full_file_hashes, 2);
+        assert_eq!(values.files.len(), 2);
+        assert_eq!(
+            values.retained_bytes,
+            segment_balance - budget.remaining_bytes()
+        );
+        assert!(values.retained_bytes > 0);
+        for (observed, (id, path, bytes, identity)) in values.files.iter().zip([
+            (1, &first_path, &first_bytes, first_identity),
+            (2, &second_path, &second_bytes, second_identity),
+        ]) {
+            assert_eq!(observed.id, id);
+            assert_eq!(&observed.path, path);
+            assert_eq!(observed.identity, identity);
+            assert_eq!(observed.len, bytes.len() as u64);
+            assert_eq!(observed.digest, blake3::hash(bytes));
+        }
+        assert_eq!(values.extents.len(), expected.len());
+        for (observed, &(id, offset, len, checksum, payload_digest)) in
+            values.extents.iter().zip(&expected)
+        {
+            assert_eq!(observed.file_id, id);
+            assert_eq!(observed.offset, offset);
+            assert_eq!(observed.len, len);
+            assert_eq!(observed.checksum, checksum);
+            assert_eq!(observed.payload_digest, payload_digest);
+        }
+        recheck_value_witness_red(root, &manifest, &values, &mut probe).unwrap();
+        assert_eq!(probe.recheck_full_file_hashes, 2);
+        assert_eq!(
+            budget.remaining_bytes(),
+            segment_balance - values.retained_bytes
+        );
+        values.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), segment_balance);
+        segments.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), wal_balance);
+        assert_eq!(snapshot(dir.path()), before);
+    });
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
 fn private_value_file_rejects_normalized_path_aliases_before_scanning() {
     let (dir, lease, manifest, _, _) =
         writer_catalog_external_fixture(CatalogKey::Name("accounts"), None, 12);
