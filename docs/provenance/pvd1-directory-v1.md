@@ -82,16 +82,19 @@ is deterministic and independent of production parsing. A later writer slice
 must add an encoder with byte-for-byte roundtrip tests before it can install
 a directory. Neither retention nor CRC substitutes for MANIFEST-bound BLAKE3.
 
-## Test-first boundary
+## Decoder verification boundary
 
-The first patch adds a compiling decoder seam that verifies fixed-header
-bounds and returns `Unsupported` at entry/CRC decoding. Synthetic fixtures
-expect a valid sorted directory to decode and preserve its exact bytes, and
-expect specific refusals for wrong magic/version/flags, truncated/trailing
+The test-first patch established a compiling decoder seam with deliberate
+`Unsupported` results after fixed-header checks. The strict standalone parser
+now checks CRC32C before entry semantics and returns a crate-private
+`UntrustedPvd1` with the exact input image and decoded entries. Synthetic
+fixtures require a valid sorted directory and empty genesis candidate to
+decode, including one fixed, independent 73-byte golden vector. They also
+require specific refusals for wrong magic/version/flags, truncated/trailing
 input, count multiplication overflow, count and length caps, payload-length
 mismatch, zero/duplicate/descending node IDs, zero pack/record indices,
 record index over cap, unknown kind and damaged CRC. Malformed semantic
 fixtures recompute CRC to isolate the error. An allocation observer requires
 zero allocations for tiny hostile count/length headers before the parser
-returns their bounds errors. This is intentional test RED, not a claim that
-the PVD1 parser is finished or that any live v5 database is supported.
+returns their bounds errors. These tests establish only a bounded syntactic
+codec; no live v5 database or ancestry authority is supported.

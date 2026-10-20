@@ -112,12 +112,12 @@ fn advertised(count: u64, payload_len: u64) -> [u8; HEADER_LEN] {
     bytes
 }
 
-fn assert_no_allocation_before_bound(bytes: &[u8], expected: Pvd1Error) {
+fn assert_rejected_without_allocation(bytes: &[u8], expected: Pvd1Error) {
     CALLS.set(0);
     TRACK.set(true);
     let decoded = decode_pvd1(bytes);
     TRACK.set(false);
-    assert_eq!(CALLS.get(), 0, "untrusted header caused allocation");
+    assert_eq!(CALLS.get(), 0, "untrusted input caused allocation");
     assert_eq!(decoded.unwrap_err(), expected);
 }
 
@@ -125,6 +125,42 @@ fn assert_no_allocation_before_bound(bytes: &[u8], expected: Pvd1Error) {
 fn castagnoli_fixture_uses_the_correct_polynomial() {
     assert_eq!(castagnoli(b"123456789"), 0xe306_9283);
     assert_ne!(castagnoli(b"123456789"), praxis::io::crc32c(b"123456789"));
+}
+
+#[test]
+fn fixed_wire_vector_is_byte_exact_and_decodes_without_authority() {
+    // Fixed independently generated vector: one Birth at pack
+    // 0x0102030405060708, one-based record index 0x00010203, CRC 0xb1e44f21.
+    let hex = concat!(
+        "505644310100000001000000000000002d00000000000000",
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        "0807060504030201",
+        "03020100",
+        "01",
+        "214fe4b1",
+    );
+    let golden: Vec<u8> = hex
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect();
+    assert_eq!(golden.len(), 73);
+    assert_eq!(castagnoli(&golden[..69]), 0xb1e4_4f21);
+    assert_eq!(
+        fixture(&[entry(0x11, 0x0102_0304_0506_0708, 0x0001_0203, 1)]),
+        golden
+    );
+    let decoded = decode_pvd1(&golden).unwrap();
+    assert_eq!(decoded.bytes(), golden.as_slice());
+    assert_eq!(
+        decoded.entries(),
+        &[Pvd1Entry {
+            node_id: [0x11; 32],
+            pack_id: 0x0102_0304_0506_0708,
+            record_index: 0x0001_0203,
+            kind: Pvd1Kind::Birth,
+        }]
+    );
 }
 
 #[test]
@@ -214,10 +250,10 @@ fn truncated_header_entry_and_trailer_and_trailing_byte_are_refused() {
 
 #[test]
 fn count_arithmetic_caps_and_length_mismatch_precede_allocation() {
-    assert_no_allocation_before_bound(&advertised(u64::MAX, 0), Pvd1Error::CountOverflow);
-    assert_no_allocation_before_bound(&advertised(MAX_ENTRIES + 1, 0), Pvd1Error::CountLimit);
-    assert_no_allocation_before_bound(&advertised(1, MAX_BYTES + 1), Pvd1Error::LengthLimit);
-    assert_no_allocation_before_bound(
+    assert_rejected_without_allocation(&advertised(u64::MAX, 0), Pvd1Error::CountOverflow);
+    assert_rejected_without_allocation(&advertised(MAX_ENTRIES + 1, 0), Pvd1Error::CountLimit);
+    assert_rejected_without_allocation(&advertised(1, MAX_BYTES + 1), Pvd1Error::LengthLimit);
+    assert_rejected_without_allocation(
         &advertised(1, ENTRY_LEN as u64 - 1),
         Pvd1Error::LengthMismatch,
     );
@@ -262,16 +298,10 @@ fn invalid_pack_record_index_and_kind_are_refused_with_valid_crc() {
 fn corrupted_payload_or_crc_is_refused_before_semantic_entry_checks() {
     let mut bytes = fixture(&[entry(0x11, 7, 1, 1)]);
     bytes[HEADER_LEN + ENTRY_LEN - 1] = 99; // Also makes kind invalid.
-    assert_eq!(
-        decode_pvd1(&bytes).unwrap_err(),
-        Pvd1Error::ChecksumMismatch
-    );
+    assert_rejected_without_allocation(&bytes, Pvd1Error::ChecksumMismatch);
 
     let mut bytes = fixture(&[entry(0x11, 7, 1, 1)]);
     let trailer = bytes.len() - 1;
     bytes[trailer] ^= 1;
-    assert_eq!(
-        decode_pvd1(&bytes).unwrap_err(),
-        Pvd1Error::ChecksumMismatch
-    );
+    assert_rejected_without_allocation(&bytes, Pvd1Error::ChecksumMismatch);
 }
