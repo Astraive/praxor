@@ -1977,6 +1977,184 @@ mod direct_replay_tests {
         exercise_writer_external_copy_ledger(true);
     }
 
+    fn exercise_writer_external_allocator_copy_ledger(conflicting_allocator: bool) {
+        let (_dir, mut config, lease) = flushed_create_fixture();
+        let root = lease.root();
+        let layout = DiskLayout::at(root);
+        let segment_path = layout.segment_path(0, 1);
+        let original = decode_segment(
+            &fs::read(&segment_path).unwrap(),
+            &segment_path,
+            &CpuAccelerator,
+        )
+        .unwrap();
+        let mut rows = original
+            .blocks
+            .into_iter()
+            .flatten()
+            .map(|raw| raw.entry)
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 7);
+        let allocator = rows
+            .iter()
+            .find(|row| {
+                row.cf.0 == RecordRole::Meta.cf()
+                    && row.key.as_ref() == [1]
+                    && row.version.sequence == 1
+            })
+            .unwrap()
+            .clone();
+        let StoredValue::Put(first_bytes) = &allocator.version.value else {
+            panic!("writer Allocator@1 must start as an inline Put")
+        };
+        let first_bytes = first_bytes.clone();
+        assert_eq!(first_bytes.len(), 56);
+        let RecordRow::Allocator(mut counters) =
+            RecordRow::decode(&RecordKey::Allocator, &first_bytes, &segment_path).unwrap()
+        else {
+            panic!("writer Allocator@1 must decode")
+        };
+        let second_bytes = if conflicting_allocator {
+            counters.compatibility_sequence += 1;
+            RecordRow::Allocator(counters).encode().unwrap()
+        } else {
+            first_bytes.clone()
+        };
+        assert_eq!(first_bytes.len(), second_bytes.len());
+        if conflicting_allocator {
+            assert_ne!(first_bytes, second_bytes);
+        } else {
+            assert_eq!(first_bytes, second_bytes);
+        }
+        let mut duplicate = allocator;
+        duplicate.version.value = StoredValue::Put(second_bytes.clone());
+        rows.push(duplicate);
+
+        config.large_value_threshold = 11;
+        config.validate().unwrap();
+        let value_path = layout.value_log_path(1);
+        let mut value_log = ValueLog::open(&value_path).unwrap();
+        let metadata = SegmentWriter::write(
+            SegmentWriteOptions {
+                path: &segment_path,
+                id: 1,
+                level: 0,
+                compression: Compression::None,
+                accelerator: &CpuAccelerator,
+                value_log: &mut value_log,
+                large_value_threshold: config.large_value_threshold,
+                block_size: config.block_size,
+                partitioned_bloom: None,
+                direct_io: false,
+            },
+            rows,
+        )
+        .unwrap();
+        drop(value_log);
+        assert_eq!(metadata.entries, 8);
+
+        let manifest_path = layout.manifest_path();
+        let mut manifest =
+            Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+        manifest.effective_config = config.persisted();
+        for family in &mut manifest.column_families {
+            if family.name.starts_with("__praxor_record_") {
+                family.large_value_threshold_bytes = config.large_value_threshold;
+            }
+        }
+        manifest.segments[0] = metadata;
+        ManifestStore::new(manifest_path.clone())
+            .save(&manifest)
+            .unwrap();
+        let manifest =
+            Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+        manifest.validate_v4(&manifest_path).unwrap();
+
+        let written = decode_segment(
+            &fs::read(&segment_path).unwrap(),
+            &segment_path,
+            &CpuAccelerator,
+        )
+        .unwrap();
+        let pointers = written
+            .blocks
+            .iter()
+            .flatten()
+            .filter(|raw| {
+                raw.entry.cf.0 == RecordRole::Meta.cf()
+                    && raw.entry.key.as_ref() == [1]
+                    && raw.entry.version.sequence == 1
+            })
+            .map(|raw| match &raw.entry.version.value {
+                StoredValue::BlobPointer(pointer) => pointer.clone(),
+                _ => panic!("writer must externalize both Allocator@1 copies"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(pointers.len(), 2);
+        assert_ne!(pointers[0].offset, pointers[1].offset);
+        let value_bytes = fs::read(&value_path).unwrap();
+        assert_written_pointer(&pointers[0], &first_bytes, &value_bytes, &value_path);
+        assert_written_pointer(&pointers[1], &second_bytes, &value_bytes, &value_path);
+        assert_eq!(
+            manifest.segments[0].file_digest,
+            blake3::hash(&fs::read(&segment_path).unwrap())
+                .to_hex()
+                .to_string()
+        );
+
+        let cut = WalCut {
+            flushed_sequence: manifest.flushed_sequence,
+            last_sequence: manifest.last_sequence,
+            flushed_wal_id: manifest.flushed_wal_id,
+            active_wal_id: manifest.active_wal_id,
+            next_wal_id: manifest.next_wal_id,
+        };
+        let (_wals, mut budget) = scan_v4_wals_with_budget(root, cut, |_, _, _, _| Ok(())).unwrap();
+        let retained = budget.remaining_bytes();
+        let before = writer_tree_snapshot(root);
+        let error = match collect_protected_copy_ledger(root, &manifest, &mut budget) {
+            Ok(candidate) => {
+                candidate.discard(root, &mut budget).unwrap();
+                panic!("external Allocator copies must remain private until owner composition")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(budget.remaining_bytes(), retained, "exact witness refund");
+        assert_eq!(
+            writer_tree_snapshot(root),
+            before,
+            "collector changed writer tree"
+        );
+        if conflicting_allocator {
+            match error {
+                PraxisError::Corrupt { reason, .. } => assert!(
+                    reason.contains("actual bytes conflict"),
+                    "expected authenticated Allocator conflict, got {reason}"
+                ),
+                other => panic!("expected authenticated Allocator conflict, got {other:?}"),
+            }
+        } else {
+            match error {
+                PraxisError::UnsupportedCatalogFeature {
+                    feature: "protected physical-copy bytes await authenticated replay",
+                } => {}
+                other => {
+                    panic!("equal external Allocators must reach private admission: {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn writer_equal_external_allocator_copies_reach_pending_private_admission() {
+        exercise_writer_external_allocator_copy_ledger(false);
+    }
+
+    #[test]
+    fn writer_rechecksummed_external_allocator_conflict_refunds_without_writes() {
+        exercise_writer_external_allocator_copy_ledger(true);
+    }
+
     #[test]
     fn writer_inline_and_external_head_copies_require_equal_logical_bytes() {
         let (_dir, mut config, lease) = flushed_create_fixture();
