@@ -794,3 +794,111 @@ fn duplicate_allocator_metadata_reaches_pending_replay_and_refunds() {
     ));
     assert_eq!(snapshot(fixture.dir.path()), fixture.before);
 }
+
+#[test]
+fn second_writer_produced_anchor_refuses_before_copy_replay_and_refunds() {
+    let (dir, config, lease) = flushed_create_fixture();
+    let root = lease.root();
+    let layout = DiskLayout::at(root);
+    let manifest_path = layout.manifest_path();
+    let mut manifest =
+        Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    let first_path = layout.segment_path(0, 1);
+    let first_bytes = fs::read(&first_path).unwrap();
+    assert_eq!(
+        manifest.segments[0].file_digest,
+        blake3::hash(&first_bytes).to_hex().to_string()
+    );
+    let first = decode_segment(&first_bytes, &first_path, &CpuAccelerator).unwrap();
+    let anchor_key = CatalogKey::Anchor.encode().unwrap();
+    let anchor = first
+        .blocks
+        .iter()
+        .flatten()
+        .find(|row| {
+            row.entry.cf.0 == CATALOG_CF
+                && row.entry.key.as_ref() == anchor_key.as_slice()
+                && row.entry.version.sequence == 1
+        })
+        .unwrap()
+        .entry
+        .clone();
+    let StoredValue::Put(ref anchor_bytes) = anchor.version.value else {
+        panic!("writer fixture Anchor@1 must be literal")
+    };
+    assert_eq!(
+        anchor_bytes,
+        &fixed_copy_oracle(
+            "bootstrap_tag6",
+            "catalog_anchor_at_1",
+            CATALOG_CF,
+            &anchor_key,
+            1,
+        )
+    );
+
+    let second_path = layout.segment_path(1, 2);
+    fs::create_dir_all(second_path.parent().unwrap()).unwrap();
+    let value_path = layout.value_log_path(2);
+    let mut value_log = ValueLog::open(&value_path).unwrap();
+    let second_meta = SegmentWriter::write(
+        SegmentWriteOptions {
+            path: &second_path,
+            id: 2,
+            level: 1,
+            compression: Compression::None,
+            accelerator: &CpuAccelerator,
+            value_log: &mut value_log,
+            large_value_threshold: config.large_value_threshold,
+            block_size: config.block_size,
+            partitioned_bloom: None,
+            direct_io: false,
+        },
+        vec![anchor.clone()],
+    )
+    .unwrap();
+    drop(value_log);
+    fs::remove_file(value_path).unwrap();
+    let second_bytes = fs::read(&second_path).unwrap();
+    assert_eq!(
+        second_meta.file_digest,
+        blake3::hash(&second_bytes).to_hex().to_string()
+    );
+    let second = decode_segment(&second_bytes, &second_path, &CpuAccelerator).unwrap();
+    assert_eq!(second.blocks.iter().flatten().count(), 1);
+    assert_eq!(second.blocks[0][0].entry, anchor);
+    assert_eq!(
+        literal_block_offsets(&second_bytes, 1, 2, second.blocks.len()).len(),
+        second.blocks.len()
+    );
+    assert_ne!(
+        physical_id(&File::open(&first_path).unwrap(), &first_path).unwrap(),
+        physical_id(&File::open(&second_path).unwrap(), &second_path).unwrap()
+    );
+
+    manifest.segments.push(second_meta);
+    manifest.next_segment_id = 3;
+    ManifestStore::new(manifest_path.clone())
+        .save(&manifest)
+        .unwrap();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    let before = snapshot(dir.path());
+    assert!(matches!(
+        inspect_v4_owner(&lease, &config, &CpuAccelerator),
+        Err(PraxisError::UnsupportedCatalogFeature {
+            feature: "v4 installed cut beyond narrow D0 bootstrap"
+        })
+    ));
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        match collect_protected_copy_ledger(root, &manifest, budget).unwrap_err() {
+            PraxisError::Corrupt { reason, .. } => {
+                assert!(reason.contains("Anchor must have one physical copy"));
+            }
+            other => panic!("second physical Anchor must be Corrupt: {other:?}"),
+        }
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(snapshot(dir.path()), before);
+    });
+    assert_eq!(snapshot(dir.path()), before);
+}
