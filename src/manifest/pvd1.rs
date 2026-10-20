@@ -123,7 +123,10 @@ pub(crate) fn decode_pvd1(bytes: &[u8]) -> Result<UntrustedPvd1<'_>, Pvd1Error> 
         .try_reserve_exact(entry_count)
         .map_err(|_| Pvd1Error::AllocationFailure)?;
     let mut previous_node_id: Option<[u8; 32]> = None;
-    for entry in bytes[HEADER_LEN..payload_end].chunks_exact(ENTRY_LEN as usize) {
+    for entry in bytes[HEADER_LEN..payload_end]
+        .as_chunks::<{ ENTRY_LEN as usize }>()
+        .0
+    {
         let node_id: [u8; 32] = entry[..32].try_into().expect("fixed entry width checked");
         if node_id == [0; 32] {
             return Err(Pvd1Error::ZeroNodeId);
