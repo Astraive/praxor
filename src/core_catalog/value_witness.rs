@@ -6,8 +6,8 @@
 use super::authority::CATALOG_CF;
 use super::codec::{CatalogKey, CatalogValue, Field};
 use super::segment_witness::{
-    ObservedSegmentRow, ObservedSegmentValue, PhysicalRowClass, ProtectedRole, SegmentPhysicalId,
-    SegmentSource, physical_id,
+    CopyReplayWork, ObservedSegmentRow, ObservedSegmentValue, PhysicalRowClass, ProtectedRole,
+    SegmentPhysicalId, SegmentSource, physical_id,
 };
 use crate::core_records::codec::{Key as RecordKey, Role as RecordRole, Row as RecordRow};
 use crate::core_records::variable_stream::{VariableKind, VariableRowStream, VariableSummary};
@@ -28,8 +28,6 @@ const MAX_SCHEMA_FIELDS: usize = 128;
 const HASH_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_REFERENCED_VALUE_FILES: usize = 4_096;
 const MAX_STAGED_VALUE_POINTERS: usize = 65_536;
-const MAX_COPY_REPLAY_READ_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_COPY_REPLAY_OPENS: usize = 8_192;
 const COPY_REPLAY_SCRATCH_BYTES: usize =
     HASH_CHUNK_BYTES + CATALOG_MAX_BYTES + HEADER_BYTES as usize + 1;
 
@@ -166,39 +164,37 @@ fn replay_limit() -> PraxisError {
     }
 }
 
-/// Cumulative physical work is charged before any selected-file replay. An
-/// attempt that fails still consumes its reserved work allowance.
+/// The value replay borrows the *same* work meter used by literal segment
+/// replay; constructing a value context cannot reset its physical allowance.
 #[allow(dead_code)] // Used when the private #82 copy ledger integrates replay.
-#[derive(Default)]
-pub(super) struct ValueReplayWork {
-    pub(super) read_bytes: u64,
-    pub(super) open_attempts: usize,
-}
-
-#[allow(dead_code)] // Used when the private #82 copy ledger integrates replay.
-#[derive(Default)]
-pub(super) struct ValueReplayContext {
-    pub(super) work: ValueReplayWork,
+pub(super) struct ValueReplayContext<'a> {
+    pub(super) work: &'a mut CopyReplayWork,
     pub(super) probe: ValueFileScanProbe,
 }
 
-impl ValueReplayWork {
-    fn reserve(&mut self, file_len: u64) -> Result<()> {
-        let read_bytes = file_len
-            .checked_mul(2)
-            .and_then(|bytes| bytes.checked_add(2))
-            .and_then(|bytes| self.read_bytes.checked_add(bytes))
-            .filter(|bytes| *bytes <= MAX_COPY_REPLAY_READ_BYTES)
-            .ok_or_else(replay_limit)?;
-        let open_attempts = self
-            .open_attempts
-            .checked_add(3)
-            .filter(|opens| *opens <= MAX_COPY_REPLAY_OPENS)
-            .ok_or_else(replay_limit)?;
-        self.read_bytes = read_bytes;
-        self.open_attempts = open_attempts;
-        Ok(())
+impl<'a> ValueReplayContext<'a> {
+    #[allow(dead_code)] // The next private #82 ledger constructs the shared context.
+    pub(super) fn new(work: &'a mut CopyReplayWork) -> Self {
+        Self {
+            work,
+            probe: ValueFileScanProbe::default(),
+        }
     }
+}
+
+/// Include the successful EOF probe of each pass and every opened handle.
+/// A failed pass keeps its prospective debit, so an error cannot reset work.
+fn reserve_value_passes(
+    work: &mut CopyReplayWork,
+    file_len: u64,
+    passes: u64,
+    opens: u64,
+) -> Result<()> {
+    let bytes = file_len
+        .checked_add(1)
+        .and_then(|per_pass| per_pass.checked_mul(passes))
+        .ok_or_else(replay_limit)?;
+    work.reserve(bytes, opens, COPY_REPLAY_SCRATCH_BYTES)
 }
 
 struct ReplayScratch<'a> {
@@ -1128,6 +1124,117 @@ pub(super) fn recheck_value_witness(
     candidate: &ValueWitnessCandidate,
     probe: &mut ValueFileScanProbe,
 ) -> Result<()> {
+    recheck_value_witness_inner(root, manifest, candidate, probe, None)
+}
+
+/// A completed, metered value fence is bound to the exact retained candidate.
+/// The ledger must confirm this token before consuming the private proof.
+#[must_use]
+#[allow(dead_code)] // Consumed by the private #82 ledger after integration.
+pub(super) struct CompleteValueCopyReplayFence {
+    fingerprint: blake3::Hash,
+}
+
+#[allow(dead_code)] // The private ledger confirms its retained value set.
+impl CompleteValueCopyReplayFence {
+    pub(super) fn confirms(&self, candidate: &ValueWitnessCandidate) -> bool {
+        self.fingerprint == value_copy_replay_fingerprint(candidate)
+    }
+}
+
+fn value_copy_replay_fingerprint(candidate: &ValueWitnessCandidate) -> blake3::Hash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(candidate.retained_bytes as u64).to_le_bytes());
+    hasher.update(&(candidate.files.len() as u64).to_le_bytes());
+    for file in &candidate.files {
+        hasher.update(&file.id.to_le_bytes());
+        hasher.update(&file.identity.volume.to_le_bytes());
+        hasher.update(&file.identity.file);
+        hasher.update(&file.len.to_le_bytes());
+        hasher.update(file.digest.as_bytes());
+        let path = file.path.as_os_str().as_encoded_bytes();
+        hasher.update(&(path.len() as u64).to_le_bytes());
+        hasher.update(path);
+    }
+    hasher.update(&(candidate.extents.len() as u64).to_le_bytes());
+    for extent in &candidate.extents {
+        hasher.update(&extent.file_id.to_le_bytes());
+        hasher.update(&extent.offset.to_le_bytes());
+        hasher.update(&extent.len.to_le_bytes());
+        hasher.update(&extent.checksum.to_le_bytes());
+        hasher.update(extent.payload_digest.as_bytes());
+        hasher.update(&[match extent.kind {
+            None => 0,
+            Some(VariableKind::Descriptor) => 1,
+            Some(VariableKind::Payload) => 2,
+        }]);
+        hasher.update(&extent.locator.source.level.to_le_bytes());
+        hasher.update(&extent.locator.source.id.to_le_bytes());
+        hasher.update(&(extent.locator.source.manifest_ordinal as u64).to_le_bytes());
+        hasher.update(&extent.locator.block_offset.to_le_bytes());
+        hasher.update(&extent.locator.row_ordinal.to_le_bytes());
+        hasher.update(&(extent.row_index as u64).to_le_bytes());
+    }
+    hasher.update(&(candidate.locator_order.len() as u64).to_le_bytes());
+    for &index in &candidate.locator_order {
+        hasher.update(&(index as u64).to_le_bytes());
+    }
+    hasher.update(&(candidate.variable_summaries.len() as u64).to_le_bytes());
+    for summary in &candidate.variable_summaries {
+        hasher.update(&(summary.extent_index as u64).to_le_bytes());
+        match summary.summary {
+            VariableSummary::Descriptor {
+                name_len,
+                namespace_len,
+            } => {
+                hasher.update(&[1]);
+                hasher.update(&name_len.to_le_bytes());
+                hasher.update(&namespace_len.to_le_bytes());
+            }
+            VariableSummary::Payload {
+                user_len,
+                user_digest,
+            } => {
+                hasher.update(&[2]);
+                hasher.update(&user_len.to_le_bytes());
+                hasher.update(user_digest.as_bytes());
+            }
+        }
+    }
+    hasher.finalize()
+}
+
+/// The #82 final value fence uses the same work meter as every literal and
+/// external selected-row replay. The older #81 witness recheck above retains
+/// its existing API and is never an admission fence for physical copies.
+#[allow(dead_code)] // Called by the private copy ledger after integration.
+pub(super) fn recheck_value_witness_for_copy(
+    root: &Path,
+    manifest: &Manifest,
+    candidate: &ValueWitnessCandidate,
+    context: &mut ValueReplayContext<'_>,
+    budget: &mut PhysicalWitnessBudget,
+) -> Result<CompleteValueCopyReplayFence> {
+    let _scratch = ReplayScratch::new(root, budget)?;
+    recheck_value_witness_inner(
+        root,
+        manifest,
+        candidate,
+        &mut context.probe,
+        Some(&mut *context.work),
+    )?;
+    Ok(CompleteValueCopyReplayFence {
+        fingerprint: value_copy_replay_fingerprint(candidate),
+    })
+}
+
+fn recheck_value_witness_inner(
+    root: &Path,
+    manifest: &Manifest,
+    candidate: &ValueWitnessCandidate,
+    probe: &mut ValueFileScanProbe,
+    mut work: Option<&mut CopyReplayWork>,
+) -> Result<()> {
     if candidate.files.is_empty()
         || candidate.files.len() > MAX_REFERENCED_VALUE_FILES
         || candidate.extents.is_empty()
@@ -1195,6 +1302,9 @@ pub(super) fn recheck_value_witness(
                 "external value candidate has no extents for file",
             ));
         }
+        if let Some(work) = work.as_deref_mut() {
+            reserve_value_passes(work, witness.len, 1, 2)?;
+        }
         let (mut opened, identity, len) = open_checked(&witness.path, probe)?;
         if identity != witness.identity || len != witness.len {
             return Err(corrupt(
@@ -1242,7 +1352,8 @@ pub(super) fn recheck_value_witness(
 /// Stream one witnessed external payload by its original physical segment
 /// locator. Bytes handed to `on_chunk` are provisional: the caller must not
 /// publish a comparison or mutate owner state until this returns `Ok(())` and
-/// the whole candidate receives its final `recheck_value_witness` fence.
+/// `recheck_value_witness_for_copy` has rechecked the complete retained value
+/// set with the same `CopyReplayWork`, including at the consumption boundary.
 ///
 /// Both passes use the same opened file handle. Each pass verifies all extents,
 /// gaps, tail and the full-file digest, followed by path/identity/length checks.
@@ -1254,7 +1365,7 @@ pub(super) fn with_authenticated_value_payload(
     manifest: &Manifest,
     candidate: &ValueWitnessCandidate,
     locator: ValueRowLocator,
-    context: &mut ValueReplayContext,
+    context: &mut ValueReplayContext<'_>,
     budget: &mut PhysicalWitnessBudget,
     mut on_chunk: impl FnMut(&[u8]) -> Result<()>,
 ) -> Result<()> {
@@ -1313,7 +1424,7 @@ pub(super) fn with_authenticated_value_payload(
     }
     let relative_index = extent_index - extent_start;
     let _scratch = ReplayScratch::new(&witness.path, budget)?;
-    context.work.reserve(witness.len)?;
+    reserve_value_passes(&mut *context.work, witness.len, 2, 3)?;
     let (mut opened, identity, len) = open_checked(&witness.path, &mut context.probe)?;
     if identity != witness.identity || len != witness.len {
         return Err(corrupt(
@@ -1511,7 +1622,10 @@ mod direct_replay_tests {
     use crate::config::Compression;
     use crate::core_catalog::codec::{CatalogKey, CatalogValue};
     use crate::core_catalog::physical_tests::flushed_create_fixture;
-    use crate::core_catalog::segment_witness::collect_protected_segment_candidate;
+    use crate::core_catalog::segment_witness::{
+        CopyReplayLimits, PRODUCTION_COPY_REPLAY_LIMITS, collect_protected_segment_candidate,
+        recheck_all_copy_replay_witnesses,
+    };
     use crate::core_records::codec::{Key as RecordKey, Role as RecordRole, Row as RecordRow};
     use crate::io::crc32c;
     use crate::manifest::ManifestStore;
@@ -1757,7 +1871,8 @@ mod direct_replay_tests {
         with_real_candidates(&fixture, |candidate, rows, budget| {
             let root = fixture.lease.root();
             let retained = budget.remaining_bytes();
-            let mut context = ValueReplayContext::default();
+            let mut work = CopyReplayWork::production();
+            let mut context = ValueReplayContext::new(&mut work);
             let heads = selected_heads(rows);
             for locator in heads {
                 let mut streamed = Vec::new();
@@ -1803,12 +1918,25 @@ mod direct_replay_tests {
             assert_eq!(streamed, fixture.payload);
             assert_eq!(budget.remaining_bytes(), retained);
             assert_eq!(
-                context.work.read_bytes,
+                context.work.physical_bytes(),
                 3 * (candidate.files[0].len * 2 + 2)
             );
-            assert_eq!(context.work.open_attempts, 9);
+            assert_eq!(context.work.file_opens(), 9);
             assert_eq!(context.probe.recheck_full_file_hashes, 6);
-            recheck_value_witness(root, &fixture.manifest, candidate, &mut context.probe).unwrap();
+            let fence = recheck_value_witness_for_copy(
+                root,
+                &fixture.manifest,
+                candidate,
+                &mut context,
+                budget,
+            )
+            .unwrap();
+            assert!(fence.confirms(candidate));
+            assert_eq!(context.work.file_opens(), 11);
+            assert_eq!(
+                context.work.physical_bytes(),
+                3 * (candidate.files[0].len * 2 + 2) + candidate.files[0].len + 1
+            );
             assert_eq!(budget.remaining_bytes(), retained);
         });
     }
@@ -1821,7 +1949,8 @@ mod direct_replay_tests {
         with_real_candidates(&fixture, |candidate, rows, budget| {
             let root = fixture.lease.root();
             let retained = budget.remaining_bytes();
-            let mut context = ValueReplayContext::default();
+            let mut work = CopyReplayWork::production();
+            let mut context = ValueReplayContext::new(&mut work);
             let mut copies = Vec::new();
             for locator in selected_heads(rows) {
                 let mut bytes = Vec::new();
@@ -1855,7 +1984,8 @@ mod direct_replay_tests {
             let root = fixture.lease.root();
             let retained = budget.remaining_bytes();
             let locator = selected_heads(rows)[0];
-            let mut refused = ValueReplayContext::default();
+            let mut refused_work = CopyReplayWork::production();
+            let mut refused = ValueReplayContext::new(&mut refused_work);
             let error = with_authenticated_value_payload(
                 root,
                 &fixture.manifest,
@@ -1876,11 +2006,15 @@ mod direct_replay_tests {
                     feature: "injected value callback refusal"
                 }
             ));
-            assert_eq!(refused.work.read_bytes, candidate.files[0].len * 2 + 2);
-            assert_eq!(refused.work.open_attempts, 3);
+            assert_eq!(
+                refused.work.physical_bytes(),
+                candidate.files[0].len * 2 + 2
+            );
+            assert_eq!(refused.work.file_opens(), 3);
             assert_eq!(budget.remaining_bytes(), retained);
 
-            let mut unwound = ValueReplayContext::default();
+            let mut unwound_work = CopyReplayWork::production();
+            let mut unwound = ValueReplayContext::new(&mut unwound_work);
             let panic_result = catch_unwind(AssertUnwindSafe(|| {
                 let _ = with_authenticated_value_payload(
                     root,
@@ -1893,14 +2027,20 @@ mod direct_replay_tests {
                 );
             }));
             assert!(panic_result.is_err());
-            assert_eq!(unwound.work.read_bytes, candidate.files[0].len * 2 + 2);
-            assert_eq!(unwound.work.open_attempts, 3);
+            assert_eq!(
+                unwound.work.physical_bytes(),
+                candidate.files[0].len * 2 + 2
+            );
+            assert_eq!(unwound.work.file_opens(), 3);
             assert_eq!(budget.remaining_bytes(), retained);
 
             let planned = candidate.files[0].len * 2 + 2;
-            let mut read_limited = ValueReplayContext::default();
-            read_limited.work.read_bytes = MAX_COPY_REPLAY_READ_BYTES - planned + 1;
-            let before = read_limited.work.read_bytes;
+            let mut read_work = CopyReplayWork::with_limits_for_test(CopyReplayLimits {
+                max_physical_bytes: planned - 1,
+                max_file_opens: PRODUCTION_COPY_REPLAY_LIMITS.max_file_opens,
+                max_transient_bytes: PRODUCTION_COPY_REPLAY_LIMITS.max_transient_bytes,
+            });
+            let mut read_limited = ValueReplayContext::new(&mut read_work);
             let error = with_authenticated_value_payload(
                 root,
                 &fixture.manifest,
@@ -1913,17 +2053,19 @@ mod direct_replay_tests {
             .unwrap_err();
             assert!(matches!(
                 error,
-                PraxisError::UnsupportedCatalogFeature {
-                    feature: "external value copy replay exceeds the bounded private profile"
-                }
+                PraxisError::UnsupportedCatalogFeature { .. }
             ));
-            assert_eq!(read_limited.work.read_bytes, before);
-            assert_eq!(read_limited.work.open_attempts, 0);
+            assert_eq!(read_limited.work.physical_bytes(), 0);
+            assert_eq!(read_limited.work.file_opens(), 0);
             assert_eq!(read_limited.probe.recheck_full_file_hashes, 0);
             assert_eq!(budget.remaining_bytes(), retained);
 
-            let mut open_limited = ValueReplayContext::default();
-            open_limited.work.open_attempts = MAX_COPY_REPLAY_OPENS - 2;
+            let mut open_work = CopyReplayWork::with_limits_for_test(CopyReplayLimits {
+                max_physical_bytes: PRODUCTION_COPY_REPLAY_LIMITS.max_physical_bytes,
+                max_file_opens: 2,
+                max_transient_bytes: PRODUCTION_COPY_REPLAY_LIMITS.max_transient_bytes,
+            });
+            let mut open_limited = ValueReplayContext::new(&mut open_work);
             let error = with_authenticated_value_payload(
                 root,
                 &fixture.manifest,
@@ -1936,19 +2078,18 @@ mod direct_replay_tests {
             .unwrap_err();
             assert!(matches!(
                 error,
-                PraxisError::UnsupportedCatalogFeature {
-                    feature: "external value copy replay exceeds the bounded private profile"
-                }
+                PraxisError::UnsupportedCatalogFeature { .. }
             ));
-            assert_eq!(open_limited.work.read_bytes, 0);
-            assert_eq!(open_limited.work.open_attempts, MAX_COPY_REPLAY_OPENS - 2);
+            assert_eq!(open_limited.work.physical_bytes(), 0);
+            assert_eq!(open_limited.work.file_opens(), 0);
             assert_eq!(open_limited.probe.recheck_full_file_hashes, 0);
             assert_eq!(budget.remaining_bytes(), retained);
 
             let held = retained - (COPY_REPLAY_SCRATCH_BYTES - 1);
             budget.charge(root, held).unwrap();
             let near_limit = budget.remaining_bytes();
-            let mut no_scratch = ValueReplayContext::default();
+            let mut scratch_work = CopyReplayWork::production();
+            let mut no_scratch = ValueReplayContext::new(&mut scratch_work);
             let error = with_authenticated_value_payload(
                 root,
                 &fixture.manifest,
@@ -1961,10 +2102,175 @@ mod direct_replay_tests {
             .unwrap_err();
             assert!(matches!(error, PraxisError::Corrupt { .. }));
             assert_eq!(budget.remaining_bytes(), near_limit);
-            assert_eq!(no_scratch.work.read_bytes, 0);
+            assert_eq!(no_scratch.work.physical_bytes(), 0);
             budget.release(root, held).unwrap();
             assert_eq!(budget.remaining_bytes(), retained);
         });
+    }
+
+    #[test]
+    fn writer_external_copy_fence_shares_selected_replay_limits() {
+        let fixture = writer_external_replay_fixture(false);
+        with_real_candidates(&fixture, |candidate, rows, budget| {
+            let root = fixture.lease.root();
+            let retained = budget.remaining_bytes();
+            let locator = selected_heads(rows)[0];
+            let file_len = candidate.files[0].len;
+            let selected_reads = (file_len + 1) * 2;
+            let fence_reads = file_len + 1;
+            let mut read_work = CopyReplayWork::with_limits_for_test(CopyReplayLimits {
+                max_physical_bytes: selected_reads + fence_reads - 1,
+                max_file_opens: 5,
+                max_transient_bytes: PRODUCTION_COPY_REPLAY_LIMITS.max_transient_bytes,
+            });
+            let mut read_context = ValueReplayContext::new(&mut read_work);
+            with_authenticated_value_payload(
+                root,
+                &fixture.manifest,
+                candidate,
+                locator,
+                &mut read_context,
+                budget,
+                |_| Ok(()),
+            )
+            .unwrap();
+            let hashes = read_context.probe.recheck_full_file_hashes;
+            assert!(matches!(
+                recheck_value_witness_for_copy(
+                    root,
+                    &fixture.manifest,
+                    candidate,
+                    &mut read_context,
+                    budget,
+                ),
+                Err(PraxisError::UnsupportedCatalogFeature { .. })
+            ));
+            assert_eq!(read_context.work.physical_bytes(), selected_reads);
+            assert_eq!(read_context.work.file_opens(), 3);
+            assert_eq!(read_context.probe.recheck_full_file_hashes, hashes);
+            assert_eq!(budget.remaining_bytes(), retained);
+            let mut renewed_context = ValueReplayContext::new(&mut read_work);
+            assert!(matches!(
+                with_authenticated_value_payload(
+                    root,
+                    &fixture.manifest,
+                    candidate,
+                    locator,
+                    &mut renewed_context,
+                    budget,
+                    |_| Ok(()),
+                ),
+                Err(PraxisError::UnsupportedCatalogFeature { .. })
+            ));
+            assert_eq!(renewed_context.work.physical_bytes(), selected_reads);
+            assert_eq!(renewed_context.work.file_opens(), 3);
+            assert_eq!(renewed_context.probe.recheck_full_file_hashes, 0);
+            assert_eq!(budget.remaining_bytes(), retained);
+
+            let mut open_work = CopyReplayWork::with_limits_for_test(CopyReplayLimits {
+                max_physical_bytes: selected_reads + fence_reads,
+                max_file_opens: 4,
+                max_transient_bytes: PRODUCTION_COPY_REPLAY_LIMITS.max_transient_bytes,
+            });
+            let mut open_context = ValueReplayContext::new(&mut open_work);
+            with_authenticated_value_payload(
+                root,
+                &fixture.manifest,
+                candidate,
+                locator,
+                &mut open_context,
+                budget,
+                |_| Ok(()),
+            )
+            .unwrap();
+            assert!(matches!(
+                recheck_value_witness_for_copy(
+                    root,
+                    &fixture.manifest,
+                    candidate,
+                    &mut open_context,
+                    budget,
+                ),
+                Err(PraxisError::UnsupportedCatalogFeature { .. })
+            ));
+            assert_eq!(open_context.work.physical_bytes(), selected_reads);
+            assert_eq!(open_context.work.file_opens(), 3);
+            assert_eq!(open_context.probe.recheck_full_file_hashes, hashes);
+            assert_eq!(budget.remaining_bytes(), retained);
+        });
+    }
+
+    #[test]
+    fn writer_segment_fence_and_external_replay_share_one_meter() {
+        let fixture = writer_external_replay_fixture(false);
+        let root = fixture.lease.root();
+        let manifest = &fixture.manifest;
+        let cut = WalCut {
+            flushed_sequence: manifest.flushed_sequence,
+            last_sequence: manifest.last_sequence,
+            flushed_wal_id: manifest.flushed_wal_id,
+            active_wal_id: manifest.active_wal_id,
+            next_wal_id: manifest.next_wal_id,
+        };
+        let (_wals, mut budget) = scan_v4_wals_with_budget(root, cut, |_, _, _, _| Ok(())).unwrap();
+        let baseline = budget.remaining_bytes();
+        let segments = collect_protected_segment_candidate(root, manifest, &mut budget).unwrap();
+        let mut probe = ValueFileScanProbe::default();
+        let mut values =
+            collect_value_witness(root, manifest, &segments.rows, &mut budget, &mut probe).unwrap();
+        let retained = budget.remaining_bytes();
+        assert_eq!(segments.witnesses.len(), 1);
+        assert_eq!(values.files.len(), 1);
+        let segment_reads = segments.witnesses[0].len + 1;
+        let value_reads = (values.files[0].len + 1) * 2;
+        let mut work = CopyReplayWork::with_limits_for_test(CopyReplayLimits {
+            max_physical_bytes: segment_reads + value_reads - 1,
+            max_file_opens: PRODUCTION_COPY_REPLAY_LIMITS.max_file_opens,
+            max_transient_bytes: PRODUCTION_COPY_REPLAY_LIMITS.max_transient_bytes,
+        });
+        let fence =
+            recheck_all_copy_replay_witnesses(root, manifest, &segments.witnesses, &mut work)
+                .unwrap();
+        assert!(fence.confirms(&segments.witnesses));
+        assert_eq!(work.physical_bytes(), segment_reads);
+        let opens = work.file_opens();
+        let mut context = ValueReplayContext::new(&mut work);
+        let error = with_authenticated_value_payload(
+            root,
+            manifest,
+            &values,
+            selected_heads(&segments.rows)[0],
+            &mut context,
+            &mut budget,
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            PraxisError::UnsupportedCatalogFeature { .. }
+        ));
+        assert_eq!(context.work.physical_bytes(), segment_reads);
+        assert_eq!(context.work.file_opens(), opens);
+        assert_eq!(context.probe.recheck_full_file_hashes, 0);
+        assert_eq!(budget.remaining_bytes(), retained);
+        let mut fence_work = CopyReplayWork::production();
+        let mut fence_context = ValueReplayContext::new(&mut fence_work);
+        let value_fence = recheck_value_witness_for_copy(
+            root,
+            manifest,
+            &values,
+            &mut fence_context,
+            &mut budget,
+        )
+        .unwrap();
+        assert!(value_fence.confirms(&values));
+        values.files[0].len += 1;
+        assert!(!value_fence.confirms(&values));
+        values.files[0].len -= 1;
+        assert_eq!(budget.remaining_bytes(), retained);
+        values.discard(root, &mut budget).unwrap();
+        segments.discard(root, &mut budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), baseline);
     }
 
     #[test]
@@ -1976,7 +2282,8 @@ mod direct_replay_tests {
             let locator = selected_heads(rows)[0];
             let path = &candidate.files[0].path;
             let mut mutator = fs::OpenOptions::new().write(true).open(path).unwrap();
-            let mut context = ValueReplayContext::default();
+            let mut work = CopyReplayWork::production();
+            let mut context = ValueReplayContext::new(&mut work);
             let error = with_authenticated_value_payload(
                 root,
                 &fixture.manifest,
@@ -1998,7 +2305,15 @@ mod direct_replay_tests {
             mutator.write_all(&fixture.file_bytes[..1]).unwrap();
             mutator.sync_data().unwrap();
             drop(mutator);
-            recheck_value_witness(root, &fixture.manifest, candidate, &mut context.probe).unwrap();
+            let fence = recheck_value_witness_for_copy(
+                root,
+                &fixture.manifest,
+                candidate,
+                &mut context,
+                budget,
+            )
+            .unwrap();
+            assert!(fence.confirms(candidate));
             assert_eq!(budget.remaining_bytes(), retained);
         });
     }

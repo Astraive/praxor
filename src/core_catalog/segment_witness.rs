@@ -1183,7 +1183,9 @@ pub(crate) const PRODUCTION_COPY_REPLAY_LIMITS: CopyReplayLimits = CopyReplayLim
     max_transient_bytes: 16 * 1024 * 1024,
 };
 
-/// Monotone checked work for physical reads, opened handles and peak capture.
+/// One monotone meter for additional segment and value replay, including both
+/// all-witness fences. The private copy ledger must retain this same instance
+/// from its first selected row through consumption.
 #[allow(dead_code)] // Produced by the private copy ledger in the next slice.
 pub(crate) struct CopyReplayWork {
     limits: CopyReplayLimits,
@@ -1216,28 +1218,41 @@ impl CopyReplayWork {
         }
     }
 
-    fn reserve(&mut self, physical_bytes: u64, opens: u64, transient: usize) -> Result<()> {
+    pub(crate) fn reserve(
+        &mut self,
+        physical_bytes: u64,
+        opens: u64,
+        transient: usize,
+    ) -> Result<()> {
         let next_bytes = self
             .physical_bytes
             .checked_add(physical_bytes)
             .filter(|total| *total <= self.limits.max_physical_bytes)
-            .ok_or_else(|| {
-                unsupported("literal copy replay physical reads exceed proof profile")
-            })?;
+            .ok_or_else(|| unsupported("physical-copy replay reads exceed proof profile"))?;
         let next_opens = self
             .file_opens
             .checked_add(opens)
             .filter(|total| *total <= self.limits.max_file_opens)
-            .ok_or_else(|| unsupported("literal copy replay opens exceed proof profile"))?;
+            .ok_or_else(|| unsupported("physical-copy replay opens exceed proof profile"))?;
         if transient > self.limits.max_transient_bytes {
             return Err(unsupported(
-                "literal copy replay transient capture exceeds proof profile",
+                "physical-copy replay transient capture exceeds proof profile",
             ));
         }
         self.physical_bytes = next_bytes;
         self.file_opens = next_opens;
         self.peak_transient_bytes = self.peak_transient_bytes.max(transient);
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn physical_bytes(&self) -> u64 {
+        self.physical_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn file_opens(&self) -> u64 {
+        self.file_opens
     }
 
     /// The ledger retains one small, charged canonical value while the
