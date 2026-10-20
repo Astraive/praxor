@@ -527,6 +527,8 @@ fn writer_produced_duplicate_head_at_s2_reaches_private_copy_ledger() {
 enum NextCopyCase {
     IdenticalAllocator,
     ConflictingHead,
+    IdenticalBinding,
+    ConflictingBinding,
 }
 
 struct NextCopyFixture {
@@ -626,6 +628,13 @@ fn next_copy_fixture(case: NextCopyCase) -> NextCopyFixture {
         ),
         (
             "bootstrap_tag6",
+            "record_binding",
+            "__praxor_record_meta_v1",
+            &[0u8][..],
+            1,
+        ),
+        (
+            "bootstrap_tag6",
             "record_allocator",
             "__praxor_record_meta_v1",
             &[1u8][..],
@@ -658,6 +667,9 @@ fn next_copy_fixture(case: NextCopyCase) -> NextCopyFixture {
     let (cf, key, sequence) = match case {
         NextCopyCase::IdenticalAllocator => ("__praxor_record_meta_v1", &[1u8][..], 1),
         NextCopyCase::ConflictingHead => (CATALOG_CF, &[0u8][..], 2),
+        NextCopyCase::IdenticalBinding | NextCopyCase::ConflictingBinding => {
+            ("__praxor_record_meta_v1", &[0u8][..], 1)
+        }
     };
     let original = first
         .blocks
@@ -691,6 +703,36 @@ fn next_copy_fixture(case: NextCopyCase) -> NextCopyFixture {
         assert_eq!(
             CatalogValue::decode(&CatalogKey::Head, &changed_bytes, &first_path).unwrap(),
             CatalogValue::Head(changed)
+        );
+        written.version.value = StoredValue::Put(changed_bytes);
+    }
+    if matches!(case, NextCopyCase::ConflictingBinding) {
+        let StoredValue::Put(original_bytes) = &original.version.value else {
+            panic!("fixed Binding@1 must be literal")
+        };
+        let RecordRow::Binding {
+            database_id,
+            descriptor_count,
+        } = RecordRow::decode(&RecordKey::Binding, original_bytes, &first_path).unwrap()
+        else {
+            panic!("fixed Binding@1 must decode as Binding")
+        };
+        let changed_count = descriptor_count.checked_add(1).unwrap();
+        let changed_bytes = RecordRow::Binding {
+            database_id,
+            descriptor_count: changed_count,
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(changed_bytes.len(), original_bytes.len());
+        assert_eq!(changed_bytes.len(), 80);
+        assert_ne!(&changed_bytes, original_bytes);
+        assert_eq!(
+            RecordRow::decode(&RecordKey::Binding, &changed_bytes, &first_path).unwrap(),
+            RecordRow::Binding {
+                database_id,
+                descriptor_count: changed_count,
+            }
         );
         written.version.value = StoredValue::Put(changed_bytes);
     }
@@ -928,6 +970,9 @@ fn exercise_next_copy_case(case: NextCopyCase) {
                 Err(other) => panic!("unexpected conflicting-copy error: {other:?}"),
                 Ok(_) => panic!("ledger admitted rechecksummed conflicting Head@2 copies"),
             },
+            NextCopyCase::IdenticalBinding | NextCopyCase::ConflictingBinding => {
+                unreachable!("Binding cases use their own test-first role-group gate")
+            }
         }
         assert_eq!(snapshot(fixture.dir.path()), fixture.before);
     });
@@ -941,6 +986,165 @@ fn writer_produced_duplicate_allocator_at_s1_requires_private_copy_admission() {
 #[test]
 fn rechecksummed_equal_length_head_at_s2_conflict_requires_private_copy_corrupt() {
     exercise_next_copy_case(NextCopyCase::ConflictingHead);
+}
+
+fn writer_record_binding_pair_case(conflicting: bool) {
+    let fixture = next_copy_fixture(if conflicting {
+        NextCopyCase::ConflictingBinding
+    } else {
+        NextCopyCase::IdenticalBinding
+    });
+    let root = fixture.lease.root();
+    let key = RecordKey::Binding.encode().unwrap();
+    assert_eq!(key, [0]);
+    let canonical = fixed_copy_oracle(
+        "bootstrap_tag6",
+        "record_binding",
+        "__praxor_record_meta_v1",
+        &key,
+        1,
+    );
+    assert_eq!(canonical.len(), 80);
+    assert_eq!(
+        fixture.original.version.value,
+        StoredValue::Put(canonical.clone())
+    );
+    let StoredValue::Put(peer) = &fixture.written.version.value else {
+        panic!("writer-produced Binding peer must remain a literal Put")
+    };
+    assert_eq!(peer.len(), 80);
+    assert_eq!(peer == &canonical, !conflicting);
+    let binding_id = fixture
+        .manifest
+        .record_authority
+        .as_ref()
+        .unwrap()
+        .identity(root)
+        .unwrap();
+    for value in [&canonical, peer] {
+        assert!(matches!(
+            RecordRow::decode(&RecordKey::Binding, value, root).unwrap(),
+            RecordRow::Binding { database_id, .. } if database_id == binding_id
+        ));
+    }
+    assert!(matches!(
+        inspect_v4_owner(&fixture.lease, &fixture.config, &CpuAccelerator),
+        Err(PraxisError::UnsupportedCatalogFeature {
+            feature: "v4 installed cut beyond narrow D0 bootstrap"
+        })
+    ));
+    assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+
+    with_wal_budget(root, &fixture.manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let staged = collect_protected_segment_candidate(root, &fixture.manifest, budget)
+            .expect("both writer-produced Binding segments must be witnessed");
+        assert_eq!(staged.witnesses.len(), 2);
+        assert_eq!(staged.rows.len(), 8);
+        for (index, (witness, path, bytes, count)) in [
+            (
+                &staged.witnesses[0],
+                &fixture.first_path,
+                &fixture.first_bytes,
+                7,
+            ),
+            (
+                &staged.witnesses[1],
+                &fixture.second_path,
+                &fixture.second_bytes,
+                1,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                witness.source,
+                SegmentSource {
+                    level: index as u32,
+                    id: index as u64 + 1,
+                    manifest_ordinal: index,
+                }
+            );
+            assert_eq!(witness.path.as_path(), path.as_path());
+            assert_eq!(witness.len, bytes.len() as u64);
+            assert_eq!(witness.digest, blake3::hash(bytes));
+            assert_eq!(witness.observed_rows, count);
+            assert_eq!(
+                witness.identity,
+                physical_id(&File::open(path).unwrap(), path).unwrap()
+            );
+        }
+        assert_ne!(staged.witnesses[0].identity, staged.witnesses[1].identity);
+        let copies = staged
+            .rows
+            .iter()
+            .filter(|row| {
+                row.cf == "__praxor_record_meta_v1" && row.key == key && row.sequence == 1
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(copies.len(), 2);
+        for (index, (row, expected)) in copies
+            .iter()
+            .zip([&fixture.original, &fixture.written])
+            .enumerate()
+        {
+            assert_eq!(row.source, staged.witnesses[index].source);
+            assert_eq!(
+                (row.block_offset, row.row_ordinal),
+                [fixture.first_location, fixture.second_location][index]
+            );
+            assert_eq!(
+                row.classification,
+                PhysicalRowClass::BoundProtected(ProtectedRole::Meta)
+            );
+            let StoredValue::Put(expected_bytes) = &expected.version.value else {
+                unreachable!("the Binding fixture writes only literal Puts")
+            };
+            assert_eq!(row.value, ObservedSegmentValue::Put(expected_bytes.clone()));
+        }
+        drop(copies);
+        staged.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), balance);
+
+        let error = match collect_protected_copy_ledger(root, &fixture.manifest, budget) {
+            Ok(candidate) => {
+                candidate.discard(root, budget).unwrap();
+                panic!("Binding copies unexpectedly reached the legacy private gate")
+            }
+            Err(error) => error,
+        };
+        if conflicting {
+            match error {
+                PraxisError::Corrupt { reason, .. } => {
+                    assert_eq!(reason, "protected physical-copy actual bytes conflict")
+                }
+                other => panic!(
+                    "RED: two valid, changed Binding@1 Puts need authenticated byte conflict after complete fences: {other:?}"
+                ),
+            }
+        } else {
+            assert!(matches!(
+                error,
+                PraxisError::UnsupportedCatalogFeature {
+                    feature: "protected physical-copy role group provenance awaits proof"
+                }
+            ));
+        }
+        assert_eq!(budget.remaining_bytes(), balance, "exact witness refund");
+        assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+    });
+    assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+}
+
+#[test]
+fn writer_equal_record_binding_at_s1_reaches_named_private_gate() {
+    writer_record_binding_pair_case(false);
+}
+
+#[test]
+fn writer_valid_changed_record_binding_at_s1_requires_actual_byte_conflict() {
+    writer_record_binding_pair_case(true);
 }
 
 fn compressed_head_copy_fixture(conflicting: bool) -> NextCopyFixture {
