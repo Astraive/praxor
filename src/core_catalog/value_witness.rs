@@ -1,8 +1,7 @@
 //! Discardable physical evidence for writer-produced value files.
 //!
-//! This first cut accepts protected catalog and fixed-size record pointers to
-//! canonical files. It does not grant an installed owner or admit variable
-//! record Payload/Descriptor extents.
+//! This private cut accepts protected catalog and record pointers to canonical
+//! files. It does not grant an installed owner.
 
 use super::authority::CATALOG_CF;
 use super::codec::{CatalogKey, CatalogValue, Field};
@@ -11,11 +10,13 @@ use super::segment_witness::{
     physical_id,
 };
 use crate::core_records::codec::{Key as RecordKey, Role as RecordRole, Row as RecordRow};
+use crate::core_records::variable_stream::{VariableKind, VariableRowStream, VariableSummary};
 use crate::disk::DiskLayout;
 use crate::errors::{PraxisError, Result};
 use crate::manifest::Manifest;
 use crate::types::ValuePointer;
 use crate::wal::catalog_witness::{PhysicalWitnessBudget, path_charge, vector_charge};
+use crate::wal::record::MAX_WAL_PAYLOAD_BYTES;
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::Read;
@@ -50,14 +51,22 @@ pub(super) struct ValueExtentWitness {
     pub(super) offset: u64,
     pub(super) len: u64,
     pub(super) checksum: u32,
+    pub(super) kind: Option<VariableKind>,
     pub(super) payload_digest: blake3::Hash,
     row_index: usize,
+}
+
+#[derive(Debug)]
+pub(super) struct ValueRecordSummaryWitness {
+    pub(super) extent_index: usize,
+    pub(super) summary: VariableSummary,
 }
 
 #[derive(Debug)]
 pub(super) struct ValueWitnessCandidate {
     pub(super) files: Vec<ValueFileWitness>,
     pub(super) extents: Vec<ValueExtentWitness>,
+    pub(super) variable_summaries: Vec<ValueRecordSummaryWitness>,
     pub(super) retained_bytes: usize,
 }
 
@@ -66,10 +75,12 @@ impl ValueWitnessCandidate {
         let Self {
             files,
             extents,
+            variable_summaries,
             retained_bytes,
         } = self;
         drop(files);
         drop(extents);
+        drop(variable_summaries);
         budget.release(root, retained_bytes)
     }
 }
@@ -264,7 +275,7 @@ fn pointer_spec<'a>(
     root: &Path,
     manifest: &Manifest,
     row: &'a ObservedSegmentRow,
-) -> Result<Option<(u64, &'a ValuePointer)>> {
+) -> Result<Option<(u64, &'a ValuePointer, Option<VariableKind>)>> {
     let ObservedSegmentValue::Pointer {
         pointer,
         expires_at_ms,
@@ -275,6 +286,7 @@ fn pointer_spec<'a>(
     if expires_at_ms.is_some() {
         return Err(corrupt(root, "protected external value pointer expires"));
     }
+    let mut variable_kind = None;
     if row.cf == CATALOG_CF
         && row.classification == PhysicalRowClass::BoundProtected(ProtectedRole::Catalog)
     {
@@ -308,21 +320,33 @@ fn pointer_spec<'a>(
         }
         let key = RecordKey::decode(role, &row.key, root)?;
         let exact_len = match key {
-            RecordKey::Binding => 80,
-            RecordKey::Allocator => 56,
-            RecordKey::State(_) => 24,
-            RecordKey::Fact { .. } => 32,
-            RecordKey::Head { .. } => 40,
-            RecordKey::Descriptor(_) | RecordKey::Payload(_) => {
-                return Err(PraxisError::UnsupportedCatalogFeature {
-                    feature: "variable-length record extents await streamed value witness",
-                });
+            RecordKey::Binding => Some(80),
+            RecordKey::Allocator => Some(56),
+            RecordKey::State(_) => Some(24),
+            RecordKey::Fact { .. } => Some(32),
+            RecordKey::Head { .. } => Some(40),
+            RecordKey::Descriptor(_) => {
+                variable_kind = Some(VariableKind::Descriptor);
+                None
+            }
+            RecordKey::Payload(_) => {
+                variable_kind = Some(VariableKind::Payload);
+                None
             }
         };
-        if pointer.len != exact_len {
+        if let Some(exact_len) = exact_len {
+            if pointer.len != exact_len {
+                return Err(corrupt(
+                    root,
+                    "external fixed record pointer has wrong length",
+                ));
+            }
+        } else if variable_kind.is_some_and(|kind| {
+            pointer.len < kind.minimum_len() || pointer.len > MAX_WAL_PAYLOAD_BYTES as u64
+        }) {
             return Err(corrupt(
                 root,
-                "external fixed record pointer has wrong length",
+                "external variable record pointer exceeds wire bound",
             ));
         }
     } else {
@@ -336,7 +360,7 @@ fn pointer_spec<'a>(
         .checked_add(HEADER_BYTES)
         .and_then(|end| end.checked_add(pointer.len))
         .ok_or_else(|| corrupt(Path::new(&pointer.path), "external value extent overflows"))?;
-    Ok(Some((id, pointer)))
+    Ok(Some((id, pointer, variable_kind)))
 }
 
 fn check_real_value_path(path: &Path) -> Result<()> {
@@ -374,7 +398,13 @@ fn check_real_value_path(path: &Path) -> Result<()> {
 
 fn open_checked(path: &Path) -> Result<(File, SegmentPhysicalId, u64)> {
     check_real_value_path(path)?;
-    let file = File::open(path)?;
+    let file = File::open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            corrupt(path, "external value path disappeared during open")
+        } else {
+            error.into()
+        }
+    })?;
     let meta = file.metadata()?;
     if !meta.is_file() {
         return Err(corrupt(path, "opened external value is not a regular file"));
@@ -382,6 +412,16 @@ fn open_checked(path: &Path) -> Result<(File, SegmentPhysicalId, u64)> {
     let id = physical_id(&file, path)?;
     check_real_value_path(path)?;
     Ok((file, id, meta.len()))
+}
+
+fn read_value_exact(file: &mut File, bytes: &mut [u8], path: &Path) -> Result<()> {
+    file.read_exact(bytes).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            corrupt(path, "external value file truncated during scan")
+        } else {
+            error.into()
+        }
+    })
 }
 
 fn recheck_opened_path(
@@ -406,32 +446,65 @@ struct ExtentSpec {
     offset: u64,
     len: u64,
     checksum: u32,
+    kind: Option<VariableKind>,
     row_index: usize,
 }
 
 trait ExtentSink {
     fn len(&self) -> usize;
     fn spec(&self, index: usize) -> ExtentSpec;
-    fn observe(&mut self, index: usize, digest: blake3::Hash, path: &Path) -> Result<()>;
+    fn proof(&self) -> bool;
+    fn observe(
+        &mut self,
+        index: usize,
+        digest: blake3::Hash,
+        summary: Option<VariableSummary>,
+        path: &Path,
+    ) -> Result<()>;
 }
 
-struct BuildExtents<'a>(&'a mut [ValueExtentWitness]);
+struct BuildExtents<'a> {
+    extents: &'a mut [ValueExtentWitness],
+    summaries: &'a mut Vec<ValueRecordSummaryWitness>,
+    base_index: usize,
+}
 
 impl ExtentSink for BuildExtents<'_> {
     fn len(&self) -> usize {
-        self.0.len()
+        self.extents.len()
     }
     fn spec(&self, index: usize) -> ExtentSpec {
-        let item = &self.0[index];
+        let item = &self.extents[index];
         ExtentSpec {
             offset: item.offset,
             len: item.len,
             checksum: item.checksum,
+            kind: item.kind,
             row_index: item.row_index,
         }
     }
-    fn observe(&mut self, index: usize, digest: blake3::Hash, _path: &Path) -> Result<()> {
-        self.0[index].payload_digest = digest;
+    fn proof(&self) -> bool {
+        true
+    }
+    fn observe(
+        &mut self,
+        index: usize,
+        digest: blake3::Hash,
+        summary: Option<VariableSummary>,
+        path: &Path,
+    ) -> Result<()> {
+        self.extents[index].payload_digest = digest;
+        if let Some(summary) = summary {
+            if self.summaries.len() == self.summaries.capacity() {
+                return Err(budget_error(path));
+            }
+            self.summaries.push(ValueRecordSummaryWitness {
+                extent_index: self.base_index + index,
+                summary,
+            });
+        } else if self.extents[index].kind.is_some() {
+            return Err(corrupt(path, "external variable record has no summary"));
+        }
         Ok(())
     }
 }
@@ -448,10 +521,26 @@ impl ExtentSink for CheckExtents<'_> {
             offset: item.offset,
             len: item.len,
             checksum: item.checksum,
+            kind: item.kind,
             row_index: item.row_index,
         }
     }
-    fn observe(&mut self, index: usize, digest: blake3::Hash, path: &Path) -> Result<()> {
+    fn proof(&self) -> bool {
+        false
+    }
+    fn observe(
+        &mut self,
+        index: usize,
+        digest: blake3::Hash,
+        summary: Option<VariableSummary>,
+        path: &Path,
+    ) -> Result<()> {
+        if summary.is_some() {
+            return Err(corrupt(
+                path,
+                "external value recheck created a new summary",
+            ));
+        }
         if digest != self.0[index].payload_digest {
             return Err(corrupt(path, "external value extent digest changed"));
         }
@@ -461,13 +550,14 @@ impl ExtentSink for CheckExtents<'_> {
 
 fn read_hashed(
     file: &mut File,
+    path: &Path,
     mut bytes: u64,
     full: &mut blake3::Hasher,
     buffer: &mut [u8; HASH_CHUNK_BYTES],
 ) -> Result<()> {
     while bytes != 0 {
         let count = bytes.min(HASH_CHUNK_BYTES as u64) as usize;
-        file.read_exact(&mut buffer[..count])?;
+        read_value_exact(file, &mut buffer[..count], path)?;
         full.update(&buffer[..count]);
         bytes -= count as u64;
     }
@@ -502,11 +592,14 @@ fn scan_file(
         }
         let len = usize::try_from(spec.len)
             .ok()
-            .filter(|len| *len <= CATALOG_MAX_BYTES)
-            .ok_or_else(|| corrupt(path, "external value extent exceeds catalog cap"))?;
-        read_hashed(file, spec.offset - position, &mut full, &mut buffer)?;
+            .filter(|len| match spec.kind {
+                Some(kind) => (*len as u64) >= kind.minimum_len() && *len <= MAX_WAL_PAYLOAD_BYTES,
+                None => *len <= CATALOG_MAX_BYTES,
+            })
+            .ok_or_else(|| corrupt(path, "external value extent exceeds decoded key cap"))?;
+        read_hashed(file, path, spec.offset - position, &mut full, &mut buffer)?;
         let mut header = [0_u8; HEADER_BYTES as usize];
-        file.read_exact(&mut header)?;
+        read_value_exact(file, &mut header, path)?;
         full.update(&header);
         if u64::from_le_bytes(header[..8].try_into().unwrap()) != spec.len
             || u32::from_le_bytes(header[8..].try_into().unwrap()) != spec.checksum
@@ -518,24 +611,38 @@ fn scan_file(
         }
         let mut crc = crc32fast::Hasher::new();
         let mut payload = blake3::Hasher::new();
+        let mut variable = if extents.proof() {
+            spec.kind
+                .map(|kind| VariableRowStream::new(kind, spec.len, path))
+                .transpose()?
+        } else {
+            None
+        };
         let mut copied = 0;
         while copied < len {
             let count = (len - copied).min(HASH_CHUNK_BYTES);
-            file.read_exact(&mut buffer[..count])?;
+            read_value_exact(file, &mut buffer[..count], path)?;
             full.update(&buffer[..count]);
             crc.update(&buffer[..count]);
             payload.update(&buffer[..count]);
-            catalog[copied..copied + count].copy_from_slice(&buffer[..count]);
+            if let Some(parser) = &mut variable {
+                parser.feed(&buffer[..count], path)?;
+            } else if spec.kind.is_none() && extents.proof() {
+                catalog[copied..copied + count].copy_from_slice(&buffer[..count]);
+            }
             copied += count;
         }
         if crc.finalize() != spec.checksum {
             return Err(corrupt(path, "external value payload checksum mismatch"));
         }
-        extents.observe(index, payload.finalize(), path)?;
-        validate(spec.row_index, &catalog[..len])?;
+        let summary = variable.map(|parser| parser.finish(path)).transpose()?;
+        extents.observe(index, payload.finalize(), summary, path)?;
+        if extents.proof() && spec.kind.is_none() {
+            validate(spec.row_index, &catalog[..len])?;
+        }
         position = end;
     }
-    read_hashed(file, observed_len - position, &mut full, &mut buffer)?;
+    read_hashed(file, path, observed_len - position, &mut full, &mut buffer)?;
     let mut extra = [0_u8; 1];
     if file.read(&mut extra)? != 0 {
         return Err(corrupt(path, "external value grew during scan"));
@@ -608,12 +715,16 @@ pub(super) fn collect_value_witness(
     probe: &mut ValueFileScanProbe,
 ) -> Result<ValueWitnessCandidate> {
     let mut count = 0_usize;
+    let mut variable_count = 0_usize;
     for row in rows {
-        if pointer_spec(root, manifest, row)?.is_some() {
+        if let Some((_, _, kind)) = pointer_spec(root, manifest, row)? {
             count = count
                 .checked_add(1)
                 .filter(|count| *count <= MAX_STAGED_VALUE_POINTERS)
                 .ok_or_else(|| corrupt(root, "external value pointer stage exceeds limit"))?;
+            if kind.is_some() {
+                variable_count += 1;
+            }
         }
     }
     if count == 0 {
@@ -628,7 +739,7 @@ pub(super) fn collect_value_witness(
     let (mut extents, extent_charge) =
         reserve_value_vec::<ValueExtentWitness>(root, count, &mut attempt)?;
     for (row_index, row) in rows.iter().enumerate() {
-        if let Some((id, pointer)) = pointer_spec(root, manifest, row)? {
+        if let Some((id, pointer, kind)) = pointer_spec(root, manifest, row)? {
             if extents.len() == extents.capacity() {
                 return Err(budget_error(root));
             }
@@ -637,6 +748,7 @@ pub(super) fn collect_value_witness(
                 offset: pointer.offset,
                 len: pointer.len,
                 checksum: pointer.checksum,
+                kind,
                 payload_digest: blake3::hash(&[]),
                 row_index,
             });
@@ -646,6 +758,11 @@ pub(super) fn collect_value_witness(
         return Err(corrupt(root, "external value pointer count changed"));
     }
     extents.sort_unstable_by_key(|item| (item.file_id, item.offset));
+    let (mut variable_summaries, summary_charge) = if variable_count == 0 {
+        (Vec::new(), 0)
+    } else {
+        reserve_value_vec::<ValueRecordSummaryWitness>(root, variable_count, &mut attempt)?
+    };
     let referenced_files = count_distinct_sorted_ids(root, &extents)?;
     for pair in extents.windows(2) {
         if pair[0].file_id == pair[1].file_id {
@@ -684,10 +801,10 @@ pub(super) fn collect_value_witness(
             let row = rows
                 .get(extent.row_index)
                 .ok_or_else(|| corrupt(&path, "external value row index is unowned"))?;
-            let Some((pointer_id, pointer)) = pointer_spec(root, manifest, row)? else {
+            let Some((pointer_id, pointer, kind)) = pointer_spec(root, manifest, row)? else {
                 return Err(corrupt(&path, "external value row lost its pointer"));
             };
-            if pointer_id != id || pointer.path.as_str() != canonical {
+            if pointer_id != id || pointer.path.as_str() != canonical || kind != extent.kind {
                 return Err(corrupt(
                     &path,
                     "external value pointer path is not the exact canonical spelling",
@@ -734,7 +851,11 @@ pub(super) fn collect_value_witness(
             .checked_add(1)
             .ok_or_else(|| corrupt(&path, "external value proof scan counter overflows"))?;
         let digest = {
-            let mut sink = BuildExtents(&mut extents[extent_start..extent_end]);
+            let mut sink = BuildExtents {
+                extents: &mut extents[extent_start..extent_end],
+                summaries: &mut variable_summaries,
+                base_index: extent_start,
+            };
             scan_file(&mut opened, &path, len, &mut sink, |row_index, bytes| {
                 let row = rows
                     .get(row_index)
@@ -760,8 +881,13 @@ pub(super) fn collect_value_witness(
     drop(physical_ids);
     attempt.release(root, physical_charge)?;
 
+    if variable_summaries.len() != variable_count {
+        return Err(corrupt(root, "external variable summary count changed"));
+    }
+
     let mut retained_bytes = extent_charge
         .checked_add(file_charge)
+        .and_then(|bytes| bytes.checked_add(summary_charge))
         .ok_or_else(|| budget_error(root))?;
     for file in &files {
         retained_bytes = retained_bytes
@@ -772,6 +898,7 @@ pub(super) fn collect_value_witness(
     Ok(ValueWitnessCandidate {
         files,
         extents,
+        variable_summaries,
         retained_bytes,
     })
 }
@@ -788,6 +915,31 @@ pub(super) fn recheck_value_witness(
         || candidate.extents.len() > MAX_STAGED_VALUE_POINTERS
     {
         return Err(corrupt(root, "external value candidate count is invalid"));
+    }
+    let mut summary_index = 0;
+    for (index, extent) in candidate.extents.iter().enumerate() {
+        if let Some(kind) = extent.kind {
+            let summary = candidate
+                .variable_summaries
+                .get(summary_index)
+                .ok_or_else(|| corrupt(root, "external variable record summary is missing"))?;
+            if summary.extent_index != index
+                || !matches!(
+                    (kind, summary.summary),
+                    (VariableKind::Descriptor, VariableSummary::Descriptor { .. })
+                        | (VariableKind::Payload, VariableSummary::Payload { .. })
+                )
+            {
+                return Err(corrupt(root, "external variable record summary is unbound"));
+            }
+            summary_index += 1;
+        }
+    }
+    if summary_index != candidate.variable_summaries.len() {
+        return Err(corrupt(
+            root,
+            "external variable record summary count is invalid",
+        ));
     }
     let mut previous_id = 0_u64;
     let mut extent_start = 0_usize;
@@ -869,6 +1021,7 @@ mod tests {
             offset: 0,
             len: 1,
             checksum: 0,
+            kind: None,
             payload_digest: blake3::hash(&[]),
             row_index: 0,
         }

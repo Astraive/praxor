@@ -7626,6 +7626,7 @@ mod record_external_caps_red {
         ValueFileScanProbe, collect_value_witness, recheck_value_witness,
     };
     use crate::core_records::codec::{Decision, Key as RecordKey, Role as RecordRole, Row};
+    use crate::core_records::variable_stream::VariableSummary;
 
     fn role(key: &RecordKey<'_>) -> RecordRole {
         match key {
@@ -8016,6 +8017,7 @@ mod record_external_caps_red {
         encoded: Vec<u8>,
         expected_len: usize,
     ) {
+        let is_descriptor = matches!(&key, RecordKey::Descriptor(_));
         let record_role = role(&key);
         let expected_sequence = sequence(&key);
         let (dir, lease, manifest, key_bytes, expected) =
@@ -8186,6 +8188,40 @@ mod record_external_caps_red {
                     && extent.checksum == crc32c(&expected)
                     && extent.payload_digest == blake3::hash(&expected)
             }));
+            let target_index = values
+                .extents
+                .iter()
+                .position(|extent| {
+                    extent.file_id == 1
+                        && extent.offset == pointer.offset
+                        && extent.len == expected_len as u64
+                })
+                .unwrap();
+            assert_eq!(
+                values.variable_summaries.len(),
+                values
+                    .extents
+                    .iter()
+                    .filter(|extent| extent.kind.is_some())
+                    .count()
+            );
+            let target_summary = values
+                .variable_summaries
+                .iter()
+                .find(|summary| summary.extent_index == target_index)
+                .unwrap();
+            let expected_summary = if is_descriptor {
+                VariableSummary::Descriptor {
+                    name_len: 3,
+                    namespace_len: 1_048_576,
+                }
+            } else {
+                VariableSummary::Payload {
+                    user_len: 262_144,
+                    user_digest: blake3::hash(&expected[12..]),
+                }
+            };
+            assert_eq!(target_summary.summary, expected_summary);
             recheck_value_witness(root, &manifest, &values, &mut probe).unwrap();
             assert_eq!(probe.recheck_full_file_hashes, 1);
             assert_eq!(
