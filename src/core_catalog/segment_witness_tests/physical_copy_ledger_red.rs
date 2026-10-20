@@ -7,11 +7,16 @@ use crate::core_catalog::value_witness::{
     ValueFileScanProbe, ValueRowLocator, collect_value_witness, validate_inline_catalog_schema_put,
 };
 use crate::core_records::codec::{
-    Decision as RecordDecision, Key as RecordKey, Role as RecordRole, Row as RecordRow,
+    Allocator as RecordAllocator, Decision as RecordDecision, Envelope as RecordEnvelope,
+    Key as RecordKey, Kind as RecordKind, Role as RecordRole, Row as RecordRow,
 };
 use crate::segments::format::SEGMENT_FOOTER_MAGIC;
+use crate::transactions::{BatchOp, WriteBatch};
+use crate::wal::record::{CoreRecordPrefix, CoreWalRecord, parse_core_record_prefix};
 
 const FIXED_ORACLE: &str = include_str!("../../../tests/fixtures/catalog_v4_wal_oracle.json");
+const CATALOG_CREATE_FRAME: &[u8; 424] =
+    include_bytes!("../../../tests/fixtures/catalog_tag7_create_s2.bin");
 
 #[test]
 fn writer_inline_schema_syntax_is_checked_before_copy_admission_and_refunds() {
@@ -1145,6 +1150,445 @@ fn writer_equal_record_binding_at_s1_reaches_named_private_gate() {
 #[test]
 fn writer_valid_changed_record_binding_at_s1_requires_actual_byte_conflict() {
     writer_record_binding_pair_case(true);
+}
+
+fn writer_record_state_pair_case(conflicting: bool) {
+    let (dir, config, lease) = flushed_create_fixture();
+    let root = lease.root();
+    let layout = DiskLayout::at(root);
+    let manifest_path = layout.manifest_path();
+    let mut manifest =
+        Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    assert_eq!((manifest.flushed_sequence, manifest.last_sequence), (2, 2));
+    assert_eq!(manifest.segments.len(), 1);
+    assert_eq!(manifest.segments[0].entries, 7);
+    let database_id = manifest
+        .record_authority
+        .as_ref()
+        .unwrap()
+        .identity(root)
+        .unwrap();
+
+    // The State key is a nonzero big-endian RID in the bound State CF. Its
+    // fixed PRS1 value is exactly 24 bytes; changing only payload_length to 5
+    // preserves a valid codec and the same (CF,key,sequence) copy group.
+    let state_key = RecordKey::State(1).encode().unwrap();
+    assert_eq!(state_key, [1, 0, 0, 0, 0, 0, 0, 0, 1]);
+    assert_eq!(
+        RecordKey::decode(RecordRole::State, &state_key, root).unwrap(),
+        RecordKey::State(1)
+    );
+    let canonical = RecordRow::State {
+        live: true,
+        payload_length: 4,
+    }
+    .encode()
+    .unwrap();
+    assert_eq!(
+        canonical,
+        oracle_bytes("505253310100000001000000000000000400000000000000")
+    );
+    assert_eq!(canonical.len(), 24);
+    let payload = RecordRow::Payload(b"docs").encode().unwrap();
+    let allocator = RecordRow::Allocator(RecordAllocator {
+        last_rid: 1,
+        compatibility_sequence: 1,
+        append_ordinal: 1,
+        live_count: 1,
+        dead_count: 0,
+        live_payload_bytes: 4,
+    })
+    .encode()
+    .unwrap();
+    let mut batch = WriteBatch::new();
+    batch.put(
+        RecordRole::Payload.cf(),
+        RecordKey::Payload(1).encode().unwrap(),
+        payload,
+    );
+    batch.put(RecordRole::State.cf(), state_key.clone(), canonical.clone());
+    batch.put(
+        RecordRole::Meta.cf(),
+        RecordKey::Allocator.encode().unwrap(),
+        allocator,
+    );
+    let envelope = RecordEnvelope {
+        kind: RecordKind::Create,
+        database_id,
+        prior_rid: 0,
+        new_rid: 1,
+        prior_compatibility_sequence: 0,
+        new_compatibility_sequence: 1,
+        prior_append_ordinal: 0,
+        new_append_ordinal: 1,
+        record_count: 1,
+        logical_entry_count: 1,
+    };
+    let frame = CoreWalRecord::Record {
+        sequence: 3,
+        envelope: envelope.clone(),
+        batch,
+    }
+    .try_encode()
+    .unwrap();
+    assert_eq!(&frame[..4], &crate::wal::record::WAL_V2_MAGIC.to_le_bytes());
+    assert_eq!(
+        crc32c(&frame[..12]),
+        u32::from_le_bytes(frame[12..16].try_into().unwrap())
+    );
+    assert_eq!(
+        crc32fast::hash(&frame[16..]),
+        u32::from_le_bytes(frame[8..12].try_into().unwrap())
+    );
+    let CoreRecordPrefix::Complete {
+        record,
+        encoded_len,
+    } = parse_core_record_prefix(&frame, root).unwrap()
+    else {
+        panic!("writer-produced Record CREATE frame must be complete")
+    };
+    assert_eq!(encoded_len, frame.len());
+    assert_eq!(record.try_encode().unwrap(), frame);
+    let CoreWalRecord::Record {
+        sequence,
+        envelope: decoded_envelope,
+        batch: decoded_batch,
+    } = record
+    else {
+        panic!("sequence 3 must remain a Record CREATE frame")
+    };
+    assert_eq!(sequence, 3);
+    assert_eq!(decoded_envelope, envelope);
+    assert_eq!(decoded_batch.len(), 3);
+    let state_in_wal = decoded_batch
+        .ops()
+        .iter()
+        .filter_map(|op| match op {
+            BatchOp::Put { cf, key, value }
+                if cf.0 == RecordRole::State.cf() && key == &state_key =>
+            {
+                Some(value)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(state_in_wal.len(), 1);
+    assert_eq!(state_in_wal[0].as_slice(), canonical.as_slice());
+    assert_eq!(
+        RecordRow::decode(&RecordKey::State(1), state_in_wal[0], root).unwrap(),
+        RecordRow::State {
+            live: true,
+            payload_length: 4,
+        }
+    );
+
+    // Retired WAL 2 carries the independent fixed Catalog CREATE S2 frame
+    // followed by this writer-encoded Record CREATE S3. Active WAL 3 remains
+    // header-only, so the installed cut is fully flushed and still private.
+    let CoreRecordPrefix::Complete {
+        record: CoreWalRecord::Catalog { sequence: 2, .. },
+        encoded_len: catalog_len,
+    } = parse_core_record_prefix(CATALOG_CREATE_FRAME, root).unwrap()
+    else {
+        panic!("fixed Catalog CREATE S2 frame must be complete")
+    };
+    assert_eq!(catalog_len, CATALOG_CREATE_FRAME.len());
+    let mut wal_two = Vec::with_capacity(16 + catalog_len + frame.len());
+    wal_two.extend(0x5457_4146u32.to_le_bytes());
+    wal_two.extend(1u32.to_le_bytes());
+    wal_two.extend(2u64.to_le_bytes());
+    wal_two.extend(CATALOG_CREATE_FRAME);
+    wal_two.extend(&frame);
+    let retired_path = layout.wal_path(2);
+    fs::write(&retired_path, &wal_two).unwrap();
+
+    // Segment 2 contains all three actual Record CREATE operations decoded
+    // from the CRC-checked WAL frame. Segment 3 contains only the State peer.
+    let rows = decoded_batch
+        .ops()
+        .iter()
+        .map(|op| match op {
+            BatchOp::Put { cf, key, value } => SegmentEntry {
+                cf: cf.clone(),
+                key: key.clone().into(),
+                version: VersionedValue {
+                    sequence: 3,
+                    value: StoredValue::Put(value.clone()),
+                },
+            },
+            _ => panic!("Record CREATE fixture must contain only Put operations"),
+        })
+        .collect::<Vec<_>>();
+    let original = rows
+        .iter()
+        .find(|row| row.cf.0 == RecordRole::State.cf() && row.key.as_ref() == state_key.as_slice())
+        .unwrap()
+        .clone();
+    assert_eq!(original.version.value, StoredValue::Put(canonical.clone()));
+    let mut peer = original.clone();
+    if conflicting {
+        let changed = RecordRow::State {
+            live: true,
+            payload_length: 5,
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(changed.len(), canonical.len());
+        assert_ne!(changed, canonical);
+        assert_eq!(
+            RecordRow::decode(&RecordKey::State(1), &changed, root).unwrap(),
+            RecordRow::State {
+                live: true,
+                payload_length: 5,
+            }
+        );
+        peer.version.value = StoredValue::Put(changed);
+    }
+
+    let mut state_locations = Vec::new();
+    let mut file_facts = Vec::new();
+    for (level, id, entries, wanted) in [
+        (1, 2, rows, original.clone()),
+        (2, 3, vec![peer.clone()], peer.clone()),
+    ] {
+        let path = layout.segment_path(level, id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let value_path = layout.value_log_path(id);
+        let mut value_log = ValueLog::open(&value_path).unwrap();
+        let meta = SegmentWriter::write(
+            SegmentWriteOptions {
+                path: &path,
+                id,
+                level,
+                compression: Compression::None,
+                accelerator: &CpuAccelerator,
+                value_log: &mut value_log,
+                large_value_threshold: config.large_value_threshold,
+                block_size: config.block_size,
+                partitioned_bloom: None,
+                direct_io: false,
+            },
+            entries,
+        )
+        .unwrap();
+        drop(value_log);
+        fs::remove_file(value_path).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(meta.path, path.to_str().unwrap());
+        assert_eq!(meta.file_digest, blake3::hash(&bytes).to_hex().to_string());
+        assert_eq!(meta.entries, if id == 2 { 3 } else { 1 });
+        let decoded = decode_segment(&bytes, &path, &CpuAccelerator).unwrap();
+        assert_eq!((decoded.level, decoded.id), (level, id));
+        assert_eq!(
+            decoded.blocks.iter().map(Vec::len).sum::<usize>() as u64,
+            meta.entries
+        );
+        let offsets = literal_block_offsets(&bytes, level, id, decoded.blocks.len());
+        let location = exact_entry_location(&decoded, &offsets, &wanted);
+        assert!(
+            decoded
+                .blocks
+                .iter()
+                .flatten()
+                .all(|row| row.blob_expiry.is_none())
+        );
+        state_locations.push(location);
+        file_facts.push((path, bytes, meta.entries));
+        manifest.segments.push(meta);
+    }
+    manifest.flushed_sequence = 3;
+    manifest.last_sequence = 3;
+    manifest.next_segment_id = 4;
+    ManifestStore::new(manifest_path.clone())
+        .save(&manifest)
+        .unwrap();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    assert_eq!((manifest.flushed_sequence, manifest.last_sequence), (3, 3));
+    assert_eq!((manifest.flushed_wal_id, manifest.active_wal_id), (2, 3));
+    assert_eq!(manifest.segments.len(), 3);
+    assert_eq!(
+        manifest
+            .segments
+            .iter()
+            .map(|meta| meta.entries)
+            .sum::<u64>(),
+        11
+    );
+    let first_path = layout.segment_path(0, 1);
+    let first_bytes = fs::read(&first_path).unwrap();
+    assert_eq!(
+        manifest.segments[0].file_digest,
+        blake3::hash(&first_bytes).to_hex().to_string()
+    );
+    let first = decode_segment(&first_bytes, &first_path, &CpuAccelerator).unwrap();
+    assert_eq!(first.blocks.iter().map(Vec::len).sum::<usize>(), 7);
+    let _first_offsets = literal_block_offsets(&first_bytes, 0, 1, first.blocks.len());
+    assert_eq!(fs::read_dir(layout.value_root()).unwrap().count(), 0);
+    let before = snapshot(dir.path());
+    assert!(matches!(
+        inspect_v4_owner(&lease, &config, &CpuAccelerator),
+        Err(PraxisError::UnsupportedCatalogFeature {
+            feature: "v4 installed cut beyond narrow D0 bootstrap"
+        })
+    ));
+    assert_eq!(snapshot(dir.path()), before);
+
+    let cut = WalCut {
+        flushed_sequence: manifest.flushed_sequence,
+        last_sequence: manifest.last_sequence,
+        flushed_wal_id: manifest.flushed_wal_id,
+        active_wal_id: manifest.active_wal_id,
+        next_wal_id: manifest.next_wal_id,
+    };
+    let mut frames = Vec::new();
+    let (wal_witnesses, mut budget) = scan_v4_wals_with_budget(root, cut, |id, start, end, row| {
+        frames.push((id, start, end, row.sequence()));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        frames,
+        [
+            (2, 16, 16 + catalog_len as u64, 2),
+            (2, 16 + catalog_len as u64, wal_two.len() as u64, 3),
+        ]
+    );
+    assert_eq!(wal_witnesses.len(), 2);
+    assert_eq!(wal_witnesses[0].id, 2);
+    assert_eq!(wal_witnesses[0].path, retired_path);
+    assert_eq!(wal_witnesses[0].full_len, wal_two.len() as u64);
+    assert_eq!(wal_witnesses[0].full_digest, blake3::hash(&wal_two));
+    assert_eq!(wal_witnesses[0].prefix_len, wal_two.len() as u64);
+    assert_eq!(wal_witnesses[0].prefix_digest, blake3::hash(&wal_two));
+    assert_eq!(wal_witnesses[0].record_count, 2);
+    assert_eq!(
+        (
+            wal_witnesses[0].first_sequence,
+            wal_witnesses[0].last_sequence
+        ),
+        (Some(2), Some(3))
+    );
+    assert_eq!(wal_witnesses[0].catalog_creates, 1);
+    assert!(wal_witnesses[0].torn_start.is_none());
+    assert_eq!(wal_witnesses[1].id, 3);
+    assert_eq!(wal_witnesses[1].path, layout.wal_path(3));
+    assert_eq!(wal_witnesses[1].record_count, 0);
+    assert_eq!(wal_witnesses[1].full_len, 16);
+    let active_bytes = fs::read(layout.wal_path(3)).unwrap();
+    assert_eq!(wal_witnesses[1].full_digest, blake3::hash(&active_bytes));
+    crate::wal::catalog_witness::recheck_v4_wals(root, cut, &wal_witnesses).unwrap();
+    assert_eq!(snapshot(dir.path()), before);
+
+    let balance = budget.remaining_bytes();
+    let staged = collect_protected_segment_candidate(root, &manifest, &mut budget)
+        .expect("all three writer-produced segments must be witnessed");
+    assert_eq!((staged.witnesses.len(), staged.rows.len()), (3, 11));
+    for (index, (witness, path, bytes, count)) in [
+        (&staged.witnesses[0], &first_path, &first_bytes, 7),
+        (
+            &staged.witnesses[1],
+            &file_facts[0].0,
+            &file_facts[0].1,
+            file_facts[0].2,
+        ),
+        (
+            &staged.witnesses[2],
+            &file_facts[1].0,
+            &file_facts[1].1,
+            file_facts[1].2,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(
+            witness.source,
+            SegmentSource {
+                level: index as u32,
+                id: index as u64 + 1,
+                manifest_ordinal: index,
+            }
+        );
+        assert_eq!(witness.path.as_path(), path.as_path());
+        assert_eq!(witness.len, bytes.len() as u64);
+        assert_eq!(witness.digest, blake3::hash(bytes));
+        assert_eq!(witness.observed_rows, count);
+        assert_eq!(
+            witness.identity,
+            physical_id(&File::open(path).unwrap(), path).unwrap()
+        );
+    }
+    assert_ne!(staged.witnesses[1].identity, staged.witnesses[2].identity);
+    let copies = staged
+        .rows
+        .iter()
+        .filter(|row| row.cf == RecordRole::State.cf() && row.key == state_key && row.sequence == 3)
+        .collect::<Vec<_>>();
+    assert_eq!(copies.len(), 2);
+    for (index, (row, expected)) in copies.iter().zip([&original, &peer]).enumerate() {
+        assert_eq!(row.source, staged.witnesses[index + 1].source);
+        assert_eq!((row.block_offset, row.row_ordinal), state_locations[index]);
+        assert_eq!(
+            row.classification,
+            PhysicalRowClass::BoundProtected(ProtectedRole::State)
+        );
+        let StoredValue::Put(expected_bytes) = &expected.version.value else {
+            panic!("both writer-produced State copies must be literal Puts")
+        };
+        assert_eq!(row.value, ObservedSegmentValue::Put(expected_bytes.clone()));
+    }
+    drop(copies);
+    staged.discard(root, &mut budget).unwrap();
+    assert_eq!(budget.remaining_bytes(), balance, "staged witness refund");
+    assert_eq!(snapshot(dir.path()), before);
+
+    let error = match collect_protected_copy_ledger(root, &manifest, &mut budget) {
+        Ok(candidate) => {
+            candidate.discard(root, &mut budget).unwrap();
+            panic!("State copies unexpectedly passed the private pending gate")
+        }
+        Err(error) => error,
+    };
+    if conflicting {
+        match error {
+            PraxisError::Corrupt { reason, .. } => {
+                assert_eq!(reason, "protected physical-copy actual bytes conflict")
+            }
+            other => panic!(
+                "RED: codec-valid changed State@3 copy needs authenticated byte conflict: {other:?}"
+            ),
+        }
+    } else {
+        assert!(matches!(
+            error,
+            PraxisError::UnsupportedCatalogFeature {
+                feature: "protected physical-copy bytes await authenticated replay"
+            }
+        ));
+    }
+    assert_eq!(
+        budget.remaining_bytes(),
+        balance,
+        "copy-ledger exact refund"
+    );
+    assert_eq!(snapshot(dir.path()), before);
+    assert!(matches!(
+        inspect_v4_owner(&lease, &config, &CpuAccelerator),
+        Err(PraxisError::UnsupportedCatalogFeature {
+            feature: "v4 installed cut beyond narrow D0 bootstrap"
+        })
+    ));
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn writer_equal_record_state_at_s3_reaches_named_private_gate() {
+    writer_record_state_pair_case(false);
+}
+
+#[test]
+fn writer_valid_changed_record_state_at_s3_requires_actual_byte_conflict() {
+    writer_record_state_pair_case(true);
 }
 
 fn compressed_head_copy_fixture(conflicting: bool) -> NextCopyFixture {
