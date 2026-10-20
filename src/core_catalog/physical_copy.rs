@@ -11,7 +11,10 @@ use super::segment_witness::{
     SegmentSource, collect_protected_segment_candidate, recheck_all_copy_replay_witnesses,
     with_authenticated_literal_put,
 };
-use super::value_witness::{ValueFileScanProbe, ValueWitnessCandidate, collect_value_witness};
+use super::value_witness::{
+    ValueFileScanProbe, ValueReplayContext, ValueRowLocator, ValueWitnessCandidate,
+    collect_value_witness, recheck_value_witness_for_copy, with_authenticated_value_payload,
+};
 use crate::core_records::codec::{Key as RecordKey, Role as RecordRole, Row as RecordRow};
 use crate::errors::{PraxisError, Result};
 use crate::manifest::Manifest;
@@ -80,12 +83,6 @@ fn unproven_index_head_cardinality() -> PraxisError {
 fn unproven_index_head_external() -> PraxisError {
     PraxisError::UnsupportedCatalogFeature {
         feature: "external record-index Head physical group awaits value replay",
-    }
-}
-
-fn unproven_external_copy() -> PraxisError {
-    PraxisError::UnsupportedCatalogFeature {
-        feature: "external protected physical-copy bytes await value replay",
     }
 }
 
@@ -584,6 +581,7 @@ fn replay_ordered_index_head_group(
     copies: &[CopyDescriptor],
     budget: &mut PhysicalWitnessBudget,
     work: &mut CopyReplayWork,
+    actual_bytes_conflict: &mut bool,
 ) -> Result<()> {
     if copies
         .iter()
@@ -658,10 +656,7 @@ fn replay_ordered_index_head_group(
                 replay_budget,
                 |actual| {
                     if !exact_literal_bytes_equal(expected, actual) {
-                        return Err(corrupt(
-                            root,
-                            "ordered record Head physical-copy bytes conflict",
-                        ));
+                        *actual_bytes_conflict = true;
                     }
                     Ok(())
                 },
@@ -672,89 +667,24 @@ fn replay_ordered_index_head_group(
     Ok(())
 }
 
-fn replay_literal_copy_groups(
+/// Read one fixed-width logical value through its exact physical witness.
+/// The callback's chunks remain provisional until the selected-file replay
+/// and both complete witness fences have succeeded.
+#[allow(clippy::too_many_arguments)] // Segment and value witnesses have separate physical identities.
+fn with_authenticated_singleton_copy(
     root: &Path,
     manifest: &Manifest,
     segment: &ProtectedSegmentCandidate,
-    descriptors: &[CopyDescriptor],
-    groups: &[CopyTripleGroup],
+    value: Option<&ValueWitnessCandidate>,
+    copy: &CopyDescriptor,
+    width: usize,
     budget: &mut PhysicalWitnessBudget,
     work: &mut CopyReplayWork,
+    mut on_chunk: impl FnMut(&[u8]) -> Result<()>,
 ) -> Result<()> {
-    for group in groups {
-        let copies = &descriptors[group.start..group.end];
-        if copies.len() < 2 {
-            continue;
-        }
-        if is_record_index_head(root, &copies[0])? {
-            replay_ordered_index_head_group(
-                root,
-                manifest,
-                &segment.witnesses,
-                copies,
-                budget,
-                work,
-            )?;
-            continue;
-        }
-        let width = singleton_literal_width(root, &copies[0])?;
-        if copies
-            .iter()
-            .any(|copy| matches!(copy.operation, CopyWireOperation::Pointer { .. }))
-        {
-            return Err(unproven_external_copy());
-        }
-        if copies.iter().any(
-            |copy| !matches!(copy.operation, CopyWireOperation::Put { len } if len == width as u64),
-        ) {
-            return Err(corrupt(
-                root,
-                "singleton protected copy has conflicting wire operation or length",
-            ));
-        }
-        let mut canonical = LiteralComparisonBuffer::new(root, budget, work, width)?;
-        let first = &copies[0];
-        let first_witness = witnessed_source(root, &segment.witnesses, first)?;
-        let charge = canonical.charge;
-        let bytes = &mut canonical.bytes;
-        let replay_budget = &mut *canonical.budget;
-        with_authenticated_literal_put(
-            root,
-            manifest,
-            first_witness,
-            PhysicalRowLocator {
-                source: first.source,
-                block_offset: first.block_offset,
-                row_ordinal: first.row_ordinal,
-            },
-            ExpectedLiteralPut {
-                cf: &first.cf,
-                key: &first.key,
-                sequence: first.sequence,
-            },
-            work,
-            replay_budget,
-            |actual| {
-                if actual.len() != width {
-                    return Err(corrupt(
-                        root,
-                        "singleton protected copy has invalid replay length",
-                    ));
-                }
-                bytes
-                    .try_reserve_exact(width)
-                    .map_err(|_| literal_buffer_limit())?;
-                if bytes.capacity() > charge {
-                    return Err(literal_buffer_limit());
-                }
-                bytes.extend_from_slice(actual);
-                Ok(())
-            },
-        )?;
-        for copy in &copies[1..] {
+    match copy.operation {
+        CopyWireOperation::Put { len } if len == width as u64 => {
             let witness = witnessed_source(root, &segment.witnesses, copy)?;
-            let expected = &canonical.bytes;
-            let replay_budget = &mut *canonical.budget;
             with_authenticated_literal_put(
                 root,
                 manifest,
@@ -770,17 +700,129 @@ fn replay_literal_copy_groups(
                     sequence: copy.sequence,
                 },
                 work,
-                replay_budget,
+                budget,
                 |actual| {
-                    if !exact_literal_bytes_equal(expected, actual) {
-                        return Err(corrupt(
-                            root,
-                            "protected physical-copy actual bytes conflict",
-                        ));
+                    for chunk in actual.chunks(COPY_COMPARE_CHUNK_BYTES) {
+                        on_chunk(chunk)?;
                     }
                     Ok(())
                 },
+            )
+        }
+        CopyWireOperation::Pointer { len } if len == width as u64 => {
+            let candidate = value
+                .ok_or_else(|| corrupt(root, "external protected copy lacks a value witness"))?;
+            let mut context = ValueReplayContext::new(work);
+            with_authenticated_value_payload(
+                root,
+                manifest,
+                candidate,
+                ValueRowLocator {
+                    source: copy.source,
+                    block_offset: copy.block_offset,
+                    row_ordinal: copy.row_ordinal,
+                },
+                &mut context,
+                budget,
+                on_chunk,
+            )
+        }
+        _ => Err(corrupt(
+            root,
+            "singleton protected copy has conflicting wire operation or length",
+        )),
+    }
+}
+
+fn replay_fixed_copy_groups(
+    root: &Path,
+    manifest: &Manifest,
+    segment: &ProtectedSegmentCandidate,
+    value: Option<&ValueWitnessCandidate>,
+    descriptors: &[CopyDescriptor],
+    groups: &[CopyTripleGroup],
+    budget: &mut PhysicalWitnessBudget,
+    work: &mut CopyReplayWork,
+) -> Result<()> {
+    let mut actual_bytes_conflict = false;
+    let mut ordered_head_conflict = false;
+    for group in groups {
+        let copies = &descriptors[group.start..group.end];
+        if copies.len() < 2 {
+            continue;
+        }
+        if is_record_index_head(root, &copies[0])? {
+            replay_ordered_index_head_group(
+                root,
+                manifest,
+                &segment.witnesses,
+                copies,
+                budget,
+                work,
+                &mut ordered_head_conflict,
             )?;
+            continue;
+        }
+        let width = singleton_literal_width(root, &copies[0])?;
+        let mut canonical = LiteralComparisonBuffer::new(root, budget, work, width)?;
+        let first = &copies[0];
+        let charge = canonical.charge;
+        let bytes = &mut canonical.bytes;
+        let replay_budget = &mut *canonical.budget;
+        let mut canonical_overflow = false;
+        with_authenticated_singleton_copy(
+            root,
+            manifest,
+            segment,
+            value,
+            first,
+            width,
+            replay_budget,
+            work,
+            |chunk| {
+                let remaining = width.saturating_sub(bytes.len());
+                let retained = chunk.len().min(remaining);
+                canonical_overflow |= chunk.len() != retained;
+                if retained != 0 {
+                    bytes
+                        .try_reserve_exact(retained)
+                        .map_err(|_| literal_buffer_limit())?;
+                    if bytes.capacity() > charge {
+                        return Err(literal_buffer_limit());
+                    }
+                    bytes.extend_from_slice(&chunk[..retained]);
+                }
+                Ok(())
+            },
+        )?;
+        if canonical.bytes.len() != width || canonical_overflow {
+            actual_bytes_conflict = true;
+        }
+        for copy in &copies[1..] {
+            let expected = &canonical.bytes;
+            let replay_budget = &mut *canonical.budget;
+            let mut compared = 0usize;
+            with_authenticated_singleton_copy(
+                root,
+                manifest,
+                segment,
+                value,
+                copy,
+                width,
+                replay_budget,
+                work,
+                |chunk| {
+                    let end = compared.saturating_add(chunk.len());
+                    if expected.get(compared..end) != Some(chunk) {
+                        actual_bytes_conflict = true;
+                    }
+                    compared = end;
+                    Ok(())
+                },
+            )?;
+            if compared != width {
+                actual_bytes_conflict = true;
+            }
         }
         drop(canonical);
     }
@@ -789,6 +831,28 @@ fn replay_literal_copy_groups(
     let fence = recheck_all_copy_replay_witnesses(root, manifest, &segment.witnesses, work)?;
     if !fence.confirms(&segment.witnesses) {
         return Err(corrupt(root, "complete copy replay witness set changed"));
+    }
+    if let Some(value) = value {
+        let mut context = ValueReplayContext::new(work);
+        let fence = recheck_value_witness_for_copy(root, manifest, value, &mut context, budget)?;
+        if !fence.confirms(value) {
+            return Err(corrupt(
+                root,
+                "complete value copy replay witness set changed",
+            ));
+        }
+    }
+    if actual_bytes_conflict {
+        return Err(corrupt(
+            root,
+            "protected physical-copy actual bytes conflict",
+        ));
+    }
+    if ordered_head_conflict {
+        return Err(corrupt(
+            root,
+            "ordered record Head physical-copy bytes conflict",
+        ));
     }
     Ok(())
 }
@@ -975,10 +1039,11 @@ pub(crate) fn collect_protected_copy_ledger(
         return attempt.fail(error);
     }
     let mut replay_work = CopyReplayWork::production();
-    let replay = replay_literal_copy_groups(
+    let replay = replay_fixed_copy_groups(
         root,
         manifest,
         attempt.segment.as_ref().expect("segment receipt exists"),
+        attempt.value.as_ref(),
         &attempt.descriptors,
         &attempt.groups,
         &mut *attempt.budget,
@@ -987,10 +1052,9 @@ pub(crate) fn collect_protected_copy_ledger(
     if let Err(error) = replay {
         return attempt.fail(error);
     }
-    // This slice validates fixed singleton literal copies and complete
-    // ordered record-index Head literal groups. No private candidate can be
-    // returned until all other groups and logical value forms have a complete
-    // proof and consumption-boundary recheck.
+    // This slice validates fixed singleton inline/external copies and complete
+    // ordered record-index Head literal groups. Variable/compressed groups and
+    // consumption-boundary admission remain separate private proof steps.
     attempt.fail(pending_replay())
 }
 
