@@ -1,7 +1,7 @@
-//! Discardable physical evidence for one writer-produced value file.
+//! Discardable physical evidence for writer-produced value files.
 //!
 //! This first cut accepts protected catalog and fixed-size record pointers to
-//! one canonical file. It does not grant an installed owner or admit variable
+//! canonical files. It does not grant an installed owner or admit variable
 //! record Payload/Descriptor extents.
 
 use super::authority::CATALOG_CF;
@@ -26,6 +26,14 @@ const CATALOG_MAX_BYTES: usize = 33_947;
 const MAX_SCHEMA_FIELDS: usize = 128;
 const HASH_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_REFERENCED_VALUE_FILES: usize = 4_096;
+const MAX_STAGED_VALUE_POINTERS: usize = 65_536;
+
+struct PreparedValueFile {
+    id: u64,
+    path: PathBuf,
+    extent_start: usize,
+    extent_end: usize,
+}
 
 #[derive(Debug)]
 pub(super) struct ValueFileWitness {
@@ -139,6 +147,76 @@ impl Drop for ValueAttempt<'_> {
             std::process::abort();
         }
     }
+}
+
+/// Charge a conservative prospective capacity before asking Vec to allocate.
+/// The observed capacity must fit that charge; no subsequent push may grow it.
+fn reserve_value_vec<T>(
+    path: &Path,
+    count: usize,
+    attempt: &mut ValueAttempt<'_>,
+) -> Result<(Vec<T>, usize)> {
+    let prospective = count.checked_mul(2).ok_or_else(|| budget_error(path))?;
+    let allowance = vector_charge::<T>(path, prospective)?;
+    attempt.charge(path, allowance)?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| corrupt(path, "external value witness reservation failed"))?;
+    let observed = vector_charge::<T>(path, values.capacity())?;
+    if values.capacity() < count || observed > allowance {
+        return Err(budget_error(path));
+    }
+    attempt.release(path, allowance - observed)?;
+    Ok((values, observed))
+}
+
+/// Extents are already sorted in place by (file ID, offset). Repeated pointers
+/// to one file consume only one of the 4,096 file slots.
+fn count_distinct_sorted_ids(path: &Path, extents: &[ValueExtentWitness]) -> Result<usize> {
+    let mut previous = 0_u64;
+    let mut count = 0_usize;
+    for extent in extents {
+        if extent.file_id == 0 || extent.file_id < previous {
+            return Err(corrupt(path, "external value IDs are not sorted and owned"));
+        }
+        if extent.file_id != previous {
+            count = count
+                .checked_add(1)
+                .filter(|count| *count <= MAX_REFERENCED_VALUE_FILES)
+                .ok_or_else(|| corrupt(path, "too many referenced value files"))?;
+            previous = extent.file_id;
+        }
+    }
+    Ok(count)
+}
+
+/// A sorted, precharged Vec avoids HashSet's speculative bucket allocation.
+fn register_physical_identity(
+    path: &Path,
+    identities: &mut Vec<SegmentPhysicalId>,
+    identity: SegmentPhysicalId,
+) -> Result<()> {
+    let position = identities.binary_search_by(|existing| {
+        existing
+            .volume
+            .cmp(&identity.volume)
+            .then_with(|| existing.file.cmp(&identity.file))
+    });
+    let index = match position {
+        Ok(_) => {
+            return Err(corrupt(
+                path,
+                "external value files share a physical identity",
+            ));
+        }
+        Err(index) => index,
+    };
+    if identities.len() == identities.capacity() {
+        return Err(budget_error(path));
+    }
+    identities.insert(index, identity);
+    Ok(())
 }
 
 /// Parse the ID from borrowed path components. Path equality normalizes some
@@ -529,91 +607,30 @@ pub(super) fn collect_value_witness(
     budget: &mut PhysicalWitnessBudget,
     probe: &mut ValueFileScanProbe,
 ) -> Result<ValueWitnessCandidate> {
-    let mut first: Option<u64> = None;
     let mut count = 0_usize;
-    let mut referenced_files = 0_usize;
     for row in rows {
-        if let Some((id, _)) = pointer_spec(root, manifest, row)? {
+        if pointer_spec(root, manifest, row)?.is_some() {
             count = count
                 .checked_add(1)
-                .filter(|count| *count <= 65_536)
+                .filter(|count| *count <= MAX_STAGED_VALUE_POINTERS)
                 .ok_or_else(|| corrupt(root, "external value pointer stage exceeds limit"))?;
-            match first {
-                None => {
-                    referenced_files = referenced_files
-                        .checked_add(1)
-                        .filter(|files| *files <= MAX_REFERENCED_VALUE_FILES)
-                        .ok_or_else(|| corrupt(root, "too many referenced value files"))?;
-                    first = Some(id);
-                }
-                Some(first_id) if first_id == id => {}
-                _ => {
-                    let _next = referenced_files
-                        .checked_add(1)
-                        .filter(|files| *files <= MAX_REFERENCED_VALUE_FILES)
-                        .ok_or_else(|| corrupt(root, "too many referenced value files"))?;
-                    return Err(PraxisError::UnsupportedCatalogFeature {
-                        feature: "multiple referenced value files await the inventory cut",
-                    });
-                }
-            }
         }
     }
-    let id = first.ok_or(PraxisError::UnsupportedCatalogFeature {
-        feature: "no protected external value to witness",
-    })?;
+    if count == 0 {
+        return Err(PraxisError::UnsupportedCatalogFeature {
+            feature: "no protected external value to witness",
+        });
+    }
+
+    // Declare the attempt before every allocation it owns. On any error, all
+    // later paths and vectors drop before its Drop returns their shared debit.
     let mut attempt = ValueAttempt::new(root, budget);
-    let build_allowance = canonical_path_build_charge(root)?;
-    attempt.charge(root, build_allowance)?;
-    let path = {
-        let layout = DiskLayout::at(root);
-        layout.value_log_path(id)
-    };
-    let canonical = path
-        .to_str()
-        .ok_or_else(|| corrupt(&path, "external value canonical path is not UTF-8"))?;
-    for row in rows {
-        if pointer_spec(root, manifest, row)?.is_some_and(|(pointer_id, pointer)| {
-            pointer_id != id || pointer.path.as_str() != canonical
-        }) {
-            return Err(corrupt(
-                &path,
-                "external value pointer path is not the exact canonical spelling",
-            ));
-        }
-    }
-    let path_allowance = path_charge(&path)?;
-    if path.capacity() > path_allowance || path_allowance > build_allowance {
-        return Err(budget_error(&path));
-    }
-    // The temporary layout, intermediate directory and filename have dropped;
-    // retain the final path's own debit before refunding the temporary excess.
-    attempt.release(root, build_allowance - path_allowance)?;
-    let file_allowance = vector_charge::<ValueFileWitness>(&path, 1)?;
-    attempt.charge(&path, file_allowance)?;
-    let mut files = Vec::new();
-    files
-        .try_reserve_exact(1)
-        .map_err(|_| corrupt(&path, "external value file witness reservation failed"))?;
-    if vector_charge::<ValueFileWitness>(&path, files.capacity())? > file_allowance {
-        return Err(budget_error(&path));
-    }
-    let extent_allowance = vector_charge::<ValueExtentWitness>(&path, count)?;
-    attempt.charge(&path, extent_allowance)?;
-    let mut extents = Vec::new();
-    extents
-        .try_reserve_exact(count)
-        .map_err(|_| corrupt(&path, "external value extent witness reservation failed"))?;
-    if vector_charge::<ValueExtentWitness>(&path, extents.capacity())? > extent_allowance {
-        return Err(budget_error(&path));
-    }
+    let (mut extents, extent_charge) =
+        reserve_value_vec::<ValueExtentWitness>(root, count, &mut attempt)?;
     for (row_index, row) in rows.iter().enumerate() {
-        if let Some((pointer_id, pointer)) = pointer_spec(root, manifest, row)? {
-            if pointer_id != id || pointer.path.as_str() != canonical {
-                return Err(corrupt(
-                    &path,
-                    "external value pointer changed during preflight",
-                ));
+        if let Some((id, pointer)) = pointer_spec(root, manifest, row)? {
+            if extents.len() == extents.capacity() {
+                return Err(budget_error(root));
             }
             extents.push(ValueExtentWitness {
                 file_id: id,
@@ -625,38 +642,132 @@ pub(super) fn collect_value_witness(
             });
         }
     }
-    extents.sort_unstable_by_key(|item| item.offset);
+    if extents.len() != count {
+        return Err(corrupt(root, "external value pointer count changed"));
+    }
+    extents.sort_unstable_by_key(|item| (item.file_id, item.offset));
+    let referenced_files = count_distinct_sorted_ids(root, &extents)?;
     for pair in extents.windows(2) {
-        let end = pair[0]
-            .offset
-            .checked_add(HEADER_BYTES)
-            .and_then(|n| n.checked_add(pair[0].len))
-            .ok_or_else(|| corrupt(&path, "external value extent overflows"))?;
-        if end > pair[1].offset {
-            return Err(corrupt(&path, "external value extents overlap"));
+        if pair[0].file_id == pair[1].file_id {
+            let end = pair[0]
+                .offset
+                .checked_add(HEADER_BYTES)
+                .and_then(|n| n.checked_add(pair[0].len))
+                .ok_or_else(|| corrupt(root, "external value extent overflows"))?;
+            if end > pair[1].offset {
+                return Err(corrupt(root, "external value extents overlap"));
+            }
         }
     }
-    let (mut opened, identity, len) = open_checked(&path)?;
-    probe.proof_full_file_hashes = probe
-        .proof_full_file_hashes
-        .checked_add(1)
-        .ok_or_else(|| corrupt(&path, "external value proof scan counter overflows"))?;
-    let digest = {
-        let mut sink = BuildExtents(&mut extents);
-        scan_file(&mut opened, &path, len, &mut sink, |row_index, bytes| {
-            validate_catalog_payload(&rows[row_index], bytes, &path, attempt.budget)
-        })?
-    };
-    recheck_opened_path(&path, &opened, identity, len)?;
-    drop(opened);
-    files.push(ValueFileWitness {
-        id,
-        path,
-        identity,
-        len,
-        digest,
-    });
-    let retained_bytes = attempt.charged;
+
+    // Prepare and compare every exact raw pointer spelling before opening or
+    // hashing the first file. Each retained path has its own live debit.
+    let (mut prepared, prepared_charge) =
+        reserve_value_vec::<PreparedValueFile>(root, referenced_files, &mut attempt)?;
+    let mut extent_start = 0;
+    while extent_start < extents.len() {
+        let id = extents[extent_start].file_id;
+        let mut extent_end = extent_start + 1;
+        while extent_end < extents.len() && extents[extent_end].file_id == id {
+            extent_end += 1;
+        }
+        let build_allowance = canonical_path_build_charge(root)?;
+        attempt.charge(root, build_allowance)?;
+        let path = {
+            let layout = DiskLayout::at(root);
+            layout.value_log_path(id)
+        };
+        let canonical = path
+            .to_str()
+            .ok_or_else(|| corrupt(&path, "external value canonical path is not UTF-8"))?;
+        for extent in &extents[extent_start..extent_end] {
+            let row = rows
+                .get(extent.row_index)
+                .ok_or_else(|| corrupt(&path, "external value row index is unowned"))?;
+            let Some((pointer_id, pointer)) = pointer_spec(root, manifest, row)? else {
+                return Err(corrupt(&path, "external value row lost its pointer"));
+            };
+            if pointer_id != id || pointer.path.as_str() != canonical {
+                return Err(corrupt(
+                    &path,
+                    "external value pointer path is not the exact canonical spelling",
+                ));
+            }
+        }
+        let path_allowance = path_charge(&path)?;
+        if path.capacity() > path_allowance || path_allowance > build_allowance {
+            return Err(budget_error(&path));
+        }
+        // Layout, directory and filename temporaries have dropped. The final
+        // PathBuf remains charged until candidate discard or error unwind.
+        attempt.release(root, build_allowance - path_allowance)?;
+        if prepared.len() == prepared.capacity() {
+            return Err(budget_error(&path));
+        }
+        prepared.push(PreparedValueFile {
+            id,
+            path,
+            extent_start,
+            extent_end,
+        });
+        extent_start = extent_end;
+    }
+    if prepared.len() != referenced_files {
+        return Err(corrupt(root, "external value file inventory count changed"));
+    }
+
+    let (mut files, file_charge) =
+        reserve_value_vec::<ValueFileWitness>(root, referenced_files, &mut attempt)?;
+    let (mut physical_ids, physical_charge) =
+        reserve_value_vec::<SegmentPhysicalId>(root, referenced_files, &mut attempt)?;
+    for plan in prepared.drain(..) {
+        let PreparedValueFile {
+            id,
+            path,
+            extent_start,
+            extent_end,
+        } = plan;
+        let (mut opened, identity, len) = open_checked(&path)?;
+        register_physical_identity(&path, &mut physical_ids, identity)?;
+        probe.proof_full_file_hashes = probe
+            .proof_full_file_hashes
+            .checked_add(1)
+            .ok_or_else(|| corrupt(&path, "external value proof scan counter overflows"))?;
+        let digest = {
+            let mut sink = BuildExtents(&mut extents[extent_start..extent_end]);
+            scan_file(&mut opened, &path, len, &mut sink, |row_index, bytes| {
+                let row = rows
+                    .get(row_index)
+                    .ok_or_else(|| corrupt(&path, "external value row index is unowned"))?;
+                validate_catalog_payload(row, bytes, &path, attempt.budget)
+            })?
+        };
+        recheck_opened_path(&path, &opened, identity, len)?;
+        drop(opened);
+        if files.len() == files.capacity() {
+            return Err(budget_error(&path));
+        }
+        files.push(ValueFileWitness {
+            id,
+            path,
+            identity,
+            len,
+            digest,
+        });
+    }
+    drop(prepared);
+    attempt.release(root, prepared_charge)?;
+    drop(physical_ids);
+    attempt.release(root, physical_charge)?;
+
+    let mut retained_bytes = extent_charge
+        .checked_add(file_charge)
+        .ok_or_else(|| budget_error(root))?;
+    for file in &files {
+        retained_bytes = retained_bytes
+            .checked_add(path_charge(&file.path)?)
+            .ok_or_else(|| budget_error(&file.path))?;
+    }
     attempt.transfer(retained_bytes)?;
     Ok(ValueWitnessCandidate {
         files,
@@ -671,62 +782,141 @@ pub(super) fn recheck_value_witness(
     candidate: &ValueWitnessCandidate,
     probe: &mut ValueFileScanProbe,
 ) -> Result<()> {
-    let [witness] = candidate.files.as_slice() else {
+    if candidate.files.is_empty()
+        || candidate.files.len() > MAX_REFERENCED_VALUE_FILES
+        || candidate.extents.is_empty()
+        || candidate.extents.len() > MAX_STAGED_VALUE_POINTERS
+    {
+        return Err(corrupt(root, "external value candidate count is invalid"));
+    }
+    let mut previous_id = 0_u64;
+    let mut extent_start = 0_usize;
+    for witness in &candidate.files {
+        if witness.id <= previous_id
+            || canonical_id(
+                root,
+                manifest,
+                witness
+                    .path
+                    .to_str()
+                    .ok_or_else(|| corrupt(&witness.path, "external value path is not UTF-8"))?,
+            )? != witness.id
+        {
+            return Err(corrupt(
+                &witness.path,
+                "external value candidate IDs are not strictly ordered",
+            ));
+        }
+        previous_id = witness.id;
+        let mut extent_end = extent_start;
+        while candidate
+            .extents
+            .get(extent_end)
+            .is_some_and(|item| item.file_id == witness.id)
+        {
+            extent_end += 1;
+        }
+        if extent_end == extent_start {
+            return Err(corrupt(
+                &witness.path,
+                "external value candidate has no extents for file",
+            ));
+        }
+        let (mut opened, identity, len) = open_checked(&witness.path)?;
+        if identity != witness.identity || len != witness.len {
+            return Err(corrupt(
+                &witness.path,
+                "external value file identity or length changed",
+            ));
+        }
+        probe.recheck_full_file_hashes =
+            probe
+                .recheck_full_file_hashes
+                .checked_add(1)
+                .ok_or_else(|| {
+                    corrupt(
+                        &witness.path,
+                        "external value recheck scan counter overflows",
+                    )
+                })?;
+        let mut sink = CheckExtents(&candidate.extents[extent_start..extent_end]);
+        let digest = scan_file(&mut opened, &witness.path, len, &mut sink, |_, _| Ok(()))?;
+        recheck_opened_path(&witness.path, &opened, identity, len)?;
+        if digest != witness.digest {
+            return Err(corrupt(
+                &witness.path,
+                "external value full-file digest changed",
+            ));
+        }
+        extent_start = extent_end;
+    }
+    if extent_start != candidate.extents.len() {
         return Err(corrupt(
             root,
-            "external value candidate is not the one-file cut",
-        ));
-    };
-    if canonical_id(
-        root,
-        manifest,
-        witness
-            .path
-            .to_str()
-            .ok_or_else(|| corrupt(&witness.path, "external value path is not UTF-8"))?,
-    )? != witness.id
-    {
-        return Err(corrupt(
-            &witness.path,
-            "external value candidate ID changed",
-        ));
-    }
-    if candidate.extents.is_empty()
-        || candidate
-            .extents
-            .iter()
-            .any(|item| item.file_id != witness.id)
-    {
-        return Err(corrupt(
-            &witness.path,
             "external value candidate has unowned extents",
         ));
     }
-    let (mut opened, identity, len) = open_checked(&witness.path)?;
-    if identity != witness.identity || len != witness.len {
-        return Err(corrupt(
-            &witness.path,
-            "external value file identity or length changed",
-        ));
-    }
-    probe.recheck_full_file_hashes =
-        probe
-            .recheck_full_file_hashes
-            .checked_add(1)
-            .ok_or_else(|| {
-                corrupt(
-                    &witness.path,
-                    "external value recheck scan counter overflows",
-                )
-            })?;
-    let mut sink = CheckExtents(candidate.extents.as_slice());
-    let digest = scan_file(&mut opened, &witness.path, len, &mut sink, |_, _| Ok(()))?;
-    recheck_opened_path(&witness.path, &opened, identity, len)?;
-    if digest != witness.digest {
-        return Err(corrupt(
-            &witness.path,
-            "external value full-file digest changed",
-        ));
-    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_extent(file_id: u64) -> ValueExtentWitness {
+        ValueExtentWitness {
+            file_id,
+            offset: 0,
+            len: 1,
+            checksum: 0,
+            payload_digest: blake3::hash(&[]),
+            row_index: 0,
+        }
+    }
+
+    #[test]
+    fn distinct_inventory_counts_repeated_ids_and_refuses_the_4097th() {
+        let root = Path::new("value-inventory-test");
+        let mut extents = (1..=MAX_REFERENCED_VALUE_FILES as u64)
+            .flat_map(|id| [test_extent(id), test_extent(id)])
+            .collect::<Vec<_>>();
+        assert_eq!(extents.len(), MAX_REFERENCED_VALUE_FILES * 2);
+        assert_eq!(
+            count_distinct_sorted_ids(root, &extents).unwrap(),
+            MAX_REFERENCED_VALUE_FILES
+        );
+        extents.push(test_extent(MAX_REFERENCED_VALUE_FILES as u64 + 1));
+        assert!(matches!(
+            count_distinct_sorted_ids(root, &extents),
+            Err(PraxisError::Corrupt { .. })
+        ));
+        extents.pop();
+        extents.swap(0, 2);
+        assert!(matches!(
+            count_distinct_sorted_ids(root, &extents),
+            Err(PraxisError::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn physical_inventory_refuses_a_duplicate_opened_identity() {
+        let root = Path::new("value-inventory-test");
+        let first = SegmentPhysicalId {
+            volume: 1,
+            file: [1; 16],
+        };
+        let second = SegmentPhysicalId {
+            volume: 1,
+            file: [2; 16],
+        };
+        let mut identities = Vec::with_capacity(2);
+        register_physical_identity(root, &mut identities, second).unwrap();
+        register_physical_identity(root, &mut identities, first).unwrap();
+        assert_eq!(identities, [first, second]);
+        assert!(matches!(
+            register_physical_identity(root, &mut identities, first),
+            Err(PraxisError::Corrupt { .. })
+        ));
+        assert_eq!(identities, [first, second]);
+    }
 }
