@@ -1699,6 +1699,24 @@ fn preflight_row(
             "record Binding copy is outside bootstrap sequence",
         ));
     }
+    if matches!(&key, RecordKey::Descriptor(_)) && row.sequence != 1 {
+        return Err(corrupt(
+            root,
+            "record Descriptor copy is outside bootstrap sequence",
+        ));
+    }
+    if matches!(&key, RecordKey::Payload(_))
+        && row.sequence == 1
+        && matches!(
+            &row.value,
+            ObservedSegmentValue::Put(_) | ObservedSegmentValue::Pointer { .. }
+        )
+    {
+        return Err(corrupt(
+            root,
+            "record Payload Put copy is before Create sequence",
+        ));
+    }
     match &row.value {
         ObservedSegmentValue::Put(bytes) => {
             let _decoded = RecordRow::decode(&key, bytes, root)?;
