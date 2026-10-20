@@ -883,7 +883,6 @@ fn validate_catalog_payload(
 /// Reuse the value-witness Schema decoder's checked field-vector charge for an
 /// inline protected Schema Put in the physical-copy ledger. This only checks
 /// the row's syntax; it grants neither copy equivalence nor owner authority.
-#[allow(dead_code)] // Used by the later private #82 ledger integrator.
 pub(super) fn validate_inline_catalog_schema_put(
     root: &Path,
     row: &ObservedSegmentRow,

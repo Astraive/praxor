@@ -13,7 +13,8 @@ use super::segment_witness::{
 };
 use super::value_witness::{
     ValueFileScanProbe, ValueReplayContext, ValueRowLocator, ValueWitnessCandidate,
-    collect_value_witness, recheck_value_witness_for_copy, with_authenticated_value_payload,
+    collect_value_witness, recheck_value_witness_for_copy, validate_inline_catalog_schema_put,
+    with_authenticated_value_payload,
 };
 use crate::core_records::codec::{Key as RecordKey, Role as RecordRole, Row as RecordRow};
 use crate::errors::{PraxisError, Result};
@@ -934,7 +935,12 @@ fn replay_external_anchor_identity(
     Ok(())
 }
 
-fn preflight_row(root: &Path, manifest: &Manifest, row: &ObservedSegmentRow) -> Result<bool> {
+fn preflight_row(
+    root: &Path,
+    manifest: &Manifest,
+    row: &ObservedSegmentRow,
+    budget: &mut PhysicalWitnessBudget,
+) -> Result<bool> {
     if row.sequence == 0 || row.sequence > manifest.flushed_sequence {
         return Err(corrupt(
             root,
@@ -981,7 +987,9 @@ fn preflight_row(root: &Path, manifest: &Manifest, row: &ObservedSegmentRow) -> 
         }
         match &row.value {
             ObservedSegmentValue::Put(bytes) => {
-                if !matches!(&key, CatalogKey::Schema(_)) {
+                if matches!(&key, CatalogKey::Schema(_)) {
+                    validate_inline_catalog_schema_put(root, row, budget)?;
+                } else {
                     let decoded = CatalogValue::decode(&key, bytes, root)?;
                     if let CatalogValue::Anchor(value) = decoded {
                         let expected = manifest
@@ -1080,7 +1088,7 @@ pub(crate) fn collect_protected_copy_ledger(
             return Err(metadata_limit());
         }
         for row in rows {
-            let anchor = preflight_row(root, manifest, row)?;
+            let anchor = preflight_row(root, manifest, row, &mut *attempt.budget)?;
             anchors += usize::from(anchor);
             pointers += usize::from(matches!(&row.value, ObservedSegmentValue::Pointer { .. }));
             if anchor && matches!(&row.value, ObservedSegmentValue::Pointer { .. }) {
