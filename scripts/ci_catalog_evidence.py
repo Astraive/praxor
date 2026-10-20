@@ -20,7 +20,8 @@ ITEM = re.compile(r"^(.+): (test|benchmark)$")
 FOOTER = re.compile(r"^\s*(\d+) tests?, (\d+) benchmarks?\s*$")
 RESULT = re.compile(
     r"^\s*test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; "
-    r"(\d+) ignored; (\d+) measured; (\d+) filtered out;"
+    r"(\d+) ignored; (\d+) measured; (\d+) filtered out; "
+    r"finished in \d+(?:\.\d+)?s\s*$"
 )
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
@@ -107,7 +108,7 @@ def parse_results(raw: str) -> dict[str, RunResult]:
                 raise ValueError(f"duplicate result harness: {key}")
             pending.append(key)
             continue
-        result = RESULT.match(line)
+        result = RESULT.fullmatch(line)
         if result:
             if not pending:
                 raise ValueError("test result has no harness header")

@@ -182,6 +182,12 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 """
         self.assertEqual(len(parse_results(interleaved)), 2)
 
+    def test_truncated_or_suffixed_result_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "missing or incomplete"):
+            parse_results(EXACT.replace("finished in 0.01s", "TRUNCATED"))
+        with self.assertRaisesRegex(ValueError, "missing or incomplete"):
+            parse_results(EXACT.replace("finished in 0.01s", "finished in 0.01s EXTRA"))
+
 
 if __name__ == "__main__":
     unittest.main()
