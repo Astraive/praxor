@@ -1,4 +1,5 @@
 use super::*;
+use crate::core_catalog::codec::{Anchor, anchor_digest};
 use crate::core_catalog::physical_copy::{
     admit_protected_physical_copies, collect_protected_copy_ledger,
 };
@@ -1208,4 +1209,247 @@ fn rechecksummed_record_head_group_byte_conflict_requires_private_copy_corrupt()
 #[test]
 fn shorter_co_resident_record_head_group_refuses_without_provenance() {
     ordered_record_head_group_case(OrderedHeadGroupCase::ShorterPeer);
+}
+
+fn exercise_external_anchor_manifest_identity(foreign_identity: bool) {
+    let (dir, mut config, lease) = flushed_create_fixture();
+    let root = lease.root();
+    let layout = DiskLayout::at(root);
+    let manifest_path = layout.manifest_path();
+    let mut manifest =
+        Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    assert_eq!(manifest.segments.len(), 1);
+    let manifest_id = manifest
+        .record_authority
+        .as_ref()
+        .unwrap()
+        .identity(root)
+        .unwrap();
+
+    let retired_path = layout.segment_path(0, 1);
+    let retired_bytes = fs::read(&retired_path).unwrap();
+    assert_eq!(
+        manifest.segments[0].file_digest,
+        blake3::hash(&retired_bytes).to_hex().to_string()
+    );
+    let original = decode_segment(&retired_bytes, &retired_path, &CpuAccelerator).unwrap();
+    let mut rows = original
+        .blocks
+        .into_iter()
+        .flatten()
+        .map(|raw| raw.entry)
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 7);
+    let anchor_key = CatalogKey::Anchor.encode().unwrap();
+    let anchor_position = rows
+        .iter()
+        .position(|row| {
+            row.cf.0 == CATALOG_CF
+                && row.key.as_ref() == anchor_key.as_slice()
+                && row.version.sequence == 1
+        })
+        .unwrap();
+    let StoredValue::Put(original_bytes) = &rows[anchor_position].version.value else {
+        panic!("flushed CREATE Anchor@1 must be literal")
+    };
+    let CatalogValue::Anchor(original_anchor) =
+        CatalogValue::decode(&CatalogKey::Anchor, original_bytes, &retired_path).unwrap()
+    else {
+        panic!("flushed CREATE Anchor@1 must decode")
+    };
+    assert_eq!(original_anchor.database_id, manifest_id);
+    let mut anchor_id = manifest_id;
+    if foreign_identity {
+        anchor_id[15] ^= 1;
+    }
+    let encoded_anchor = CatalogValue::Anchor(Anchor {
+        database_id: anchor_id,
+        head_at_1_digest: anchor_digest(anchor_id).unwrap(),
+    })
+    .encode()
+    .unwrap();
+    assert_eq!(encoded_anchor.len(), 72);
+    assert_eq!(anchor_id == manifest_id, !foreign_identity);
+    assert_eq!(
+        CatalogValue::decode(&CatalogKey::Anchor, &encoded_anchor, &retired_path).unwrap(),
+        CatalogValue::Anchor(Anchor {
+            database_id: anchor_id,
+            head_at_1_digest: anchor_digest(anchor_id).unwrap(),
+        })
+    );
+    rows[anchor_position].version.value = StoredValue::Put(encoded_anchor.clone());
+
+    config.large_value_threshold = 11;
+    config.validate().unwrap();
+    let segment_path = layout.segment_path(0, 2);
+    let value_path = layout.value_log_path(2);
+    let mut value_log = ValueLog::open(&value_path).unwrap();
+    let metadata = SegmentWriter::write(
+        SegmentWriteOptions {
+            path: &segment_path,
+            id: 2,
+            level: 0,
+            compression: Compression::None,
+            accelerator: &CpuAccelerator,
+            value_log: &mut value_log,
+            large_value_threshold: config.large_value_threshold,
+            block_size: config.block_size,
+            partitioned_bloom: None,
+            direct_io: false,
+        },
+        rows,
+    )
+    .unwrap();
+    drop(value_log);
+    let segment_bytes = fs::read(&segment_path).unwrap();
+    assert_eq!(metadata.entries, 7);
+    assert_eq!(metadata.path, segment_path.to_str().unwrap());
+    assert_eq!(
+        metadata.file_digest,
+        blake3::hash(&segment_bytes).to_hex().to_string()
+    );
+    assert_ne!(
+        physical_id(&File::open(&retired_path).unwrap(), &retired_path).unwrap(),
+        physical_id(&File::open(&segment_path).unwrap(), &segment_path).unwrap()
+    );
+    let written = decode_segment(&segment_bytes, &segment_path, &CpuAccelerator).unwrap();
+    assert_eq!(written.blocks.iter().flatten().count(), 7);
+    let anchor_rows = written
+        .blocks
+        .iter()
+        .flatten()
+        .filter(|raw| {
+            raw.entry.cf.0 == CATALOG_CF
+                && raw.entry.key.as_ref() == anchor_key.as_slice()
+                && raw.entry.version.sequence == 1
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(anchor_rows.len(), 1);
+    let StoredValue::BlobPointer(pointer) = &anchor_rows[0].entry.version.value else {
+        panic!("replacement writer must externalize the sole Anchor@1")
+    };
+    assert_eq!(pointer.path.as_str(), value_path.to_str().unwrap());
+    assert_eq!(pointer.len, 72);
+    assert_eq!(pointer.checksum, crc32c(&encoded_anchor));
+    assert_ne!(
+        physical_id(&File::open(&segment_path).unwrap(), &segment_path).unwrap(),
+        physical_id(&File::open(&value_path).unwrap(), &value_path).unwrap()
+    );
+    let value_bytes = fs::read(&value_path).unwrap();
+    let offset = usize::try_from(pointer.offset).unwrap();
+    let end = offset.checked_add(12 + encoded_anchor.len()).unwrap();
+    assert!(end <= value_bytes.len());
+    assert_eq!(
+        u64::from_le_bytes(value_bytes[offset..offset + 8].try_into().unwrap()),
+        pointer.len
+    );
+    assert_eq!(
+        u32::from_le_bytes(value_bytes[offset + 8..offset + 12].try_into().unwrap()),
+        pointer.checksum
+    );
+    assert_eq!(&value_bytes[offset + 12..end], encoded_anchor.as_slice());
+
+    fs::remove_file(&retired_path).unwrap();
+    manifest.segments = vec![metadata];
+    manifest.next_segment_id = 3;
+    manifest.effective_config = config.persisted();
+    for family in &mut manifest.column_families {
+        if family.name.starts_with("__praxor_record_") {
+            family.large_value_threshold_bytes = config.large_value_threshold;
+        }
+    }
+    ManifestStore::new(manifest_path.clone())
+        .save(&manifest)
+        .unwrap();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    assert_eq!(manifest.segments.len(), 1);
+    assert_eq!(manifest.segments[0].id, 2);
+    assert_eq!(manifest.segments[0].path, segment_path.to_str().unwrap());
+    assert_eq!(
+        manifest.segments[0].file_digest,
+        blake3::hash(&segment_bytes).to_hex().to_string()
+    );
+    assert_eq!(manifest.next_segment_id, 3);
+    assert_eq!(manifest.effective_config, config.persisted());
+    manifest.validate_v4(root).unwrap();
+    assert!(!retired_path.exists());
+    let before = snapshot(dir.path());
+
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let segment = collect_protected_segment_candidate(root, &manifest, budget)
+            .expect("replacement segment must pass the bounded visitor");
+        assert_eq!(segment.witnesses.len(), 1);
+        assert_eq!(segment.rows.len(), 7);
+        let observed_anchor = segment
+            .rows
+            .iter()
+            .filter(|row| {
+                row.cf == CATALOG_CF
+                    && row.key.as_slice() == anchor_key.as_slice()
+                    && row.sequence == 1
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(observed_anchor.len(), 1);
+        assert!(matches!(
+            &observed_anchor[0].value,
+            ObservedSegmentValue::Pointer {
+                expires_at_ms: None,
+                ..
+            }
+        ));
+        let segment_balance = budget.remaining_bytes();
+        let mut probe = crate::core_catalog::value_witness::ValueFileScanProbe::default();
+        let values = crate::core_catalog::value_witness::collect_value_witness(
+            root,
+            &manifest,
+            &segment.rows,
+            budget,
+            &mut probe,
+        )
+        .expect("self-consistent external Anchor must pass the value witness");
+        assert_eq!(values.files.len(), 1);
+        assert!(!values.extents.is_empty());
+        assert_eq!(probe.proof_full_file_hashes, 1);
+        values.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), segment_balance);
+        segment.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(snapshot(dir.path()), before);
+
+        let result = collect_protected_copy_ledger(root, &manifest, budget);
+        if foreign_identity {
+            match result {
+                Err(PraxisError::Corrupt { reason, .. }) => {
+                    assert!(reason.contains("Anchor") && reason.contains("MANIFEST"));
+                }
+                other => panic!(
+                    "foreign external Anchor must be Corrupt at the private identity check: {other:?}"
+                ),
+            }
+        } else {
+            match result {
+                Err(PraxisError::UnsupportedCatalogFeature {
+                    feature: "protected physical-copy bytes await authenticated replay",
+                }) => {}
+                Ok(candidate) => candidate.discard(root, budget).unwrap(),
+                other => {
+                    panic!("same-identity external Anchor must reach the next gate: {other:?}")
+                }
+            }
+        }
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(snapshot(dir.path()), before);
+    });
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn writer_external_anchor_matching_manifest_identity_reaches_next_private_gate() {
+    exercise_external_anchor_manifest_identity(false);
+}
+
+#[test]
+fn rechecksummed_external_anchor_foreign_manifest_identity_requires_corrupt() {
+    exercise_external_anchor_manifest_identity(true);
 }
