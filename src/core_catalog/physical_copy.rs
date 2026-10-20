@@ -734,6 +734,7 @@ fn with_authenticated_singleton_copy(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Segment/value receipts and replay limits are distinct proof inputs.
 fn replay_fixed_copy_groups(
     root: &Path,
     manifest: &Manifest,
