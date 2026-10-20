@@ -360,6 +360,37 @@ mod tests {
     }
 
     #[test]
+    fn absent_pending_path_still_validates_the_descriptor() {
+        let mut cases = Vec::new();
+        let mut expected = golden_descriptor();
+        expected.database_id.fill(0);
+        cases.push(("zero database", expected));
+        let mut expected = golden_descriptor();
+        expected.writer_incarnation.fill(0);
+        cases.push(("zero incarnation", expected));
+        let mut expected = golden_descriptor();
+        expected.wal_id = 0;
+        cases.push(("zero id", expected));
+        let mut expected = golden_descriptor();
+        expected.wal_id = u64::MAX;
+        cases.push(("reserved maximum id", expected));
+        let mut expected = golden_descriptor();
+        expected.creation_nonce[0] ^= 1;
+        cases.push(("nonce id mismatch", expected));
+        let mut expected = golden_descriptor();
+        expected.header_digest[0] ^= 1;
+        cases.push(("header digest mismatch", expected));
+
+        for (name, expected) in cases {
+            assert_eq!(
+                pending(None, &expected),
+                Err(H80Error::Corrupt),
+                "absent pending path with {name}"
+            );
+        }
+    }
+
+    #[test]
     fn crc_ieee_and_wrong_digest_domain_are_not_v5_integrity() {
         let mut header = golden_h80();
         let mut expected = golden_descriptor();
