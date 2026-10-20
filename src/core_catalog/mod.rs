@@ -15,8 +15,8 @@ mod physical;
 #[allow(dead_code)] // #80 starts with a compiling behavioral RED for this private reader.
 mod segment_witness;
 
-#[cfg(test)]
-mod external_value_red;
+#[allow(dead_code)] // Private external Head bytes are not owner authority until #81 is complete.
+mod external_value;
 
 #[cfg(test)]
 mod frame_tests;

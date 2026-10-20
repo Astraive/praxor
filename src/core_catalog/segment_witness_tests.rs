@@ -1,5 +1,5 @@
 use super::codec::{CatalogKey, CatalogValue, Head};
-use super::external_value_red::{ValuePayloadProbe, resolve_catalog_head_external};
+use super::external_value::{ValuePayloadProbe, resolve_catalog_head_external};
 use super::physical::inspect_v4_owner;
 use super::physical_tests::flushed_create_fixture;
 use super::segment_witness::{
@@ -7042,13 +7042,14 @@ fn private_external_head_resolves_writer_produced_48_bytes_without_tree_mutation
             }
         ));
         let mut probe = ValuePayloadProbe::default();
-        let resolved = resolve_catalog_head_external(root, head, &mut probe);
+        let resolved = resolve_catalog_head_external(root, &manifest, head, &mut probe);
         candidate.discard(root, budget).unwrap();
         assert_eq!(budget.remaining_bytes(), balance);
         assert_eq!(snapshot(dir.path()), before);
-        assert_eq!(resolved.unwrap(), expected);
+        assert_eq!(resolved.unwrap().as_bytes().as_slice(), expected.as_slice());
         assert_eq!(probe.open_attempts, 1);
-        assert!(probe.read_attempts >= 1);
+        assert_eq!(probe.read_attempts, 2);
+        assert_eq!(probe.reserve_attempts, 0);
     });
     assert_eq!(snapshot(dir.path()), before);
 }
@@ -7089,7 +7090,7 @@ fn private_external_head_rejects_noncanonical_pointer_before_open() {
         };
         assert_eq!(pointer.path, noncanonical);
         let mut probe = ValuePayloadProbe::default();
-        let result = resolve_catalog_head_external(root, head, &mut probe);
+        let result = resolve_catalog_head_external(root, &manifest, head, &mut probe);
         candidate.discard(root, budget).unwrap();
         assert_eq!(budget.remaining_bytes(), balance);
         assert_eq!(probe.open_attempts, 0);
@@ -7148,7 +7149,7 @@ fn private_external_head_rejects_atomic_cap_claim_before_payload_read_or_reserve
         };
         assert_eq!(pointer.len, MAX_WAL_PAYLOAD_BYTES as u64);
         let mut probe = ValuePayloadProbe::default();
-        let result = resolve_catalog_head_external(root, head, &mut probe);
+        let result = resolve_catalog_head_external(root, &manifest, head, &mut probe);
         candidate.discard(root, budget).unwrap();
         assert_eq!(budget.remaining_bytes(), balance);
         assert_eq!(probe.open_attempts, 0);
