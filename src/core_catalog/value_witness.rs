@@ -1503,3 +1503,503 @@ mod tests {
         assert_eq!(identities, [first, second]);
     }
 }
+
+#[cfg(test)]
+mod direct_replay_tests {
+    use super::*;
+    use crate::accel::cpu::scalar::CpuAccelerator;
+    use crate::config::Compression;
+    use crate::core_catalog::codec::{CatalogKey, CatalogValue};
+    use crate::core_catalog::physical_tests::flushed_create_fixture;
+    use crate::core_catalog::segment_witness::collect_protected_segment_candidate;
+    use crate::core_records::codec::{Key as RecordKey, Role as RecordRole, Row as RecordRow};
+    use crate::io::crc32c;
+    use crate::manifest::ManifestStore;
+    use crate::segments::block::SegmentEntry;
+    use crate::segments::codec::decode_segment;
+    use crate::segments::{SegmentWriteOptions, SegmentWriter};
+    use crate::types::{ColumnFamily, StoredValue, ValuePointer, VersionedValue};
+    use crate::values::ValueLog;
+    use crate::wal::catalog_witness::{WalCut, scan_v4_wals_with_budget};
+    use crate::writer_lease::WriterLease;
+    use std::io::{Seek, SeekFrom, Write};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    struct WriterExternalReplayFixture {
+        lease: WriterLease,
+        _dir: tempfile::TempDir,
+        manifest: Manifest,
+        first_head: Vec<u8>,
+        second_head: Vec<u8>,
+        payload: Vec<u8>,
+        file_bytes: Vec<u8>,
+    }
+
+    fn assert_written_pointer(pointer: &ValuePointer, expected: &[u8], file: &[u8], path: &Path) {
+        assert_eq!(pointer.path, path.to_str().unwrap());
+        assert_eq!(pointer.len, expected.len() as u64);
+        assert_eq!(pointer.checksum, crc32c(expected));
+        let offset = usize::try_from(pointer.offset).unwrap();
+        let end = offset.checked_add(12 + expected.len()).unwrap();
+        assert!(end <= file.len());
+        assert_eq!(
+            u64::from_le_bytes(file[offset..offset + 8].try_into().unwrap()),
+            expected.len() as u64
+        );
+        assert_eq!(
+            u32::from_le_bytes(file[offset + 8..offset + 12].try_into().unwrap()),
+            crc32c(expected)
+        );
+        assert_eq!(&file[offset + 12..end], expected);
+    }
+
+    fn writer_external_replay_fixture(conflicting_head: bool) -> WriterExternalReplayFixture {
+        let (dir, mut config, lease) = flushed_create_fixture();
+        let root = lease.root();
+        let layout = DiskLayout::at(root);
+        let segment_path = layout.segment_path(0, 1);
+        let decoded = decode_segment(
+            &fs::read(&segment_path).unwrap(),
+            &segment_path,
+            &CpuAccelerator,
+        )
+        .unwrap();
+        let mut rows = decoded
+            .blocks
+            .into_iter()
+            .flatten()
+            .map(|raw| raw.entry)
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 7);
+        let head = rows
+            .iter()
+            .find(|row| {
+                row.cf.0 == CATALOG_CF && row.key.as_ref() == [0] && row.version.sequence == 2
+            })
+            .unwrap()
+            .clone();
+        let StoredValue::Put(first_head) = &head.version.value else {
+            panic!("flushed Head@2 must start as an inline Put")
+        };
+        let first_head = first_head.clone();
+        let second_head = if conflicting_head {
+            let CatalogValue::Head(mut decoded_head) =
+                CatalogValue::decode(&CatalogKey::Head, &first_head, &segment_path).unwrap()
+            else {
+                panic!("writer fixture Head@2 must decode")
+            };
+            decoded_head.revision += 1;
+            CatalogValue::Head(decoded_head).encode().unwrap()
+        } else {
+            first_head.clone()
+        };
+        assert_eq!(first_head.len(), second_head.len());
+        let mut second = head;
+        second.version.value = StoredValue::Put(second_head.clone());
+        rows.push(second);
+
+        let user = vec![0x5a; HASH_CHUNK_BYTES * 2 + 17];
+        let payload = RecordRow::Payload(&user).encode().unwrap();
+        assert!(payload.len() > HASH_CHUNK_BYTES * 2);
+        let payload_key = RecordKey::Payload(1).encode().unwrap();
+        rows.push(SegmentEntry {
+            cf: ColumnFamily(RecordRole::Payload.cf().into()),
+            key: payload_key.clone().into(),
+            version: VersionedValue {
+                sequence: 2,
+                value: StoredValue::Put(payload.clone()),
+            },
+        });
+
+        config.large_value_threshold = 11;
+        config.validate().unwrap();
+        let value_path = layout.value_log_path(1);
+        let mut value_log = ValueLog::open(&value_path).unwrap();
+        let metadata = SegmentWriter::write(
+            SegmentWriteOptions {
+                path: &segment_path,
+                id: 1,
+                level: 0,
+                compression: Compression::None,
+                accelerator: &CpuAccelerator,
+                value_log: &mut value_log,
+                large_value_threshold: config.large_value_threshold,
+                block_size: config.block_size,
+                partitioned_bloom: None,
+                direct_io: false,
+            },
+            rows,
+        )
+        .unwrap();
+        drop(value_log);
+
+        let manifest_path = layout.manifest_path();
+        let mut manifest =
+            Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+        manifest.effective_config = config.persisted();
+        for family in &mut manifest.column_families {
+            if family.name.starts_with("__praxor_record_") {
+                family.large_value_threshold_bytes = config.large_value_threshold;
+            }
+        }
+        manifest.segments[0] = metadata;
+        ManifestStore::new(manifest_path.clone())
+            .save(&manifest)
+            .unwrap();
+        let manifest =
+            Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+        manifest.validate_v4(&manifest_path).unwrap();
+
+        let written = decode_segment(
+            &fs::read(&segment_path).unwrap(),
+            &segment_path,
+            &CpuAccelerator,
+        )
+        .unwrap();
+        let head_pointers = written
+            .blocks
+            .iter()
+            .flatten()
+            .filter(|raw| {
+                raw.entry.cf.0 == CATALOG_CF
+                    && raw.entry.key.as_ref() == [0]
+                    && raw.entry.version.sequence == 2
+            })
+            .map(|raw| match &raw.entry.version.value {
+                StoredValue::BlobPointer(pointer) => pointer.clone(),
+                _ => panic!("writer must externalize both Head@2 copies"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(head_pointers.len(), 2);
+        assert_ne!(head_pointers[0].offset, head_pointers[1].offset);
+        let payload_pointer = written
+            .blocks
+            .iter()
+            .flatten()
+            .find(|raw| {
+                raw.entry.cf.0 == RecordRole::Payload.cf()
+                    && raw.entry.key.as_ref() == payload_key.as_slice()
+            })
+            .map(|raw| match &raw.entry.version.value {
+                StoredValue::BlobPointer(pointer) => pointer.clone(),
+                _ => panic!("writer must externalize the large record Payload"),
+            })
+            .unwrap();
+        let file_bytes = fs::read(&value_path).unwrap();
+        assert_written_pointer(&head_pointers[0], &first_head, &file_bytes, &value_path);
+        assert_written_pointer(&head_pointers[1], &second_head, &file_bytes, &value_path);
+        assert_written_pointer(&payload_pointer, &payload, &file_bytes, &value_path);
+        assert_eq!(
+            manifest.segments[0].file_digest,
+            blake3::hash(&fs::read(&segment_path).unwrap())
+                .to_hex()
+                .to_string()
+        );
+        WriterExternalReplayFixture {
+            lease,
+            _dir: dir,
+            manifest,
+            first_head,
+            second_head,
+            payload,
+            file_bytes,
+        }
+    }
+
+    fn with_real_candidates(
+        fixture: &WriterExternalReplayFixture,
+        test: impl FnOnce(&ValueWitnessCandidate, &[ObservedSegmentRow], &mut PhysicalWitnessBudget),
+    ) {
+        let root = fixture.lease.root();
+        let manifest = &fixture.manifest;
+        let cut = WalCut {
+            flushed_sequence: manifest.flushed_sequence,
+            last_sequence: manifest.last_sequence,
+            flushed_wal_id: manifest.flushed_wal_id,
+            active_wal_id: manifest.active_wal_id,
+            next_wal_id: manifest.next_wal_id,
+        };
+        let (_wals, mut budget) = scan_v4_wals_with_budget(root, cut, |_, _, _, _| Ok(())).unwrap();
+        let baseline = budget.remaining_bytes();
+        let segments = collect_protected_segment_candidate(root, manifest, &mut budget).unwrap();
+        let after_segments = budget.remaining_bytes();
+        assert!(after_segments < baseline);
+        let mut probe = ValueFileScanProbe::default();
+        let values =
+            collect_value_witness(root, manifest, &segments.rows, &mut budget, &mut probe).unwrap();
+        assert_eq!(values.files.len(), 1);
+        assert_eq!(values.files[0].digest, blake3::hash(&fixture.file_bytes));
+        assert!(values.extents.len() >= 3);
+        let retained = budget.remaining_bytes();
+        test(&values, &segments.rows, &mut budget);
+        assert_eq!(budget.remaining_bytes(), retained);
+        values.discard(root, &mut budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), after_segments);
+        segments.discard(root, &mut budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), baseline);
+    }
+
+    fn selected_heads(rows: &[ObservedSegmentRow]) -> Vec<ValueRowLocator> {
+        let heads = rows
+            .iter()
+            .filter(|row| row.cf == CATALOG_CF && row.key == [0] && row.sequence == 2)
+            .map(ValueRowLocator::from_row)
+            .collect::<Vec<_>>();
+        assert_eq!(heads.len(), 2);
+        assert_ne!(heads[0], heads[1]);
+        heads
+    }
+
+    #[test]
+    fn writer_external_copies_stream_exact_head_and_large_payload_chunks() {
+        let fixture = writer_external_replay_fixture(false);
+        assert_eq!(fixture.first_head, fixture.second_head);
+        with_real_candidates(&fixture, |candidate, rows, budget| {
+            let root = fixture.lease.root();
+            let retained = budget.remaining_bytes();
+            let mut context = ValueReplayContext::default();
+            let heads = selected_heads(rows);
+            for locator in heads {
+                let mut streamed = Vec::new();
+                with_authenticated_value_payload(
+                    root,
+                    &fixture.manifest,
+                    candidate,
+                    locator,
+                    &mut context,
+                    budget,
+                    |chunk| {
+                        assert!(!chunk.is_empty() && chunk.len() <= HASH_CHUNK_BYTES);
+                        streamed.extend_from_slice(chunk);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert_eq!(streamed, fixture.first_head);
+                assert_eq!(budget.remaining_bytes(), retained);
+            }
+            let payload_row = rows
+                .iter()
+                .find(|row| row.cf == RecordRole::Payload.cf())
+                .unwrap();
+            let mut streamed = Vec::new();
+            let mut chunks = 0;
+            with_authenticated_value_payload(
+                root,
+                &fixture.manifest,
+                candidate,
+                ValueRowLocator::from_row(payload_row),
+                &mut context,
+                budget,
+                |chunk| {
+                    assert!(!chunk.is_empty() && chunk.len() <= HASH_CHUNK_BYTES);
+                    chunks += 1;
+                    streamed.extend_from_slice(chunk);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(chunks >= 3);
+            assert_eq!(streamed, fixture.payload);
+            assert_eq!(budget.remaining_bytes(), retained);
+            assert_eq!(
+                context.work.read_bytes,
+                3 * (candidate.files[0].len * 2 + 2)
+            );
+            assert_eq!(context.work.open_attempts, 9);
+            assert_eq!(context.probe.recheck_full_file_hashes, 6);
+            recheck_value_witness(root, &fixture.manifest, candidate, &mut context.probe).unwrap();
+            assert_eq!(budget.remaining_bytes(), retained);
+        });
+    }
+
+    #[test]
+    fn writer_external_equal_length_conflict_exposes_different_actual_bytes() {
+        let fixture = writer_external_replay_fixture(true);
+        assert_eq!(fixture.first_head.len(), fixture.second_head.len());
+        assert_ne!(fixture.first_head, fixture.second_head);
+        with_real_candidates(&fixture, |candidate, rows, budget| {
+            let root = fixture.lease.root();
+            let retained = budget.remaining_bytes();
+            let mut context = ValueReplayContext::default();
+            let mut copies = Vec::new();
+            for locator in selected_heads(rows) {
+                let mut bytes = Vec::new();
+                with_authenticated_value_payload(
+                    root,
+                    &fixture.manifest,
+                    candidate,
+                    locator,
+                    &mut context,
+                    budget,
+                    |chunk| {
+                        bytes.extend_from_slice(chunk);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                copies.push(bytes);
+                assert_eq!(budget.remaining_bytes(), retained);
+            }
+            assert_eq!(copies[0], fixture.first_head);
+            assert_eq!(copies[1], fixture.second_head);
+            assert_ne!(copies[0], copies[1]);
+            assert_eq!(copies[0].len(), copies[1].len());
+        });
+    }
+
+    #[test]
+    fn writer_external_replay_refunds_on_callback_error_unwind_and_limits() {
+        let fixture = writer_external_replay_fixture(false);
+        with_real_candidates(&fixture, |candidate, rows, budget| {
+            let root = fixture.lease.root();
+            let retained = budget.remaining_bytes();
+            let locator = selected_heads(rows)[0];
+            let mut refused = ValueReplayContext::default();
+            let error = with_authenticated_value_payload(
+                root,
+                &fixture.manifest,
+                candidate,
+                locator,
+                &mut refused,
+                budget,
+                |_| {
+                    Err(PraxisError::UnsupportedCatalogFeature {
+                        feature: "injected value callback refusal",
+                    })
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                PraxisError::UnsupportedCatalogFeature {
+                    feature: "injected value callback refusal"
+                }
+            ));
+            assert_eq!(refused.work.read_bytes, candidate.files[0].len * 2 + 2);
+            assert_eq!(refused.work.open_attempts, 3);
+            assert_eq!(budget.remaining_bytes(), retained);
+
+            let mut unwound = ValueReplayContext::default();
+            let panic_result = catch_unwind(AssertUnwindSafe(|| {
+                let _ = with_authenticated_value_payload(
+                    root,
+                    &fixture.manifest,
+                    candidate,
+                    locator,
+                    &mut unwound,
+                    budget,
+                    |_| -> Result<()> { panic!("injected value callback unwind") },
+                );
+            }));
+            assert!(panic_result.is_err());
+            assert_eq!(unwound.work.read_bytes, candidate.files[0].len * 2 + 2);
+            assert_eq!(unwound.work.open_attempts, 3);
+            assert_eq!(budget.remaining_bytes(), retained);
+
+            let planned = candidate.files[0].len * 2 + 2;
+            let mut read_limited = ValueReplayContext::default();
+            read_limited.work.read_bytes = MAX_COPY_REPLAY_READ_BYTES - planned + 1;
+            let before = read_limited.work.read_bytes;
+            let error = with_authenticated_value_payload(
+                root,
+                &fixture.manifest,
+                candidate,
+                locator,
+                &mut read_limited,
+                budget,
+                |_| Ok(()),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                PraxisError::UnsupportedCatalogFeature {
+                    feature: "external value copy replay exceeds the bounded private profile"
+                }
+            ));
+            assert_eq!(read_limited.work.read_bytes, before);
+            assert_eq!(read_limited.work.open_attempts, 0);
+            assert_eq!(read_limited.probe.recheck_full_file_hashes, 0);
+            assert_eq!(budget.remaining_bytes(), retained);
+
+            let mut open_limited = ValueReplayContext::default();
+            open_limited.work.open_attempts = MAX_COPY_REPLAY_OPENS - 2;
+            let error = with_authenticated_value_payload(
+                root,
+                &fixture.manifest,
+                candidate,
+                locator,
+                &mut open_limited,
+                budget,
+                |_| Ok(()),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                PraxisError::UnsupportedCatalogFeature {
+                    feature: "external value copy replay exceeds the bounded private profile"
+                }
+            ));
+            assert_eq!(open_limited.work.read_bytes, 0);
+            assert_eq!(open_limited.work.open_attempts, MAX_COPY_REPLAY_OPENS - 2);
+            assert_eq!(open_limited.probe.recheck_full_file_hashes, 0);
+            assert_eq!(budget.remaining_bytes(), retained);
+
+            let held = retained - (COPY_REPLAY_SCRATCH_BYTES - 1);
+            budget.charge(root, held).unwrap();
+            let near_limit = budget.remaining_bytes();
+            let mut no_scratch = ValueReplayContext::default();
+            let error = with_authenticated_value_payload(
+                root,
+                &fixture.manifest,
+                candidate,
+                locator,
+                &mut no_scratch,
+                budget,
+                |_| Ok(()),
+            )
+            .unwrap_err();
+            assert!(matches!(error, PraxisError::Corrupt { .. }));
+            assert_eq!(budget.remaining_bytes(), near_limit);
+            assert_eq!(no_scratch.work.read_bytes, 0);
+            budget.release(root, held).unwrap();
+            assert_eq!(budget.remaining_bytes(), retained);
+        });
+    }
+
+    #[test]
+    fn writer_external_selected_file_mutation_refuses_and_refunds() {
+        let fixture = writer_external_replay_fixture(false);
+        with_real_candidates(&fixture, |candidate, rows, budget| {
+            let root = fixture.lease.root();
+            let retained = budget.remaining_bytes();
+            let locator = selected_heads(rows)[0];
+            let path = &candidate.files[0].path;
+            let mut mutator = fs::OpenOptions::new().write(true).open(path).unwrap();
+            let mut context = ValueReplayContext::default();
+            let error = with_authenticated_value_payload(
+                root,
+                &fixture.manifest,
+                candidate,
+                locator,
+                &mut context,
+                budget,
+                |_| {
+                    mutator.seek(SeekFrom::Start(0))?;
+                    mutator.write_all(&[fixture.file_bytes[0] ^ 1])?;
+                    mutator.sync_data()?;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(error, PraxisError::Corrupt { .. }));
+            assert_eq!(budget.remaining_bytes(), retained);
+            mutator.seek(SeekFrom::Start(0)).unwrap();
+            mutator.write_all(&fixture.file_bytes[..1]).unwrap();
+            mutator.sync_data().unwrap();
+            drop(mutator);
+            recheck_value_witness(root, &fixture.manifest, candidate, &mut context.probe).unwrap();
+            assert_eq!(budget.remaining_bytes(), retained);
+        });
+    }
+}
