@@ -2561,3 +2561,212 @@ fn writer_schema_external_then_inline_unequal_length_conflict() {
         SchemaPeerChange::LongerName,
     );
 }
+
+#[derive(Clone, Copy, Debug)]
+enum FixedCatalogPair {
+    Name,
+    Namespace,
+}
+
+fn writer_fixed_catalog_pair_case(role: FixedCatalogPair, conflicting: bool) {
+    let (dir, config, lease) = flushed_create_fixture();
+    let root = lease.root();
+    let layout = DiskLayout::at(root);
+    let manifest_path = layout.manifest_path();
+    let mut manifest =
+        Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    assert_eq!(manifest.segments.len(), 1);
+    let first_path = layout.segment_path(0, 1);
+    let first_bytes = fs::read(&first_path).unwrap();
+    assert_eq!(
+        manifest.segments[0].file_digest,
+        blake3::hash(&first_bytes).to_hex().to_string()
+    );
+    let first = decode_segment(&first_bytes, &first_path, &CpuAccelerator).unwrap();
+    let (key, oracle_name, width) = match role {
+        FixedCatalogPair::Name => (CatalogKey::Name("accounts"), "catalog_name_accounts", 12),
+        FixedCatalogPair::Namespace => (
+            CatalogKey::Namespace(NamespaceId::new(2).unwrap()),
+            "catalog_namespace_id_2",
+            16,
+        ),
+    };
+    let key_bytes = key.encode().unwrap();
+    let original_bytes = fixed_copy_oracle("create_tag7", oracle_name, CATALOG_CF, &key_bytes, 2);
+    assert_eq!(original_bytes.len(), width);
+    let mut peer = first
+        .blocks
+        .iter()
+        .flatten()
+        .find(|row| {
+            row.entry.cf.0 == CATALOG_CF
+                && row.entry.key.as_ref() == key_bytes.as_slice()
+                && row.entry.version.sequence == 2
+        })
+        .expect("flushed CREATE has this catalog role")
+        .entry
+        .clone();
+    assert_eq!(peer.version.value, StoredValue::Put(original_bytes.clone()));
+    assert!(matches!(
+        CatalogValue::decode(&key, &original_bytes, root),
+        Ok(CatalogValue::Name(_)) | Ok(CatalogValue::Namespace(_))
+    ));
+    let peer_bytes = if conflicting {
+        assert!(matches!(role, FixedCatalogPair::Name));
+        let changed = CatalogValue::Name(CollectionId::new(3).unwrap())
+            .encode()
+            .unwrap();
+        assert_eq!(changed.len(), width);
+        assert_ne!(changed, original_bytes);
+        assert!(matches!(
+            CatalogValue::decode(&key, &changed, root),
+            Ok(CatalogValue::Name(_))
+        ));
+        peer.version.value = StoredValue::Put(changed.clone());
+        changed
+    } else {
+        original_bytes.clone()
+    };
+    let first_offsets = literal_block_offsets(&first_bytes, 0, 1, first.blocks.len());
+    let original_entry = first
+        .blocks
+        .iter()
+        .flatten()
+        .find(|row| {
+            row.entry.cf.0 == CATALOG_CF
+                && row.entry.key.as_ref() == key_bytes.as_slice()
+                && row.entry.version.sequence == 2
+        })
+        .unwrap()
+        .entry
+        .clone();
+    let first_location = exact_entry_location(&first, &first_offsets, &original_entry);
+    let second_path = layout.segment_path(1, 2);
+    fs::create_dir_all(second_path.parent().unwrap()).unwrap();
+    let value_path = layout.value_log_path(2);
+    let mut value_log = ValueLog::open(&value_path).unwrap();
+    let second_meta = SegmentWriter::write(
+        SegmentWriteOptions {
+            path: &second_path,
+            id: 2,
+            level: 1,
+            compression: Compression::None,
+            accelerator: &CpuAccelerator,
+            value_log: &mut value_log,
+            large_value_threshold: config.large_value_threshold,
+            block_size: config.block_size,
+            partitioned_bloom: None,
+            direct_io: false,
+        },
+        vec![peer.clone()],
+    )
+    .unwrap();
+    drop(value_log);
+    fs::remove_file(value_path).unwrap();
+    let second_bytes = fs::read(&second_path).unwrap();
+    assert_eq!(
+        second_meta.file_digest,
+        blake3::hash(&second_bytes).to_hex().to_string()
+    );
+    let second = decode_segment(&second_bytes, &second_path, &CpuAccelerator).unwrap();
+    assert_eq!(second.blocks.iter().flatten().count(), 1);
+    assert_eq!(second.blocks[0][0].entry, peer);
+    let second_offsets = literal_block_offsets(&second_bytes, 1, 2, second.blocks.len());
+    let second_location = exact_entry_location(&second, &second_offsets, &peer);
+    assert_ne!(
+        physical_id(&File::open(&first_path).unwrap(), &first_path).unwrap(),
+        physical_id(&File::open(&second_path).unwrap(), &second_path).unwrap()
+    );
+    manifest.segments.push(second_meta);
+    manifest.next_segment_id = 3;
+    ManifestStore::new(manifest_path.clone())
+        .save(&manifest)
+        .unwrap();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    manifest.validate_v4(root).unwrap();
+    let before = snapshot(dir.path());
+
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let staged = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+        let copies = staged
+            .rows
+            .iter()
+            .filter(|row| row.cf == CATALOG_CF && row.key == key_bytes && row.sequence == 2)
+            .collect::<Vec<_>>();
+        assert_eq!(copies.len(), 2);
+        for (index, (row, bytes)) in copies
+            .iter()
+            .zip([&original_bytes, &peer_bytes])
+            .enumerate()
+        {
+            assert_eq!(
+                row.source,
+                SegmentSource {
+                    level: index as u32,
+                    id: index as u64 + 1,
+                    manifest_ordinal: index,
+                }
+            );
+            assert_eq!(
+                (row.block_offset, row.row_ordinal),
+                [first_location, second_location][index]
+            );
+            assert_eq!(
+                row.classification,
+                PhysicalRowClass::BoundProtected(ProtectedRole::Catalog)
+            );
+            assert_eq!(row.value, ObservedSegmentValue::Put(bytes.to_vec()));
+        }
+        staged.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(snapshot(dir.path()), before);
+
+        let result = collect_protected_copy_ledger(root, &manifest, budget);
+        let error = match result {
+            Err(error) => error,
+            Ok(candidate) => {
+                candidate.discard(root, budget).unwrap();
+                panic!("fixed catalog pair unexpectedly reached a private candidate")
+            }
+        };
+        assert_eq!(
+            budget.remaining_bytes(),
+            balance,
+            "refusal must refund exactly"
+        );
+        assert_eq!(snapshot(dir.path()), before, "refusal must not edit files");
+        if conflicting {
+            match error {
+                PraxisError::Corrupt { reason, .. }
+                    if reason == "protected physical-copy actual bytes conflict" => {}
+                other => panic!(
+                    "RED: valid different Name@2 bytes must conflict after complete fences: {other:?}"
+                ),
+            }
+        } else {
+            assert!(matches!(
+                error,
+                PraxisError::UnsupportedCatalogFeature {
+                    feature: "protected physical-copy role group provenance awaits proof"
+                }
+            ));
+        }
+    });
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn writer_identical_catalog_name_pair_reaches_next_private_gate() {
+    writer_fixed_catalog_pair_case(FixedCatalogPair::Name, false);
+}
+
+#[test]
+fn writer_valid_catalog_name_copy_conflict_requires_corrupt() {
+    writer_fixed_catalog_pair_case(FixedCatalogPair::Name, true);
+}
+
+#[test]
+fn writer_identical_catalog_namespace_pair_reaches_next_private_gate() {
+    writer_fixed_catalog_pair_case(FixedCatalogPair::Namespace, false);
+}
