@@ -32,6 +32,7 @@ const CATALOG_HEAD_LITERAL_BYTES: usize = 48;
 const CATALOG_NAME_LITERAL_BYTES: usize = 12;
 const CATALOG_NAMESPACE_LITERAL_BYTES: usize = 16;
 const CATALOG_ANCHOR_BYTES: usize = 72;
+const RECORD_BINDING_LITERAL_BYTES: usize = 80;
 const RECORD_ALLOCATOR_LITERAL_BYTES: usize = 56;
 const RECORD_INDEX_HEAD_LITERAL_BYTES: usize = 40;
 // Vec capacity can exceed logical length; debit both buffers before replay.
@@ -996,6 +997,62 @@ fn replay_fixed_catalog_copy_group(
     Ok(())
 }
 
+/// Reassemble and decode the selected Binding bytes, including a value-log
+/// payload whose callbacks may split the 80-byte row. The returned bytes stay
+/// provisional until the caller checks every complete source-file fence.
+fn replay_fixed_binding_value(
+    root: &Path,
+    manifest: &Manifest,
+    segment: &ProtectedSegmentCandidate,
+    value: Option<&ValueWitnessCandidate>,
+    copy: &CopyDescriptor,
+    budget: &mut PhysicalWitnessBudget,
+    work: &mut CopyReplayWork,
+) -> Result<[u8; RECORD_BINDING_LITERAL_BYTES]> {
+    if copy.cf != RecordRole::Meta.cf()
+        || !matches!(
+            RecordKey::decode(RecordRole::Meta, &copy.key, root)?,
+            RecordKey::Binding
+        )
+    {
+        return Err(corrupt(
+            root,
+            "fixed Record Binding copy has an unexpected role",
+        ));
+    }
+    let mut bytes = [0_u8; RECORD_BINDING_LITERAL_BYTES];
+    let mut copied = 0_usize;
+    with_authenticated_singleton_copy(
+        root,
+        manifest,
+        segment,
+        value,
+        copy,
+        RECORD_BINDING_LITERAL_BYTES,
+        budget,
+        work,
+        |chunk| {
+            let end = copied
+                .checked_add(chunk.len())
+                .filter(|end| *end <= RECORD_BINDING_LITERAL_BYTES)
+                .ok_or_else(|| corrupt(root, "replayed fixed Record Binding exceeds width"))?;
+            bytes[copied..end].copy_from_slice(chunk);
+            copied = end;
+            Ok(())
+        },
+    )?;
+    if copied != RECORD_BINDING_LITERAL_BYTES {
+        return Err(corrupt(
+            root,
+            "replayed fixed Record Binding length changed",
+        ));
+    }
+    // The visitor's prior decode does not validate bytes read at this exact
+    // physical locator during replay.
+    let _decoded = RecordRow::decode(&RecordKey::Binding, &bytes, root)?;
+    Ok(bytes)
+}
+
 #[allow(clippy::too_many_arguments)] // Segment/value receipts and replay limits are distinct proof inputs.
 fn replay_fixed_copy_groups(
     root: &Path,
@@ -1058,6 +1115,26 @@ fn replay_fixed_copy_groups(
                 }
                 _ => {}
             }
+        }
+        // Binding is immutable at S=1. Its source group cannot contain
+        // distinct ordered events as an index Head can.
+        if copies[0].cf == RecordRole::Meta.cf()
+            && matches!(
+                RecordKey::decode(RecordRole::Meta, &copies[0].key, root)?,
+                RecordKey::Binding
+            )
+        {
+            let canonical = replay_fixed_binding_value(
+                root, manifest, segment, value, &copies[0], budget, work,
+            )?;
+            for copy in &copies[1..] {
+                let peer =
+                    replay_fixed_binding_value(root, manifest, segment, value, copy, budget, work)?;
+                if canonical != peer {
+                    actual_bytes_conflict = true;
+                }
+            }
+            continue;
         }
         let width = singleton_literal_width(root, &copies[0])?;
         let mut canonical = LiteralComparisonBuffer::new(root, budget, work, width)?;
