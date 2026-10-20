@@ -1,5 +1,5 @@
 use super::codec::{
-    Anchor, CatalogKey, CatalogValue, CollectionId, Field, Head, NamespaceId, ScalarType, Schema,
+    CatalogKey, CatalogValue, CollectionId, Field, Head, NamespaceId, ScalarType, Schema,
 };
 use super::external_value::{ValuePayloadProbe, resolve_catalog_head_external};
 use super::physical::inspect_v4_owner;
