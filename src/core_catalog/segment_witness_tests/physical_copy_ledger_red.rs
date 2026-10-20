@@ -5,9 +5,10 @@ use crate::segments::format::SEGMENT_FOOTER_MAGIC;
 const FIXED_ORACLE: &str = include_str!("../../../tests/fixtures/catalog_v4_wal_oracle.json");
 
 fn oracle_bytes(hex: &str) -> Vec<u8> {
-    assert!(hex.len().is_multiple_of(2));
-    hex.as_bytes()
-        .chunks_exact(2)
+    let (pairs, remainder) = hex.as_bytes().as_chunks::<2>();
+    assert!(remainder.is_empty());
+    pairs
+        .iter()
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect()
 }
