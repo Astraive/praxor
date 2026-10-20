@@ -7,6 +7,7 @@ mod schema;
 mod snapshot;
 mod store;
 pub(crate) mod transition;
+pub(crate) mod variable_stream;
 
 #[cfg(test)]
 mod recovery_tests;

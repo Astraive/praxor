@@ -1,3 +1,10 @@
+use super::codec::{
+    CatalogKey, CatalogValue, CollectionId, Field, Head, NamespaceId, ScalarType, Schema,
+};
+use super::external_value::{
+    UnwitnessedRecordValue, ValuePayloadProbe, resolve_catalog_external_caps,
+    resolve_catalog_head_external, resolve_record_external_caps,
+};
 use super::physical::inspect_v4_owner;
 use super::physical_tests::flushed_create_fixture;
 use super::segment_witness::{
@@ -26,6 +33,7 @@ use crate::values::ValueLog;
 use crate::wal::catalog_witness::{
     PhysicalWitnessBudget, WalCut, scan_v4_wals_with_budget, vector_charge,
 };
+use crate::wal::record::MAX_WAL_PAYLOAD_BYTES;
 use crate::writer_lease::{LOCK_FILE_NAME, WriterLease};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -34,6 +42,10 @@ use std::path::{Path, PathBuf};
 use zstd::zstd_safe::zstd_sys as zstd_ffi;
 
 const CATALOG_CF: &str = "__praxor_record_catalog_v1";
+
+// Private test-first contract for full-file and per-extent value witnesses.
+// The public installed owner remains fenced while #81 is incomplete.
+mod value_file_witness_red;
 
 fn row(key: u8, value: StoredValue) -> SegmentEntry {
     SegmentEntry {
@@ -6906,4 +6918,1454 @@ fn zstd_final_recheck_detects_changed_earlier_file_after_stage() {
     assert_eq!(file_id(path), original_id);
     assert_eq!(fs::read(path).unwrap(), original);
     assert_eq!(snapshot(dir.path()), before);
+}
+
+fn writer_external_head_fixture() -> (
+    tempfile::TempDir,
+    PraxisConfig,
+    WriterLease,
+    Manifest,
+    Vec<u8>,
+) {
+    let (dir, mut config, lease, _) = two_literal_segments(false);
+    let root = lease.root();
+    let layout = DiskLayout::at(root);
+    config.large_value_threshold = 47;
+    config.validate().unwrap();
+    let key = CatalogKey::Head.encode().unwrap();
+    let encoded = CatalogValue::Head(Head {
+        database_id: [0x11; 16],
+        revision: 2,
+        collection_count: 1,
+    })
+    .encode()
+    .unwrap();
+    assert_eq!(key, [0]);
+    assert_eq!(encoded.len(), 48);
+
+    let value_path = layout.value_log_path(1);
+    let mut value_log = ValueLog::open(&value_path).unwrap();
+    let segment_path = layout.segment_path(0, 1);
+    let metadata = SegmentWriter::write(
+        SegmentWriteOptions {
+            path: &segment_path,
+            id: 1,
+            level: 0,
+            compression: Compression::None,
+            accelerator: &CpuAccelerator,
+            value_log: &mut value_log,
+            large_value_threshold: config.large_value_threshold,
+            block_size: 4096,
+            partitioned_bloom: None,
+            direct_io: false,
+        },
+        vec![row_in(
+            CATALOG_CF,
+            &key,
+            2,
+            StoredValue::Put(encoded.clone()),
+        )],
+    )
+    .unwrap();
+    drop(value_log);
+
+    let bytes = fs::read(&segment_path).unwrap();
+    let parsed = decode_segment(&bytes, &segment_path, &CpuAccelerator).unwrap();
+    assert_eq!(parsed.blocks.len(), 1);
+    assert_eq!(parsed.blocks[0].len(), 1);
+    let StoredValue::BlobPointer(pointer) = &parsed.blocks[0][0].entry.version.value else {
+        panic!("the writer must externalize the 48-byte Head")
+    };
+    assert_eq!(pointer.path.as_str(), value_path.to_str().unwrap());
+    assert_eq!(pointer.offset, 0);
+    assert_eq!(pointer.len, 48);
+    assert_eq!(pointer.checksum, crc32c(&encoded));
+    let value_file = fs::read(&value_path).unwrap();
+    assert_eq!(value_file.len(), 60);
+    assert_eq!(u64::from_le_bytes(value_file[..8].try_into().unwrap()), 48);
+    assert_eq!(
+        u32::from_le_bytes(value_file[8..12].try_into().unwrap()),
+        crc32c(&encoded)
+    );
+    assert_eq!(&value_file[12..], encoded.as_slice());
+
+    let manifest_path = layout.manifest_path();
+    let mut manifest =
+        Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    manifest.effective_config = config.persisted();
+    for family in &mut manifest.column_families {
+        if family.name.starts_with("__praxor_record_") {
+            family.large_value_threshold_bytes = config.large_value_threshold;
+        }
+    }
+    *manifest
+        .segments
+        .iter_mut()
+        .find(|segment| segment.id == 1)
+        .unwrap() = metadata;
+    ManifestStore::new(manifest_path.clone())
+        .save(&manifest)
+        .unwrap();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    assert_eq!(manifest.effective_config, config.persisted());
+    assert_eq!(
+        manifest
+            .column_families
+            .iter()
+            .find(|family| family.name == CATALOG_CF)
+            .unwrap()
+            .large_value_threshold_bytes,
+        config.large_value_threshold
+    );
+    (dir, config, lease, manifest, encoded)
+}
+
+#[test]
+fn private_external_head_resolves_writer_produced_48_bytes_without_tree_mutation() {
+    let (dir, config, lease, manifest, expected) = writer_external_head_fixture();
+    let root = lease.root();
+    let before = snapshot(dir.path());
+    assert!(matches!(
+        inspect_v4_owner(&lease, &config, &CpuAccelerator),
+        Err(PraxisError::UnsupportedCatalogFeature {
+            feature: "v4 installed cut beyond narrow D0 bootstrap"
+        })
+    ));
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let candidate = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+        let head = candidate
+            .rows
+            .iter()
+            .find(|row| row.source.id == 1 && row.cf == CATALOG_CF && row.key == [0])
+            .unwrap();
+        assert_eq!(
+            head.classification,
+            PhysicalRowClass::BoundProtected(ProtectedRole::Catalog)
+        );
+        assert!(matches!(
+            &head.value,
+            ObservedSegmentValue::Pointer {
+                expires_at_ms: None,
+                ..
+            }
+        ));
+        let mut probe = ValuePayloadProbe::default();
+        let resolved = resolve_catalog_head_external(root, &manifest, head, &mut probe);
+        candidate.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(snapshot(dir.path()), before);
+        assert_eq!(resolved.unwrap().as_bytes().as_slice(), expected.as_slice());
+        assert_eq!(probe.open_attempts, 1);
+        assert_eq!(probe.read_attempts, 2);
+        assert_eq!(probe.reserve_attempts, 0);
+    });
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn private_external_head_rejects_noncanonical_pointer_before_open() {
+    let (dir, _config, lease, _manifest, _) = writer_external_head_fixture();
+    let root = lease.root();
+    let segment_path = DiskLayout::at(root).segment_path(0, 1);
+    let mut decoded = decode_segment(
+        &fs::read(&segment_path).unwrap(),
+        &segment_path,
+        &CpuAccelerator,
+    )
+    .unwrap();
+    let StoredValue::BlobPointer(pointer) = &mut decoded.blocks[0][0].entry.version.value else {
+        panic!("the writer must produce a pointer before mutation")
+    };
+    let noncanonical = root.join("outside.tval").to_string_lossy().into_owned();
+    pointer.path = noncanonical.clone();
+    let rechecksummed = decoded.encode(&CpuAccelerator).unwrap();
+    let manifest = replace_first_segment_bytes(root, &rechecksummed);
+    let before = snapshot(dir.path());
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let candidate = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+        let head = candidate
+            .rows
+            .iter()
+            .find(|row| row.source.id == 1 && row.cf == CATALOG_CF && row.key == [0])
+            .unwrap();
+        let ObservedSegmentValue::Pointer {
+            pointer,
+            expires_at_ms: None,
+        } = &head.value
+        else {
+            panic!("the rechecksummed segment must expose the claimed pointer")
+        };
+        assert_eq!(pointer.path, noncanonical);
+        let mut probe = ValuePayloadProbe::default();
+        let result = resolve_catalog_head_external(root, &manifest, head, &mut probe);
+        candidate.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(probe.open_attempts, 0);
+        assert_eq!(probe.read_attempts, 0);
+        assert_eq!(probe.reserve_attempts, 0);
+        assert_eq!(snapshot(dir.path()), before);
+        assert!(
+            matches!(&result, Err(PraxisError::Corrupt { .. })),
+            "{result:?}"
+        );
+    });
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn private_external_head_rejects_atomic_cap_claim_before_payload_read_or_reserve() {
+    let (dir, _config, lease, _manifest, _) = writer_external_head_fixture();
+    let root = lease.root();
+    let segment_path = DiskLayout::at(root).segment_path(0, 1);
+    let mut decoded = decode_segment(
+        &fs::read(&segment_path).unwrap(),
+        &segment_path,
+        &CpuAccelerator,
+    )
+    .unwrap();
+    let StoredValue::BlobPointer(pointer) = &mut decoded.blocks[0][0].entry.version.value else {
+        panic!("the writer must produce a pointer before mutation")
+    };
+    pointer.len = MAX_WAL_PAYLOAD_BYTES as u64;
+    let rechecksummed = decoded.encode(&CpuAccelerator).unwrap();
+    let manifest = replace_first_segment_bytes(root, &rechecksummed);
+    assert_eq!(
+        manifest
+            .segments
+            .iter()
+            .find(|segment| segment.id == 1)
+            .unwrap()
+            .file_digest,
+        blake3::hash(&rechecksummed).to_hex().to_string()
+    );
+    let before = snapshot(dir.path());
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let candidate = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+        let head = candidate
+            .rows
+            .iter()
+            .find(|row| row.source.id == 1 && row.cf == CATALOG_CF && row.key == [0])
+            .unwrap();
+        let ObservedSegmentValue::Pointer {
+            pointer,
+            expires_at_ms: None,
+        } = &head.value
+        else {
+            panic!("the rechecksummed segment must expose the claimed pointer")
+        };
+        assert_eq!(pointer.len, MAX_WAL_PAYLOAD_BYTES as u64);
+        let mut probe = ValuePayloadProbe::default();
+        let result = resolve_catalog_head_external(root, &manifest, head, &mut probe);
+        candidate.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(probe.open_attempts, 0);
+        assert_eq!(probe.read_attempts, 0);
+        assert_eq!(probe.reserve_attempts, 0);
+        assert_eq!(snapshot(dir.path()), before);
+        assert!(
+            matches!(&result, Err(PraxisError::Corrupt { .. })),
+            "{result:?}"
+        );
+    });
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+fn writer_catalog_external_fixture(
+    key: CatalogKey<'_>,
+    replacement: Option<Vec<u8>>,
+    expected_len: usize,
+) -> (tempfile::TempDir, WriterLease, Manifest, Vec<u8>, Vec<u8>) {
+    let expected_sequence = if matches!(&key, CatalogKey::Anchor) {
+        1
+    } else {
+        2
+    };
+    let (dir, mut config, lease) = flushed_create_fixture();
+    let root = lease.root();
+    let layout = DiskLayout::at(root);
+    let segment_path = layout.segment_path(0, 1);
+    let decoded = decode_segment(
+        &fs::read(&segment_path).unwrap(),
+        &segment_path,
+        &CpuAccelerator,
+    )
+    .unwrap();
+    let mut rows = decoded
+        .blocks
+        .into_iter()
+        .flatten()
+        .map(|raw| raw.entry)
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 7);
+    let key_bytes = key.encode().unwrap();
+    let target = rows
+        .iter()
+        .position(|row| row.cf.0 == CATALOG_CF && row.key.as_ref() == key_bytes.as_slice())
+        .unwrap();
+    assert_eq!(rows[target].version.sequence, expected_sequence);
+    let StoredValue::Put(original) = &rows[target].version.value else {
+        panic!("the flushed fixture must begin with a literal catalog row")
+    };
+    let expected = replacement.unwrap_or_else(|| original.to_vec());
+    assert_eq!(expected.len(), expected_len);
+    let decoded_key = CatalogKey::decode(&key_bytes, &segment_path).unwrap();
+    assert_eq!(
+        CatalogValue::decode(&decoded_key, &expected, &segment_path)
+            .unwrap()
+            .encode()
+            .unwrap(),
+        expected
+    );
+    rows[target].version.value = StoredValue::Put(expected.clone());
+    config.large_value_threshold = 11;
+    config.validate().unwrap();
+
+    let value_path = layout.value_log_path(1);
+    let mut value_log = ValueLog::open(&value_path).unwrap();
+    let metadata = SegmentWriter::write(
+        SegmentWriteOptions {
+            path: &segment_path,
+            id: 1,
+            level: 0,
+            compression: Compression::None,
+            accelerator: &CpuAccelerator,
+            value_log: &mut value_log,
+            large_value_threshold: config.large_value_threshold,
+            block_size: config.block_size,
+            partitioned_bloom: None,
+            direct_io: false,
+        },
+        rows,
+    )
+    .unwrap();
+    drop(value_log);
+    let written = decode_segment(
+        &fs::read(&segment_path).unwrap(),
+        &segment_path,
+        &CpuAccelerator,
+    )
+    .unwrap();
+    let target = written
+        .blocks
+        .iter()
+        .flatten()
+        .find(|raw| raw.entry.cf.0 == CATALOG_CF && raw.entry.key.as_ref() == key_bytes.as_slice())
+        .unwrap();
+    assert_eq!(target.entry.version.sequence, expected_sequence);
+    let StoredValue::BlobPointer(pointer) = &target.entry.version.value else {
+        panic!("the writer must externalize the catalog value")
+    };
+    assert_eq!(pointer.path.as_str(), value_path.to_str().unwrap());
+    assert_eq!(pointer.len, expected_len as u64);
+    assert_eq!(pointer.checksum, crc32c(&expected));
+    let value_file = fs::read(&value_path).unwrap();
+    let offset = usize::try_from(pointer.offset).unwrap();
+    let end = offset.checked_add(12 + expected_len).unwrap();
+    assert!(end <= value_file.len());
+    assert_eq!(
+        u64::from_le_bytes(value_file[offset..offset + 8].try_into().unwrap()),
+        expected_len as u64
+    );
+    assert_eq!(
+        u32::from_le_bytes(value_file[offset + 8..offset + 12].try_into().unwrap()),
+        crc32c(&expected)
+    );
+    assert_eq!(&value_file[offset + 12..end], expected.as_slice());
+
+    let manifest_path = layout.manifest_path();
+    let mut manifest =
+        Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    assert_eq!(manifest.segments.len(), 1);
+    manifest.effective_config = config.persisted();
+    for family in &mut manifest.column_families {
+        if family.name.starts_with("__praxor_record_") {
+            family.large_value_threshold_bytes = config.large_value_threshold;
+        }
+    }
+    manifest.segments[0] = metadata;
+    ManifestStore::new(manifest_path.clone())
+        .save(&manifest)
+        .unwrap();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    assert_eq!(manifest.effective_config, config.persisted());
+    for family_name in [CATALOG_CF, "__praxor_record_meta_v1"] {
+        assert_eq!(
+            manifest
+                .column_families
+                .iter()
+                .find(|family| family.name == family_name)
+                .unwrap()
+                .large_value_threshold_bytes,
+            11
+        );
+    }
+    assert!(
+        manifest
+            .column_families
+            .iter()
+            .filter(|family| family.name.starts_with("__praxor_record_"))
+            .all(|family| family.large_value_threshold_bytes == 11)
+    );
+    assert_eq!(manifest.segments.len(), 1);
+    assert_eq!(manifest.segments[0].id, 1);
+    assert!(value_path.is_file());
+    (dir, lease, manifest, key_bytes, expected)
+}
+
+fn schema_value_at_limit(short_by_one: bool) -> Vec<u8> {
+    let id = CollectionId::new(2).unwrap();
+    let namespace = NamespaceId::new(2).unwrap();
+    let collection_name = "c".repeat(255);
+    let field_names = (1..=128)
+        .map(|ordinal| {
+            let suffix_len = if short_by_one && ordinal == 128 {
+                251
+            } else {
+                252
+            };
+            format!("{ordinal:03}{}", "x".repeat(suffix_len))
+        })
+        .collect::<Vec<_>>();
+    assert!(field_names.iter().all(|name| name.len() <= 255));
+    let fields = field_names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| Field {
+            id: (index + 1) as u16,
+            name,
+            scalar: ScalarType::Text,
+            nullable: false,
+        })
+        .collect();
+    let encoded = CatalogValue::Schema(Schema {
+        collection_id: id,
+        namespace_id: namespace,
+        name: &collection_name,
+        fields,
+    })
+    .encode()
+    .unwrap();
+    assert_eq!(encoded.len(), if short_by_one { 33_946 } else { 33_947 });
+    encoded
+}
+
+fn assert_private_catalog_external_positive(
+    key: CatalogKey<'_>,
+    replacement: Option<Vec<u8>>,
+    expected_len: usize,
+    expected_sequence: u64,
+) {
+    let (dir, lease, manifest, key_bytes, expected) =
+        writer_catalog_external_fixture(key, replacement, expected_len);
+    let root = lease.root();
+    let before = snapshot(dir.path());
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let candidate = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+        assert_eq!(candidate.witnesses.len(), 1);
+        let target = candidate
+            .rows
+            .iter()
+            .find(|row| row.source.id == 1 && row.cf == CATALOG_CF && row.key == key_bytes)
+            .unwrap();
+        assert_eq!(target.sequence, expected_sequence);
+        assert_eq!(
+            target.classification,
+            PhysicalRowClass::BoundProtected(ProtectedRole::Catalog)
+        );
+        let ObservedSegmentValue::Pointer {
+            pointer,
+            expires_at_ms: None,
+        } = &target.value
+        else {
+            panic!("the physical visitor must stage a nonexpiring pointer")
+        };
+        assert_eq!(pointer.len, expected_len as u64);
+        let mut probe = ValuePayloadProbe::default();
+        let result = resolve_catalog_external_caps(root, &manifest, target, budget, &mut probe);
+        candidate.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(snapshot(dir.path()), before);
+        assert_eq!(result.unwrap().as_bytes(), expected.as_slice());
+        assert_eq!(probe.open_attempts, 1);
+        assert!(probe.read_attempts >= 2);
+    });
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+fn assert_private_catalog_external_cap_plus_one(
+    key: CatalogKey<'_>,
+    replacement: Option<Vec<u8>>,
+    cap: usize,
+) {
+    let expected_sequence = if matches!(&key, CatalogKey::Anchor) {
+        1
+    } else {
+        2
+    };
+    let (dir, lease, _manifest, key_bytes, _) =
+        writer_catalog_external_fixture(key, replacement, cap);
+    let root = lease.root();
+    let segment_path = DiskLayout::at(root).segment_path(0, 1);
+    let mut decoded = decode_segment(
+        &fs::read(&segment_path).unwrap(),
+        &segment_path,
+        &CpuAccelerator,
+    )
+    .unwrap();
+    let target = decoded
+        .blocks
+        .iter_mut()
+        .flatten()
+        .find(|raw| raw.entry.cf.0 == CATALOG_CF && raw.entry.key.as_ref() == key_bytes.as_slice())
+        .unwrap();
+    let StoredValue::BlobPointer(pointer) = &mut target.entry.version.value else {
+        panic!("the writer must produce a pointer before the forged length")
+    };
+    assert_eq!(pointer.len, cap as u64);
+    pointer.len = (cap + 1) as u64;
+    let rechecksummed = decoded.encode(&CpuAccelerator).unwrap();
+    let manifest = replace_first_segment_bytes(root, &rechecksummed);
+    assert_eq!(
+        manifest.segments[0].file_digest,
+        blake3::hash(&rechecksummed).to_hex().to_string()
+    );
+    let before = snapshot(dir.path());
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let candidate = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+        let target = candidate
+            .rows
+            .iter()
+            .find(|row| row.source.id == 1 && row.cf == CATALOG_CF && row.key == key_bytes)
+            .unwrap();
+        assert_eq!(target.sequence, expected_sequence);
+        let ObservedSegmentValue::Pointer {
+            pointer,
+            expires_at_ms: None,
+        } = &target.value
+        else {
+            panic!("the rechecksummed visitor must stage a nonexpiring pointer")
+        };
+        assert_eq!(pointer.len, (cap + 1) as u64);
+        let mut probe = ValuePayloadProbe::default();
+        let result = resolve_catalog_external_caps(root, &manifest, target, budget, &mut probe);
+        candidate.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(snapshot(dir.path()), before);
+        assert_eq!(probe.open_attempts, 0);
+        assert_eq!(probe.read_attempts, 0);
+        assert_eq!(probe.reserve_attempts, 0);
+        assert!(
+            matches!(&result, Err(PraxisError::Corrupt { .. })),
+            "{result:?}"
+        );
+    });
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn private_external_anchor_resolves_writer_produced_72_bytes() {
+    assert_private_catalog_external_positive(CatalogKey::Anchor, None, 72, 1);
+}
+
+#[test]
+fn private_external_name_resolves_writer_produced_12_bytes() {
+    assert_private_catalog_external_positive(CatalogKey::Name("accounts"), None, 12, 2);
+}
+
+#[test]
+fn private_external_namespace_resolves_writer_produced_16_bytes() {
+    assert_private_catalog_external_positive(
+        CatalogKey::Namespace(NamespaceId::new(2).unwrap()),
+        None,
+        16,
+        2,
+    );
+}
+
+#[test]
+fn private_external_schema_resolves_writer_produced_33946_bytes() {
+    assert_private_catalog_external_positive(
+        CatalogKey::Schema(CollectionId::new(2).unwrap()),
+        Some(schema_value_at_limit(true)),
+        33_946,
+        2,
+    );
+}
+
+#[test]
+fn private_external_schema_resolves_writer_produced_33947_bytes() {
+    assert_private_catalog_external_positive(
+        CatalogKey::Schema(CollectionId::new(2).unwrap()),
+        Some(schema_value_at_limit(false)),
+        33_947,
+        2,
+    );
+}
+
+#[test]
+fn private_external_anchor_rejects_73_byte_claim_before_io() {
+    assert_private_catalog_external_cap_plus_one(CatalogKey::Anchor, None, 72);
+}
+
+#[test]
+fn private_external_name_rejects_13_byte_claim_before_io() {
+    assert_private_catalog_external_cap_plus_one(CatalogKey::Name("accounts"), None, 12);
+}
+
+#[test]
+fn private_external_namespace_rejects_17_byte_claim_before_io() {
+    assert_private_catalog_external_cap_plus_one(
+        CatalogKey::Namespace(NamespaceId::new(2).unwrap()),
+        None,
+        16,
+    );
+}
+
+#[test]
+fn private_external_schema_rejects_33948_byte_claim_before_io() {
+    assert_private_catalog_external_cap_plus_one(
+        CatalogKey::Schema(CollectionId::new(2).unwrap()),
+        Some(schema_value_at_limit(false)),
+        33_947,
+    );
+}
+
+#[test]
+fn private_external_head_generalized_resolves_writer_produced_48_bytes() {
+    assert_private_catalog_external_positive(CatalogKey::Head, None, 48, 2);
+}
+
+#[test]
+fn private_external_head_generalized_rejects_opened_hardlink_alias() {
+    let (dir, lease, manifest, key_bytes, _) =
+        writer_catalog_external_fixture(CatalogKey::Head, None, 48);
+    let root = lease.root();
+    let value_path = DiskLayout::at(root).value_log_path(1);
+    let alias = root.join("external-value-hardlink-alias");
+    fs::hard_link(&value_path, &alias).unwrap();
+    assert!(value_path.is_file());
+    assert!(alias.is_file());
+    assert_eq!(file_id(&value_path), file_id(&alias));
+    let before = snapshot(dir.path());
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let candidate = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+        let target = candidate
+            .rows
+            .iter()
+            .find(|row| row.source.id == 1 && row.cf == CATALOG_CF && row.key == key_bytes)
+            .unwrap();
+        assert_eq!(target.sequence, 2);
+        let mut probe = ValuePayloadProbe::default();
+        let result = resolve_catalog_external_caps(root, &manifest, target, budget, &mut probe);
+        candidate.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(snapshot(dir.path()), before);
+        assert_eq!(probe.open_attempts, 1);
+        assert_eq!(probe.read_attempts, 0);
+        assert_eq!(probe.reserve_attempts, 0);
+        assert!(
+            matches!(&result, Err(PraxisError::Corrupt { .. })),
+            "{result:?}"
+        );
+    });
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn private_external_schema_refuses_before_decoder_reserve_at_budget_edge() {
+    let (dir, lease, manifest, key_bytes, _) = writer_catalog_external_fixture(
+        CatalogKey::Schema(CollectionId::new(2).unwrap()),
+        Some(schema_value_at_limit(false)),
+        33_947,
+    );
+    let root = lease.root();
+    let before = snapshot(dir.path());
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let candidate = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+        let target = candidate
+            .rows
+            .iter()
+            .find(|row| row.source.id == 1 && row.cf == CATALOG_CF && row.key == key_bytes)
+            .unwrap();
+        let raw_capacity_bytes = 256 * std::mem::size_of::<Field<'static>>();
+        let policy_allowance = vector_charge::<Field<'static>>(root, 256).unwrap();
+        assert!(policy_allowance > raw_capacity_bytes);
+        let available = budget.remaining_bytes();
+        assert!(available > raw_capacity_bytes);
+        let held = available - raw_capacity_bytes;
+        budget.charge(root, held).unwrap();
+        let mut probe = ValuePayloadProbe::default();
+        let result = resolve_catalog_external_caps(root, &manifest, target, budget, &mut probe);
+        budget.release(root, held).unwrap();
+        candidate.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(snapshot(dir.path()), before);
+        assert_eq!(probe.open_attempts, 1);
+        assert_eq!(probe.read_attempts, 2);
+        assert_eq!(probe.reserve_attempts, 0);
+        assert!(
+            matches!(&result, Err(PraxisError::Corrupt { .. })),
+            "{result:?}"
+        );
+    });
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+// A private test-first contract for record value resolution. These tests stage
+// real writer-produced pointers, but confer no installed owner authority.
+mod record_external_caps_red {
+    use super::*;
+    use crate::core_catalog::value_witness::{
+        ValueFileScanProbe, collect_value_witness, recheck_value_witness,
+    };
+    use crate::core_records::codec::{Decision, Key as RecordKey, Role as RecordRole, Row};
+    use crate::core_records::variable_stream::VariableSummary;
+
+    fn role(key: &RecordKey<'_>) -> RecordRole {
+        match key {
+            RecordKey::Binding | RecordKey::Allocator | RecordKey::Descriptor(_) => {
+                RecordRole::Meta
+            }
+            RecordKey::Payload(_) => RecordRole::Payload,
+            RecordKey::State(_) => RecordRole::State,
+            RecordKey::Fact { .. } | RecordKey::Head { .. } => RecordRole::Index,
+        }
+    }
+
+    fn protected_role(role: RecordRole) -> ProtectedRole {
+        match role {
+            RecordRole::Meta => ProtectedRole::Meta,
+            RecordRole::Payload => ProtectedRole::Payload,
+            RecordRole::State => ProtectedRole::State,
+            RecordRole::Index => ProtectedRole::Index,
+        }
+    }
+
+    fn sequence(key: &RecordKey<'_>) -> u64 {
+        match key {
+            RecordKey::Binding | RecordKey::Allocator | RecordKey::Descriptor(_) => 1,
+            _ => 2,
+        }
+    }
+
+    fn writer_record_external_fixture(
+        key: RecordKey<'_>,
+        replacement: Option<Vec<u8>>,
+        expected_len: usize,
+    ) -> (tempfile::TempDir, WriterLease, Manifest, Vec<u8>, Vec<u8>) {
+        let (dir, mut config, lease) = flushed_create_fixture();
+        let root = lease.root();
+        let layout = DiskLayout::at(root);
+        let segment_path = layout.segment_path(0, 1);
+        let decoded = decode_segment(
+            &fs::read(&segment_path).unwrap(),
+            &segment_path,
+            &CpuAccelerator,
+        )
+        .unwrap();
+        let mut rows = decoded
+            .blocks
+            .into_iter()
+            .flatten()
+            .map(|raw| raw.entry)
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 7);
+        let key_bytes = key.encode().unwrap();
+        let record_role = role(&key);
+        assert_eq!(
+            RecordKey::decode(record_role, &key_bytes, &segment_path).unwrap(),
+            key
+        );
+        let target = rows.iter().position(|row| {
+            row.cf.0 == record_role.cf() && row.key.as_ref() == key_bytes.as_slice()
+        });
+        let expected = if let Some(target) = target {
+            assert!(
+                replacement.is_none(),
+                "installed row must retain its encoded bytes"
+            );
+            assert_eq!(rows[target].version.sequence, sequence(&key));
+            let StoredValue::Put(bytes) = &rows[target].version.value else {
+                panic!("the installed row must start as a literal Put")
+            };
+            bytes.to_vec()
+        } else {
+            let bytes = replacement.expect("new private record row needs encoded bytes");
+            rows.push(row_in(
+                record_role.cf(),
+                &key_bytes,
+                sequence(&key),
+                StoredValue::Put(bytes.clone()),
+            ));
+            bytes
+        };
+        assert_eq!(expected.len(), expected_len);
+        assert_eq!(
+            Row::decode(&key, &expected, &segment_path)
+                .unwrap()
+                .encode()
+                .unwrap(),
+            expected
+        );
+
+        config.large_value_threshold = 11;
+        config.validate().unwrap();
+        let value_path = layout.value_log_path(1);
+        let mut value_log = ValueLog::open(&value_path).unwrap();
+        let metadata = SegmentWriter::write(
+            SegmentWriteOptions {
+                path: &segment_path,
+                id: 1,
+                level: 0,
+                compression: Compression::None,
+                accelerator: &CpuAccelerator,
+                value_log: &mut value_log,
+                large_value_threshold: config.large_value_threshold,
+                block_size: config.block_size,
+                partitioned_bloom: None,
+                direct_io: false,
+            },
+            rows,
+        )
+        .unwrap();
+        drop(value_log);
+
+        let written = decode_segment(
+            &fs::read(&segment_path).unwrap(),
+            &segment_path,
+            &CpuAccelerator,
+        )
+        .unwrap();
+        let target = written
+            .blocks
+            .iter()
+            .flatten()
+            .find(|raw| {
+                raw.entry.cf.0 == record_role.cf() && raw.entry.key.as_ref() == key_bytes.as_slice()
+            })
+            .unwrap();
+        assert_eq!(target.entry.version.sequence, sequence(&key));
+        let StoredValue::BlobPointer(pointer) = &target.entry.version.value else {
+            panic!("the writer must externalize the record row")
+        };
+        assert_eq!(pointer.path.as_str(), value_path.to_str().unwrap());
+        assert_eq!(pointer.len, expected_len as u64);
+        assert_eq!(pointer.checksum, crc32c(&expected));
+        let value_file = fs::read(&value_path).unwrap();
+        let offset = usize::try_from(pointer.offset).unwrap();
+        let end = offset.checked_add(12 + expected_len).unwrap();
+        assert!(end <= value_file.len());
+        assert_eq!(
+            u64::from_le_bytes(value_file[offset..offset + 8].try_into().unwrap()),
+            expected_len as u64
+        );
+        assert_eq!(
+            u32::from_le_bytes(value_file[offset + 8..offset + 12].try_into().unwrap()),
+            crc32c(&expected)
+        );
+        assert_eq!(&value_file[offset + 12..end], expected.as_slice());
+
+        let manifest_path = layout.manifest_path();
+        let mut manifest =
+            Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+        assert_eq!(manifest.segments.len(), 1);
+        manifest.effective_config = config.persisted();
+        for family in &mut manifest.column_families {
+            if family.name.starts_with("__praxor_record_") {
+                family.large_value_threshold_bytes = config.large_value_threshold;
+            }
+        }
+        manifest.segments[0] = metadata;
+        ManifestStore::new(manifest_path.clone())
+            .save(&manifest)
+            .unwrap();
+        let manifest =
+            Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+        assert_eq!(manifest.effective_config, config.persisted());
+        assert!(
+            manifest
+                .column_families
+                .iter()
+                .filter(|family| family.name.starts_with("__praxor_record_"))
+                .all(|family| family.large_value_threshold_bytes == 11)
+        );
+        assert_eq!(manifest.segments[0].id, 1);
+        assert!(value_path.is_file());
+        (dir, lease, manifest, key_bytes, expected)
+    }
+
+    fn assert_positive(key: RecordKey<'_>, replacement: Option<Vec<u8>>, len: usize) {
+        let record_role = role(&key);
+        let expected_sequence = sequence(&key);
+        let (dir, lease, manifest, key_bytes, encoded) =
+            writer_record_external_fixture(key.clone(), replacement, len);
+        let root = lease.root();
+        let expected = match Row::decode(&key, &encoded, root).unwrap() {
+            Row::Payload(user) => UnwitnessedRecordValue::Payload {
+                user_len: user.len() as u64,
+                digest: blake3::hash(user),
+            },
+            Row::Descriptor { name, namespace } => UnwitnessedRecordValue::Descriptor {
+                encoded_len: encoded.len() as u64,
+                encoded_digest: blake3::hash(&encoded),
+                name_len: name.len() as u64,
+                namespace_len: namespace.len() as u64,
+            },
+            _ => {
+                let mut bytes = [0_u8; 80];
+                assert!(encoded.len() <= bytes.len());
+                bytes[..encoded.len()].copy_from_slice(&encoded);
+                UnwitnessedRecordValue::Fixed {
+                    len: encoded.len(),
+                    bytes,
+                }
+            }
+        };
+        let before = snapshot(dir.path());
+        with_wal_budget(root, &manifest, |budget| {
+            let balance = budget.remaining_bytes();
+            let candidate = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+            assert_eq!(candidate.witnesses.len(), 1);
+            let target = candidate
+                .rows
+                .iter()
+                .find(|row| {
+                    row.source.id == 1 && row.cf == record_role.cf() && row.key == key_bytes
+                })
+                .unwrap();
+            assert_eq!(target.sequence, expected_sequence);
+            assert_eq!(
+                target.classification,
+                PhysicalRowClass::BoundProtected(protected_role(record_role))
+            );
+            let ObservedSegmentValue::Pointer {
+                pointer,
+                expires_at_ms: None,
+            } = &target.value
+            else {
+                panic!("the visitor must stage a nonexpiring record pointer")
+            };
+            assert_eq!(pointer.len, len as u64);
+            let mut probe = ValuePayloadProbe::default();
+            let result = resolve_record_external_caps(root, &manifest, target, budget, &mut probe);
+            candidate.discard(root, budget).unwrap();
+            assert_eq!(budget.remaining_bytes(), balance);
+            assert_eq!(snapshot(dir.path()), before);
+            assert_eq!(result.unwrap(), expected);
+            assert_eq!(probe.open_attempts, 1);
+            assert!(probe.read_attempts >= 2);
+            assert_eq!(probe.reserve_attempts, 0);
+        });
+        assert_eq!(snapshot(dir.path()), before);
+    }
+
+    fn assert_cap_plus_one(
+        key: RecordKey<'_>,
+        replacement: Option<Vec<u8>>,
+        actual_len: usize,
+        claimed_len: u64,
+    ) {
+        let record_role = role(&key);
+        let expected_sequence = sequence(&key);
+        let (dir, lease, _manifest, key_bytes, _) =
+            writer_record_external_fixture(key, replacement, actual_len);
+        let root = lease.root();
+        let segment_path = DiskLayout::at(root).segment_path(0, 1);
+        let mut decoded = decode_segment(
+            &fs::read(&segment_path).unwrap(),
+            &segment_path,
+            &CpuAccelerator,
+        )
+        .unwrap();
+        let target = decoded
+            .blocks
+            .iter_mut()
+            .flatten()
+            .find(|raw| {
+                raw.entry.cf.0 == record_role.cf() && raw.entry.key.as_ref() == key_bytes.as_slice()
+            })
+            .unwrap();
+        let StoredValue::BlobPointer(pointer) = &mut target.entry.version.value else {
+            panic!("the writer must produce a pointer before the forged length")
+        };
+        assert_eq!(pointer.len, actual_len as u64);
+        pointer.len = claimed_len;
+        let rechecksummed = decoded.encode(&CpuAccelerator).unwrap();
+        let manifest = replace_first_segment_bytes(root, &rechecksummed);
+        assert_eq!(
+            manifest.segments[0].file_digest,
+            blake3::hash(&rechecksummed).to_hex().to_string()
+        );
+        let before = snapshot(dir.path());
+        with_wal_budget(root, &manifest, |budget| {
+            let balance = budget.remaining_bytes();
+            let candidate = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+            let target = candidate
+                .rows
+                .iter()
+                .find(|row| {
+                    row.source.id == 1 && row.cf == record_role.cf() && row.key == key_bytes
+                })
+                .unwrap();
+            assert_eq!(target.sequence, expected_sequence);
+            assert_eq!(
+                target.classification,
+                PhysicalRowClass::BoundProtected(protected_role(record_role))
+            );
+            let ObservedSegmentValue::Pointer {
+                pointer,
+                expires_at_ms: None,
+            } = &target.value
+            else {
+                panic!("the rechecksummed visitor must stage the record pointer")
+            };
+            assert_eq!(pointer.len, claimed_len);
+            let mut probe = ValuePayloadProbe::default();
+            let result = resolve_record_external_caps(root, &manifest, target, budget, &mut probe);
+            candidate.discard(root, budget).unwrap();
+            assert_eq!(budget.remaining_bytes(), balance);
+            assert_eq!(snapshot(dir.path()), before);
+            assert_eq!(probe.open_attempts, 0);
+            assert_eq!(probe.read_attempts, 0);
+            assert_eq!(probe.reserve_attempts, 0);
+            assert!(
+                matches!(&result, Err(PraxisError::Corrupt { .. })),
+                "{result:?}"
+            );
+        });
+        assert_eq!(snapshot(dir.path()), before);
+    }
+
+    fn fact_key() -> RecordKey<'static> {
+        RecordKey::Fact {
+            index: 1,
+            incarnation: 1,
+            key: b"k",
+            raw_sequence: 2,
+        }
+    }
+
+    fn head_key() -> RecordKey<'static> {
+        RecordKey::Head {
+            index: 1,
+            incarnation: 1,
+            key: b"k",
+        }
+    }
+
+    fn state_value() -> Vec<u8> {
+        Row::State {
+            live: true,
+            payload_length: 1,
+        }
+        .encode()
+        .unwrap()
+    }
+
+    fn fact_value() -> Vec<u8> {
+        Row::Fact {
+            append_ordinal: 1,
+            decision: Decision::Put(1),
+        }
+        .encode()
+        .unwrap()
+    }
+
+    fn head_value() -> Vec<u8> {
+        Row::Head {
+            raw_sequence: 2,
+            append_ordinal: 1,
+            decision: Decision::Put(1),
+        }
+        .encode()
+        .unwrap()
+    }
+
+    fn descriptor_value() -> Vec<u8> {
+        let namespace = "n".repeat(1024 * 1024);
+        Row::Descriptor {
+            name: "idx",
+            namespace: &namespace,
+        }
+        .encode()
+        .unwrap()
+    }
+
+    fn descriptor_with_namespace(namespace: &str) -> Vec<u8> {
+        Row::Descriptor {
+            name: "idx",
+            namespace,
+        }
+        .encode()
+        .unwrap()
+    }
+
+    fn payload_value() -> Vec<u8> {
+        let user = vec![0x5a; 256 * 1024];
+        Row::Payload(&user).encode().unwrap()
+    }
+
+    fn assert_private_record_value_file_witness(
+        key: RecordKey<'_>,
+        encoded: Vec<u8>,
+        expected_len: usize,
+    ) {
+        let is_descriptor = matches!(&key, RecordKey::Descriptor(_));
+        let record_role = role(&key);
+        let expected_sequence = sequence(&key);
+        let (dir, lease, manifest, key_bytes, expected) =
+            writer_record_external_fixture(key, Some(encoded), expected_len);
+        let root = lease.root();
+        let value_path = DiskLayout::at(root).value_log_path(1);
+        let value_spelling = value_path.to_str().unwrap();
+        let value_file = fs::read(&value_path).unwrap();
+        let opened = File::open(&value_path).unwrap();
+        let expected_identity = physical_id(&opened, &value_path).unwrap();
+        drop(opened);
+        let before = snapshot(dir.path());
+
+        let mut config = PraxisConfig::new(root);
+        config.compression = Compression::None;
+        config.large_value_threshold = 11;
+        config.validate().unwrap();
+        assert_eq!(manifest.effective_config, config.persisted());
+        let owner = inspect_v4_owner(&lease, &config, &CpuAccelerator);
+        assert!(
+            owner.is_err(),
+            "record fixture unexpectedly admitted the public owner: {owner:?}"
+        );
+        assert_eq!(snapshot(dir.path()), before);
+
+        with_wal_budget(root, &manifest, |budget| {
+            let wal_balance = budget.remaining_bytes();
+            let segments = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+            let segment_balance = budget.remaining_bytes();
+            assert!(segment_balance < wal_balance);
+            assert_eq!(segments.witnesses.len(), 1);
+            let record = segments
+                .rows
+                .iter()
+                .find(|row| {
+                    row.source.id == 1 && row.cf == record_role.cf() && row.key == key_bytes
+                })
+                .unwrap();
+            assert_eq!(record.sequence, expected_sequence);
+            assert_eq!(
+                record.classification,
+                PhysicalRowClass::BoundProtected(protected_role(record_role))
+            );
+            let ObservedSegmentValue::Pointer {
+                pointer,
+                expires_at_ms: None,
+            } = &record.value
+            else {
+                panic!("the writer must stage a nonexpiring record pointer")
+            };
+            assert_eq!(pointer.path, value_spelling);
+            assert_eq!(pointer.len, expected_len as u64);
+            assert_eq!(pointer.checksum, crc32c(&expected));
+            let record_offset = usize::try_from(pointer.offset).unwrap();
+            let record_end = record_offset.checked_add(12 + expected_len).unwrap();
+            assert!(record_end <= value_file.len());
+            assert_eq!(
+                u64::from_le_bytes(
+                    value_file[record_offset..record_offset + 8]
+                        .try_into()
+                        .unwrap()
+                ),
+                expected_len as u64
+            );
+            assert_eq!(
+                u32::from_le_bytes(
+                    value_file[record_offset + 8..record_offset + 12]
+                        .try_into()
+                        .unwrap()
+                ),
+                crc32c(&expected)
+            );
+            assert_eq!(
+                &value_file[record_offset + 12..record_end],
+                expected.as_slice()
+            );
+
+            let mut expected_extents = Vec::new();
+            for row in &segments.rows {
+                let ObservedSegmentValue::Pointer {
+                    pointer,
+                    expires_at_ms: None,
+                } = &row.value
+                else {
+                    continue;
+                };
+                assert_ne!(row.classification, PhysicalRowClass::Other);
+                assert_eq!(pointer.path, value_spelling);
+                let offset = usize::try_from(pointer.offset).unwrap();
+                let len = usize::try_from(pointer.len).unwrap();
+                let end = offset.checked_add(12).unwrap().checked_add(len).unwrap();
+                assert!(end <= value_file.len());
+                assert_eq!(
+                    u64::from_le_bytes(value_file[offset..offset + 8].try_into().unwrap()),
+                    pointer.len
+                );
+                assert_eq!(
+                    u32::from_le_bytes(value_file[offset + 8..offset + 12].try_into().unwrap()),
+                    pointer.checksum
+                );
+                let payload = &value_file[offset + 12..end];
+                assert_eq!(crc32c(payload), pointer.checksum);
+                expected_extents.push((
+                    pointer.offset,
+                    pointer.len,
+                    pointer.checksum,
+                    blake3::hash(payload),
+                ));
+            }
+            expected_extents.sort_by_key(|extent| extent.0);
+            assert!(expected_extents.len() >= 2);
+            let mut probe = ValueFileScanProbe::default();
+            let values = match collect_value_witness(
+                root,
+                &manifest,
+                &segments.rows,
+                budget,
+                &mut probe,
+            ) {
+                Ok(values) => values,
+                Err(error) => {
+                    assert!(
+                        matches!(
+                            &error,
+                            PraxisError::UnsupportedCatalogFeature {
+                                feature: "variable-length record extents await streamed value witness"
+                            }
+                        ),
+                        "the fixture failed before the intended variable-record seam: {error}"
+                    );
+                    assert_eq!(probe.proof_full_file_hashes, 0);
+                    assert_eq!(budget.remaining_bytes(), segment_balance);
+                    segments.discard(root, budget).unwrap();
+                    assert_eq!(budget.remaining_bytes(), wal_balance);
+                    assert_eq!(snapshot(dir.path()), before);
+                    panic!(
+                        "writer-produced variable record reached the unimplemented witness: {error}"
+                    );
+                }
+            };
+            assert_eq!(probe.proof_full_file_hashes, 1);
+            assert_eq!(values.files.len(), 1);
+            assert_eq!(
+                values.retained_bytes,
+                segment_balance - budget.remaining_bytes()
+            );
+            assert!(values.retained_bytes > 0);
+            let file = &values.files[0];
+            assert_eq!(file.id, 1);
+            assert_eq!(file.path, value_path);
+            assert_eq!(file.identity, expected_identity);
+            assert_eq!(file.len, value_file.len() as u64);
+            assert_eq!(file.digest, blake3::hash(&value_file));
+            assert_eq!(values.extents.len(), expected_extents.len());
+            for (observed, &(offset, len, checksum, payload_digest)) in
+                values.extents.iter().zip(&expected_extents)
+            {
+                assert_eq!(observed.file_id, 1);
+                assert_eq!(observed.offset, offset);
+                assert_eq!(observed.len, len);
+                assert_eq!(observed.checksum, checksum);
+                assert_eq!(observed.payload_digest, payload_digest);
+            }
+            assert!(values.extents.iter().any(|extent| {
+                extent.file_id == 1
+                    && extent.offset == pointer.offset
+                    && extent.len == expected_len as u64
+                    && extent.checksum == crc32c(&expected)
+                    && extent.payload_digest == blake3::hash(&expected)
+            }));
+            let target_index = values
+                .extents
+                .iter()
+                .position(|extent| {
+                    extent.file_id == 1
+                        && extent.offset == pointer.offset
+                        && extent.len == expected_len as u64
+                })
+                .unwrap();
+            assert_eq!(
+                values.variable_summaries.len(),
+                values
+                    .extents
+                    .iter()
+                    .filter(|extent| extent.kind.is_some())
+                    .count()
+            );
+            let target_summary = values
+                .variable_summaries
+                .iter()
+                .find(|summary| summary.extent_index == target_index)
+                .unwrap();
+            let expected_summary = if is_descriptor {
+                VariableSummary::Descriptor {
+                    name_len: 3,
+                    namespace_len: 1_048_576,
+                }
+            } else {
+                VariableSummary::Payload {
+                    user_len: 262_144,
+                    user_digest: blake3::hash(&expected[12..]),
+                }
+            };
+            assert_eq!(target_summary.summary, expected_summary);
+            recheck_value_witness(root, &manifest, &values, &mut probe).unwrap();
+            assert_eq!(probe.recheck_full_file_hashes, 1);
+            assert_eq!(
+                budget.remaining_bytes(),
+                segment_balance - values.retained_bytes
+            );
+            values.discard(root, budget).unwrap();
+            assert_eq!(budget.remaining_bytes(), segment_balance);
+            segments.discard(root, budget).unwrap();
+            assert_eq!(budget.remaining_bytes(), wal_balance);
+            assert_eq!(snapshot(dir.path()), before);
+        });
+        assert_eq!(snapshot(dir.path()), before);
+    }
+
+    #[test]
+    fn private_record_descriptor_value_file_witnesses_writer_megabyte_namespace() {
+        let encoded = descriptor_value();
+        assert_eq!(encoded.len(), 1024 * 1024 + 35);
+        assert_private_record_value_file_witness(
+            RecordKey::Descriptor(1),
+            encoded,
+            1024 * 1024 + 35,
+        );
+    }
+
+    #[test]
+    fn private_record_payload_value_file_witnesses_writer_quarter_megabyte() {
+        let encoded = payload_value();
+        assert_eq!(encoded.len(), 256 * 1024 + 12);
+        assert_private_record_value_file_witness(RecordKey::Payload(1), encoded, 256 * 1024 + 12);
+    }
+
+    #[test]
+    fn private_record_binding_resolves_writer_produced_80_bytes() {
+        assert_positive(RecordKey::Binding, None, 80);
+    }
+
+    #[test]
+    fn private_record_allocator_resolves_writer_produced_56_bytes() {
+        assert_positive(RecordKey::Allocator, None, 56);
+    }
+
+    #[test]
+    fn private_record_state_resolves_writer_produced_24_bytes() {
+        assert_positive(RecordKey::State(1), Some(state_value()), 24);
+    }
+
+    #[test]
+    fn private_record_fact_resolves_writer_produced_32_bytes() {
+        assert_positive(fact_key(), Some(fact_value()), 32);
+    }
+
+    #[test]
+    fn private_record_head_resolves_writer_produced_40_bytes() {
+        assert_positive(head_key(), Some(head_value()), 40);
+    }
+
+    #[test]
+    fn private_record_descriptor_resolves_writer_produced_megabyte_namespace() {
+        assert_positive(
+            RecordKey::Descriptor(1),
+            Some(descriptor_value()),
+            1024 * 1024 + 35,
+        );
+    }
+
+    #[test]
+    fn private_record_descriptor_streams_valid_utf8_across_chunk_boundary() {
+        let mut namespace = "x".repeat(64 * 1024 - 1);
+        namespace.push('é');
+        namespace.push('z');
+        let encoded = descriptor_with_namespace(&namespace);
+        assert_eq!(encoded.len(), namespace.len() + 35);
+        assert_positive(
+            RecordKey::Descriptor(1),
+            Some(encoded),
+            namespace.len() + 35,
+        );
+    }
+
+    #[test]
+    fn private_record_descriptor_streams_past_half_of_shared_budget() {
+        let namespace = "n".repeat(33 * 1024 * 1024);
+        let encoded = descriptor_with_namespace(&namespace);
+        assert_eq!(encoded.len(), namespace.len() + 35);
+        assert_positive(
+            RecordKey::Descriptor(1),
+            Some(encoded),
+            namespace.len() + 35,
+        );
+    }
+
+    #[test]
+    fn private_record_payload_resolves_writer_produced_stream_summary() {
+        assert_positive(
+            RecordKey::Payload(1),
+            Some(payload_value()),
+            256 * 1024 + 12,
+        );
+    }
+
+    #[test]
+    fn private_record_binding_rejects_81_byte_claim_before_io() {
+        assert_cap_plus_one(RecordKey::Binding, None, 80, 81);
+    }
+
+    #[test]
+    fn private_record_allocator_rejects_57_byte_claim_before_io() {
+        assert_cap_plus_one(RecordKey::Allocator, None, 56, 57);
+    }
+
+    #[test]
+    fn private_record_state_rejects_25_byte_claim_before_io() {
+        assert_cap_plus_one(RecordKey::State(1), Some(state_value()), 24, 25);
+    }
+
+    #[test]
+    fn private_record_fact_rejects_33_byte_claim_before_io() {
+        assert_cap_plus_one(fact_key(), Some(fact_value()), 32, 33);
+    }
+
+    #[test]
+    fn private_record_head_rejects_41_byte_claim_before_io() {
+        assert_cap_plus_one(head_key(), Some(head_value()), 40, 41);
+    }
+
+    #[test]
+    fn private_record_descriptor_rejects_broad_atomic_cap_plus_one_before_io() {
+        assert_cap_plus_one(
+            RecordKey::Descriptor(1),
+            Some(descriptor_value()),
+            1024 * 1024 + 35,
+            MAX_WAL_PAYLOAD_BYTES as u64 + 1,
+        );
+    }
+
+    #[test]
+    fn private_record_payload_rejects_broad_atomic_cap_plus_one_before_io() {
+        assert_cap_plus_one(
+            RecordKey::Payload(1),
+            Some(payload_value()),
+            256 * 1024 + 12,
+            MAX_WAL_PAYLOAD_BYTES as u64 + 1,
+        );
+    }
 }
