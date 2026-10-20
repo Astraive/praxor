@@ -3,12 +3,197 @@ use crate::core_catalog::codec::{Anchor, anchor_digest};
 use crate::core_catalog::physical_copy::{
     admit_protected_physical_copies, collect_protected_copy_ledger,
 };
+use crate::core_catalog::value_witness::validate_inline_catalog_schema_put;
 use crate::core_records::codec::{
     Decision as RecordDecision, Key as RecordKey, Role as RecordRole, Row as RecordRow,
 };
 use crate::segments::format::SEGMENT_FOOTER_MAGIC;
 
 const FIXED_ORACLE: &str = include_str!("../../../tests/fixtures/catalog_v4_wal_oracle.json");
+
+#[test]
+fn writer_inline_schema_syntax_is_checked_before_copy_admission_and_refunds() {
+    for malformed in [false, true] {
+        let (dir, config, lease) = flushed_create_fixture();
+        let root = lease.root();
+        let layout = DiskLayout::at(root);
+        let segment_path = layout.segment_path(0, 1);
+        let manifest_path = layout.manifest_path();
+        let original_manifest =
+            Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+        assert_eq!(original_manifest.flushed_sequence, 2);
+        assert_eq!(original_manifest.segments.len(), 1);
+        assert_eq!(original_manifest.segments[0].entries, 7);
+
+        let original_bytes = fs::read(&segment_path).unwrap();
+        assert_eq!(
+            original_manifest.segments[0].file_digest,
+            blake3::hash(&original_bytes).to_hex().to_string()
+        );
+        let original = decode_segment(&original_bytes, &segment_path, &CpuAccelerator).unwrap();
+        assert_eq!((original.level, original.id), (0, 1));
+        let schema_key = CatalogKey::Schema(CollectionId::new(2).unwrap())
+            .encode()
+            .unwrap();
+        let valid_schema = fixed_copy_oracle(
+            "create_tag7",
+            "catalog_schema_id_2",
+            CATALOG_CF,
+            &schema_key,
+            2,
+        );
+        assert_eq!(valid_schema.len(), 65);
+        assert!(matches!(
+            CatalogValue::decode(
+                &CatalogKey::Schema(CollectionId::new(2).unwrap()),
+                &valid_schema,
+                root,
+            )
+            .unwrap(),
+            CatalogValue::Schema(_)
+        ));
+
+        let mut rows = original
+            .blocks
+            .into_iter()
+            .flatten()
+            .map(|raw| raw.entry)
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 7);
+        let schema_rows = rows
+            .iter_mut()
+            .filter(|row| {
+                row.cf.0 == CATALOG_CF
+                    && row.key.as_ref() == schema_key.as_slice()
+                    && row.version.sequence == 2
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(schema_rows.len(), 1);
+        let schema_row = &mut *schema_rows.into_iter().next().unwrap();
+        let StoredValue::Put(schema_bytes) = &mut schema_row.version.value else {
+            panic!("writer fixture Schema@2 must be inline")
+        };
+        assert_eq!(schema_bytes.as_slice(), valid_schema.as_slice());
+        if malformed {
+            // The final byte is the second field's reserved byte. The writer
+            // rechecksums the segment, so only Schema syntax is invalid.
+            *schema_bytes.last_mut().unwrap() = 1;
+            assert!(matches!(
+                CatalogValue::decode(
+                    &CatalogKey::Schema(CollectionId::new(2).unwrap()),
+                    schema_bytes,
+                    root,
+                ),
+                Err(PraxisError::Corrupt { reason, .. })
+                    if reason == "nonzero catalog field reserved bytes"
+            ));
+        }
+        let expected_schema = schema_bytes.clone();
+        let expected_entry = schema_row.clone();
+        let manifest = rewrite_first_segment(
+            root,
+            rows,
+            Compression::None,
+            config.large_value_threshold,
+            config.block_size,
+        );
+        assert_eq!(manifest.segments.len(), 1);
+        assert_eq!(manifest.segments[0].entries, 7);
+        assert_eq!(manifest.flushed_sequence, 2);
+        assert_eq!(manifest.effective_config, config.persisted());
+        let written_bytes = fs::read(&segment_path).unwrap();
+        assert_eq!(
+            manifest.segments[0].file_digest,
+            blake3::hash(&written_bytes).to_hex().to_string()
+        );
+        let written = decode_segment(&written_bytes, &segment_path, &CpuAccelerator).unwrap();
+        assert_eq!((written.level, written.id), (0, 1));
+        let offsets = literal_block_offsets(&written_bytes, 0, 1, written.blocks.len());
+        let expected_location = exact_entry_location(&written, &offsets, &expected_entry);
+        let expected_id = physical_id(&File::open(&segment_path).unwrap(), &segment_path).unwrap();
+        let before = snapshot(dir.path());
+
+        with_wal_budget(root, &manifest, |budget| {
+            let mut observed = Vec::new();
+            let witnesses = visit_v4_segments(root, &manifest, budget, |row| {
+                observed.push(row);
+                Ok(())
+            })
+            .expect("bounded visitor must accept writer-produced Schema wire bytes");
+            assert_eq!(witnesses.len(), 1);
+            assert_eq!(
+                witnesses[0].source,
+                SegmentSource {
+                    level: 0,
+                    id: 1,
+                    manifest_ordinal: 0,
+                }
+            );
+            assert_eq!(witnesses[0].path, segment_path);
+            assert_eq!(witnesses[0].len, written_bytes.len() as u64);
+            assert_eq!(witnesses[0].digest, blake3::hash(&written_bytes));
+            assert_eq!(witnesses[0].identity, expected_id);
+            assert_eq!(witnesses[0].observed_rows, 7);
+            let staged_schema = observed
+                .iter()
+                .filter(|row| row.cf == CATALOG_CF && row.key == schema_key && row.sequence == 2)
+                .collect::<Vec<_>>();
+            assert_eq!(staged_schema.len(), 1);
+            let staged_schema = staged_schema[0];
+            assert_eq!(
+                (staged_schema.block_offset, staged_schema.row_ordinal),
+                expected_location
+            );
+            assert_eq!(
+                staged_schema.classification,
+                PhysicalRowClass::BoundProtected(ProtectedRole::Catalog)
+            );
+            assert_eq!(
+                staged_schema.value,
+                ObservedSegmentValue::Put(expected_schema.clone())
+            );
+            assert_eq!(snapshot(dir.path()), before);
+
+            let balance = budget.remaining_bytes();
+            let direct_syntax = validate_inline_catalog_schema_put(root, staged_schema, budget);
+            if malformed {
+                assert!(matches!(
+                    direct_syntax,
+                    Err(PraxisError::Corrupt { reason, .. })
+                        if reason == "nonzero catalog field reserved bytes"
+                ));
+            } else {
+                direct_syntax.expect("valid inline Schema must pass charged syntax validation");
+            }
+            assert_eq!(budget.remaining_bytes(), balance);
+
+            let result = collect_protected_copy_ledger(root, &manifest, budget);
+            if malformed {
+                assert!(
+                    matches!(
+                        result,
+                        Err(PraxisError::Corrupt { reason, .. })
+                            if reason == "nonzero catalog field reserved bytes"
+                    ),
+                    "malformed inline Schema must be Corrupt before pending admission"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(PraxisError::UnsupportedCatalogFeature {
+                            feature: "protected physical-copy bytes await authenticated replay"
+                        })
+                    ),
+                    "valid inline Schema must reach only the pending private gate"
+                );
+            }
+            assert_eq!(budget.remaining_bytes(), balance);
+            assert_eq!(snapshot(dir.path()), before);
+        });
+        assert_eq!(snapshot(dir.path()), before);
+    }
+}
 
 fn oracle_bytes(hex: &str) -> Vec<u8> {
     let (pairs, remainder) = hex.as_bytes().as_chunks::<2>();
