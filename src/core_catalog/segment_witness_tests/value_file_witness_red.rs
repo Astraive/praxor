@@ -822,6 +822,119 @@ fn private_value_recheck_rejects_second_file_replacement_or_referenced_mutation(
 }
 
 #[test]
+fn private_value_inventory_rejects_forged_head_claims_before_any_reservation_or_scan() {
+    #[derive(Clone, Copy, Debug)]
+    enum Forgery {
+        AtomicLength,
+        OverflowingOffset,
+    }
+
+    for forgery in [Forgery::AtomicLength, Forgery::OverflowingOffset] {
+        let (dir, lease, _, schema_key, _, second_pointer, config) =
+            writer_two_file_catalog_external_fixture();
+        let root = lease.root();
+        let layout = DiskLayout::at(root);
+        let segment_path = layout.segment_path(0, 1);
+        let first_path = layout.value_log_path(1);
+        let second_path = layout.value_log_path(2);
+        let first_bytes = fs::read(&first_path).unwrap();
+        let second_bytes = fs::read(&second_path).unwrap();
+        assert!(first_bytes.len() < 1024 * 1024);
+        assert!(second_bytes.len() < 1024 * 1024);
+
+        let mut decoded = decode_segment(
+            &fs::read(&segment_path).unwrap(),
+            &segment_path,
+            &CpuAccelerator,
+        )
+        .unwrap();
+        let head = decoded
+            .blocks
+            .iter_mut()
+            .flatten()
+            .find(|raw| raw.entry.cf.0 == CATALOG_CF && raw.entry.key.as_ref() == &[0_u8][..])
+            .expect("the writer must emit a Head row");
+        let StoredValue::BlobPointer(pointer) = &mut head.entry.version.value else {
+            panic!("the writer must externalize Head")
+        };
+        assert_eq!(pointer.path, first_path.to_str().unwrap());
+        assert_eq!(pointer.len, 48);
+        let original_checksum = pointer.checksum;
+        let (expected_offset, expected_len, expected_path, expected_reason) = match forgery {
+            Forgery::AtomicLength => {
+                pointer.len = MAX_WAL_PAYLOAD_BYTES as u64;
+                (
+                    pointer.offset,
+                    pointer.len,
+                    root,
+                    "external catalog pointer exceeds its key cap",
+                )
+            }
+            Forgery::OverflowingOffset => {
+                pointer.offset = u64::MAX - 5;
+                (
+                    pointer.offset,
+                    pointer.len,
+                    first_path.as_path(),
+                    "external value extent overflows",
+                )
+            }
+        };
+        assert_eq!(pointer.checksum, original_checksum);
+        let rechecksummed = decoded.encode(&CpuAccelerator).unwrap();
+        let manifest = replace_first_segment_bytes(root, &rechecksummed);
+        assert_eq!(
+            manifest.segments[0].file_digest,
+            blake3::hash(&rechecksummed).to_hex().to_string()
+        );
+        assert_eq!(fs::read(&first_path).unwrap(), first_bytes);
+        assert_eq!(fs::read(&second_path).unwrap(), second_bytes);
+        assert_two_file_owner_remains_fenced(&dir, &lease, &config);
+        let before = snapshot(dir.path());
+
+        with_wal_budget(root, &manifest, |budget| {
+            let wal_balance = budget.remaining_bytes();
+            let segments = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+            let segment_balance = budget.remaining_bytes();
+            assert!(segment_balance < wal_balance);
+            let head = catalog_pointer(&segments.rows, &[0]);
+            assert_eq!(head.path, first_path.to_str().unwrap());
+            assert_eq!((head.offset, head.len), (expected_offset, expected_len));
+            assert_eq!(head.checksum, original_checksum);
+            assert_eq!(
+                catalog_pointer(&segments.rows, &schema_key),
+                &second_pointer
+            );
+
+            // If metadata is reserved before the key cap and checked extent,
+            // this exhausted shared WAL + segment ledger changes the error.
+            let held = budget.remaining_bytes();
+            assert!(held > 0);
+            budget.charge(root, held).unwrap();
+            assert_eq!(budget.remaining_bytes(), 0);
+            let mut probe = ValueFileScanProbeRed::default();
+            let error =
+                collect_value_witness_red(root, &manifest, &segments.rows, budget, &mut probe)
+                    .unwrap_err();
+            assert!(
+                matches!(&error, PraxisError::Corrupt { path, reason }
+                    if path.as_path() == expected_path && reason == expected_reason),
+                "{forgery:?} failed outside the private pre-I/O pointer check: {error}"
+            );
+            assert_eq!(probe.proof_full_file_hashes, 0);
+            assert_eq!(probe.recheck_full_file_hashes, 0);
+            assert_eq!(budget.remaining_bytes(), 0);
+            budget.release(root, held).unwrap();
+            assert_eq!(budget.remaining_bytes(), segment_balance);
+            segments.discard(root, budget).unwrap();
+            assert_eq!(budget.remaining_bytes(), wal_balance);
+            assert_eq!(snapshot(dir.path()), before);
+        });
+        assert_eq!(snapshot(dir.path()), before);
+    }
+}
+
+#[test]
 fn private_value_file_rejects_normalized_path_aliases_before_scanning() {
     let (dir, lease, manifest, _, _) =
         writer_catalog_external_fixture(CatalogKey::Name("accounts"), None, 12);
