@@ -8,10 +8,12 @@ use crate::core_records::codec::{Key as RecordKey, Role as RecordRole, Row as Re
 enum InvalidVariableSequence {
     DescriptorAfterBootstrap,
     PayloadBeforeCreate,
+    PayloadDeleteBeforeCreate,
+    PayloadPointerBeforeCreate,
 }
 
 fn malformed_variable_sequence_case(case: InvalidVariableSequence) {
-    let (dir, config, lease) = flushed_create_fixture();
+    let (dir, mut config, lease) = flushed_create_fixture();
     let root = lease.root();
     let layout = DiskLayout::at(root);
     let path = layout.segment_path(0, 1);
@@ -77,44 +79,100 @@ fn malformed_variable_sequence_case(case: InvalidVariableSequence) {
         1,
         StoredValue::Put(descriptor_value.clone()),
     ));
-    let (role, key, value, sequence, expected_reason) = match case {
+    let (role, key, value, sequence, expected_reason, external_payload) = match case {
         InvalidVariableSequence::DescriptorAfterBootstrap => (
             RecordRole::Meta,
             RecordKey::Descriptor(1),
-            descriptor_value.clone(),
+            StoredValue::Put(descriptor_value.clone()),
             2,
             "record Descriptor copy is outside bootstrap sequence",
+            false,
         ),
         InvalidVariableSequence::PayloadBeforeCreate => (
             RecordRole::Payload,
             RecordKey::Payload(1),
-            RecordRow::Payload(b"p").encode().unwrap(),
+            StoredValue::Put(RecordRow::Payload(b"p").encode().unwrap()),
             1,
             "record Payload Put copy is before Create sequence",
+            false,
+        ),
+        InvalidVariableSequence::PayloadDeleteBeforeCreate => (
+            RecordRole::Payload,
+            RecordKey::Payload(1),
+            // A canonical DeleteRecords frame can tombstone only an RID that
+            // was allocated by an earlier Create; S=1 is the bootstrap.
+            StoredValue::Delete,
+            1,
+            "record Payload Delete copy is before Create sequence",
+            false,
+        ),
+        InvalidVariableSequence::PayloadPointerBeforeCreate => (
+            RecordRole::Payload,
+            RecordKey::Payload(1),
+            StoredValue::Put(RecordRow::Payload(&[0x5a; 256]).encode().unwrap()),
+            1,
+            "record Payload Put copy is before Create sequence",
+            true,
         ),
     };
     let key_bytes = key.encode().unwrap();
     assert_eq!(RecordKey::decode(role, &key_bytes, root).unwrap(), key);
-    assert_eq!(
-        RecordRow::decode(&key, &value, root)
-            .unwrap()
-            .encode()
-            .unwrap(),
-        value
-    );
-    rows.push(row_in(
-        role.cf(),
-        &key_bytes,
-        sequence,
-        StoredValue::Put(value.clone()),
-    ));
-    let manifest = rewrite_first_segment(
-        root,
-        rows,
-        Compression::None,
-        config.large_value_threshold,
-        config.block_size,
-    );
+    if let StoredValue::Put(bytes) = &value {
+        assert_eq!(
+            RecordRow::decode(&key, bytes, root)
+                .unwrap()
+                .encode()
+                .unwrap(),
+            *bytes
+        );
+    }
+    rows.push(row_in(role.cf(), &key_bytes, sequence, value.clone()));
+    let manifest = if external_payload {
+        // Preserve the bootstrap rows inline while making the new S=1 Payload
+        // a genuine writer-produced pointer into a retained value file.
+        config.large_value_threshold = 255;
+        config.validate().unwrap();
+        let value_path = layout.value_log_path(1);
+        let mut value_log = ValueLog::open(&value_path).unwrap();
+        let first = SegmentWriter::write(
+            SegmentWriteOptions {
+                path: &path,
+                id: 1,
+                level: 0,
+                compression: Compression::None,
+                accelerator: &CpuAccelerator,
+                value_log: &mut value_log,
+                large_value_threshold: config.large_value_threshold,
+                block_size: config.block_size,
+                partitioned_bloom: None,
+                direct_io: false,
+            },
+            rows,
+        )
+        .unwrap();
+        drop(value_log);
+        let mut manifest =
+            Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+        manifest.effective_config = config.persisted();
+        for family in &mut manifest.column_families {
+            if family.name == CATALOG_CF || family.name.starts_with("__praxor_record_") {
+                family.large_value_threshold_bytes = config.large_value_threshold;
+            }
+        }
+        manifest.segments[0] = first;
+        ManifestStore::new(manifest_path.clone())
+            .save(&manifest)
+            .unwrap();
+        Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap()
+    } else {
+        rewrite_first_segment(
+            root,
+            rows,
+            Compression::None,
+            config.large_value_threshold,
+            config.block_size,
+        )
+    };
     manifest.validate_v4(root).unwrap();
     assert_eq!(manifest.flushed_sequence, 2);
     assert_eq!(manifest.segments.len(), 1);
@@ -180,10 +238,59 @@ fn malformed_variable_sequence_case(case: InvalidVariableSequence) {
         .collect::<Vec<_>>();
     assert_eq!(matching.len(), 1);
     assert_eq!(matching[0].entry.version.sequence, sequence);
-    assert_eq!(
-        matching[0].entry.version.value,
-        StoredValue::Put(value.clone())
-    );
+    assert_eq!(matching[0].blob_expiry, None);
+    let written_value = matching[0].entry.version.value.clone();
+    let external_value_identity = if external_payload {
+        let StoredValue::Put(bytes) = &value else {
+            unreachable!("the external fixture starts with an encoded Payload Put")
+        };
+        let StoredValue::BlobPointer(pointer) = &written_value else {
+            panic!("the segment writer must externalize the S=1 Payload")
+        };
+        let value_path = layout.value_log_path(1);
+        let value_file = fs::read(&value_path).unwrap();
+        assert_eq!(pointer.path, value_path.to_str().unwrap());
+        assert_eq!(pointer.offset, 0);
+        assert_eq!(pointer.len, bytes.len() as u64);
+        assert_eq!(pointer.checksum, crc32c(bytes));
+        assert_eq!(value_file.len(), 12 + bytes.len());
+        assert_eq!(
+            u64::from_le_bytes(value_file[..8].try_into().unwrap()),
+            pointer.len
+        );
+        assert_eq!(
+            u32::from_le_bytes(value_file[8..12].try_into().unwrap()),
+            pointer.checksum
+        );
+        assert_eq!(&value_file[12..], bytes.as_slice());
+        let value_file_handle = File::open(&value_path).unwrap();
+        Some(physical_id(&value_file_handle, &value_path).unwrap())
+    } else {
+        assert_eq!(written_value, value);
+        None
+    };
+    assert_eq!(decoded.blocks.len(), 1);
+    assert_eq!(decoded.blocks[0].len(), 9);
+    let target_ordinal = u32::try_from(
+        decoded.blocks[0]
+            .iter()
+            .position(|raw| {
+                raw.entry.cf.0 == role.cf()
+                    && raw.entry.key.as_ref() == key_bytes
+                    && raw.entry.version.sequence == sequence
+            })
+            .unwrap(),
+    )
+    .unwrap();
+    let expected_observed = match &written_value {
+        StoredValue::Put(bytes) => ObservedSegmentValue::Put(bytes.clone()),
+        StoredValue::Delete => ObservedSegmentValue::Delete,
+        StoredValue::BlobPointer(pointer) => ObservedSegmentValue::Pointer {
+            pointer: pointer.clone(),
+            expires_at_ms: None,
+        },
+        _ => unreachable!("the fixture writes only Put, Delete, or external Put"),
+    };
     let before = snapshot(dir.path());
     assert!(matches!(
         inspect_v4_owner(&lease, &config, &CpuAccelerator),
@@ -199,6 +306,15 @@ fn malformed_variable_sequence_case(case: InvalidVariableSequence) {
             .expect("writer-encoded row must reach the private variable shape guard");
         assert_eq!(staged.witnesses.len(), 1);
         assert_eq!(staged.rows.len(), 9);
+        let segment_file = File::open(&path).unwrap();
+        assert_eq!(staged.witnesses[0].path, path);
+        assert_eq!(
+            staged.witnesses[0].identity,
+            physical_id(&segment_file, &path).unwrap()
+        );
+        assert_eq!(staged.witnesses[0].len, written.len() as u64);
+        assert_eq!(staged.witnesses[0].digest, blake3::hash(&written));
+        assert_eq!(staged.witnesses[0].observed_rows, 9);
         assert_eq!(
             staged
                 .rows
@@ -230,7 +346,9 @@ fn malformed_variable_sequence_case(case: InvalidVariableSequence) {
             })
         );
         assert_eq!(matching[0].source, staged.witnesses[0].source);
-        assert_eq!(matching[0].value, ObservedSegmentValue::Put(value));
+        assert_eq!(matching[0].block_offset, 21);
+        assert_eq!(matching[0].row_ordinal, target_ordinal);
+        assert_eq!(matching[0].value, expected_observed);
         staged.discard(root, budget).unwrap();
         assert_eq!(budget.remaining_bytes(), balance);
 
@@ -287,6 +405,14 @@ fn malformed_variable_sequence_case(case: InvalidVariableSequence) {
         );
     });
     assert_eq!(snapshot(dir.path()), before);
+    if let Some(identity) = external_value_identity {
+        let value_path = layout.value_log_path(1);
+        assert_eq!(
+            physical_id(&File::open(&value_path).unwrap(), &value_path).unwrap(),
+            identity,
+            "the external value file identity must survive both collectors"
+        );
+    }
 }
 
 #[test]
@@ -297,4 +423,14 @@ fn rechecksummed_record_descriptor_after_bootstrap_refuses_before_copy_replay() 
 #[test]
 fn rechecksummed_record_payload_before_create_refuses_before_copy_replay() {
     malformed_variable_sequence_case(InvalidVariableSequence::PayloadBeforeCreate);
+}
+
+#[test]
+fn rechecksummed_record_payload_delete_before_create_refuses_before_copy_replay() {
+    malformed_variable_sequence_case(InvalidVariableSequence::PayloadDeleteBeforeCreate);
+}
+
+#[test]
+fn writer_external_record_payload_before_create_refuses_before_copy_replay() {
+    malformed_variable_sequence_case(InvalidVariableSequence::PayloadPointerBeforeCreate);
 }
