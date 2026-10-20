@@ -7,38 +7,281 @@ on:
   schedule:
     - cron: "0 3 * * 1"
 
+permissions:
+  contents: read
+
+env:
+  CARGO_BUILD_JOBS: "2"
+  PYTHONDONTWRITEBYTECODE: "1"
+
 jobs:
   storage-kernel:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      P80_SOFT_JOB_MINUTES: "100"
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Record pre-gate Linux setup
+        run: |
+          set -Ee -o pipefail
+          root="$RUNNER_TEMP/p80-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$root/logs"
+          started="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          printf '{"event":"start","utc":"%s"}\n' "$started" > "$root/logs/setup-pretoolchain.start.json"
+          failed_line=0
+          trap 'failed_line=$LINENO; printf "line=%s\ncommand=%q\n" "$LINENO" "$BASH_COMMAND" > "$root/logs/setup-pretoolchain.error.txt"' ERR
+          setup_exit() {
+            status=$?
+            trap - EXIT
+            state=passed
+            error=none
+            if [ "$status" -ne 0 ]; then state=failed; error=pre_gate_setup_failed; fi
+            printf '{"event":"exit","utc":"%s","exit_code":%d,"state":"%s","failure_line":%d,"error":"%s"}\n' \
+              "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$status" "$state" "$failed_line" "$error" \
+              > "$root/logs/setup-pretoolchain.exit.json"
+            exit "$status"
+          }
+          trap setup_exit EXIT
+          printf 'setup_started_utc=%s\nrunner_image=%s/%s\n' "$started" "$ImageOS" "$ImageVersion" \
+            > "$root/logs/setup-pretoolchain.raw.log"
+          setup_probe_failed=0
+          run_setup_probe() {
+            local name="$1" output rc
+            shift
+            if output="$("$@" 2>&1)"; then
+              printf '%s=%s\n%s_probe_status=ok\n' "$name" "$output" "$name"
+            else
+              rc=$?
+              printf '%s_probe_status=error\n%s_probe_exit_code=%d\n%s_probe_error=%q\n' \
+                "$name" "$name" "$rc" "$name" "$output"
+              setup_probe_failed=1
+            fi
+          }
+          {
+            run_setup_probe disk df -B1 "$RUNNER_TEMP"
+            run_setup_probe memory free -b
+            run_setup_probe head git rev-parse HEAD
+            run_setup_probe tree git rev-parse HEAD^{tree}
+            run_setup_probe status git status --porcelain --untracked-files=all
+            run_setup_probe ignored_untracked git ls-files --others --ignored --exclude-standard
+          } >> "$root/logs/setup-pretoolchain.raw.log" 2>&1
+          if [ "$setup_probe_failed" -ne 0 ]; then
+            printf 'required_probe_failure=1\n' >> "$root/logs/setup-pretoolchain.raw.log"
+            false
+          fi
+          echo "P80_SETUP_START_UTC=$started" 2>> "$root/logs/setup-pretoolchain.raw.log" >> "$GITHUB_ENV"
+          cp -- Cargo.lock "$root/logs/setup-pretoolchain.Cargo.lock.raw" >> "$root/logs/setup-pretoolchain.raw.log" 2>&1
+          cmp -s Cargo.lock "$root/logs/setup-pretoolchain.Cargo.lock.raw" >> "$root/logs/setup-pretoolchain.raw.log" 2>&1
+          {
+            printf 'cargo_lock_sha256='; sha256sum Cargo.lock
+            printf 'cargo_lock_raw_snapshot_sha256='; sha256sum "$root/logs/setup-pretoolchain.Cargo.lock.raw"
+            printf 'cargo_lock_raw_snapshot_bytes='; wc -c < "$root/logs/setup-pretoolchain.Cargo.lock.raw"
+          } >> "$root/logs/setup-pretoolchain.raw.log" 2>&1
+      - name: Assert frozen source
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          git rev-parse HEAD^{tree}
+          test -z "$(git status --porcelain)"
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-      - name: Format
-        run: cargo fmt --check
+      - name: Frozen-head native Linux catalog platform gate
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python scripts/ci_catalog_platform_gate.py --platform linux
 
-      - name: Check tests and benches
-        run: cargo check --locked --benches --tests
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: catalog-linux-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/p80-${{ github.run_id }}-${{ github.run_attempt }}/logs/
+          if-no-files-found: error
 
-      - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
-
-      - name: Test
-        run: cargo test --locked --all
-
-      - name: Storage slog gate
+  catalog-platform-windows:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-2025
+    timeout-minutes: 90
+    env:
+      P80_SOFT_JOB_MINUTES: "70"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Record pre-gate Windows setup
         shell: pwsh
-        run: ./scripts/verify_slog_storage.ps1
-
-      - name: Storage boundary gate
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP "p80-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $logs = Join-Path $root 'logs'
+          New-Item -ItemType Directory -Force -Path $logs -ErrorAction Stop | Out-Null
+          $started = (Get-Date).ToUniversalTime().ToString('o')
+          [ordered]@{ event = 'start'; utc = $started } |
+            ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $logs 'setup-pretoolchain.start.json') -Encoding utf8
+          $setup = [ordered]@{
+            setup_started_utc = $started
+            runner_image = "$env:ImageOS/$env:ImageVersion"
+            state = 'started'
+            failed_probe = $null
+            error = $null
+            head = $null
+            tree = $null
+            status = $null
+            ignored_untracked = $null
+            disk_free_bytes = $null
+            ram_available_bytes = $null
+            probe_status = [ordered]@{
+              drive = 'pending'
+              memory = 'pending'
+              git_head = 'pending'
+              git_tree = 'pending'
+              git_status = 'pending'
+              git_ignored_untracked = 'pending'
+            }
+            probe_errors = [ordered]@{}
+          }
+          $setup | ConvertTo-Json -Depth 5 -Compress | Set-Content -LiteralPath (Join-Path $logs 'setup-pretoolchain.json') -Encoding utf8
+          $exitCode = 1
+          $setupError = $null
+          $currentProbe = 'drive'
+          $failedProbes = [System.Collections.Generic.List[string]]::new()
+          function Save-Pretoolchain {
+            $setup | ConvertTo-Json -Depth 5 -Compress |
+              Set-Content -LiteralPath (Join-Path $logs 'setup-pretoolchain.json') -Encoding utf8
+          }
+          function Invoke-PretoolchainProbe {
+            param([string]$Name, [scriptblock]$Action)
+            $script:currentProbe = $Name
+            try {
+              & $Action
+              $setup['probe_status'][$Name] = 'ok'
+            } catch {
+              $setup['probe_status'][$Name] = 'error'
+              $setup['probe_errors'][$Name] = $_.Exception.Message
+              $failedProbes.Add($Name)
+            }
+            Save-Pretoolchain
+          }
+          try {
+            Invoke-PretoolchainProbe 'drive' {
+              $drive = [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($root))
+              $setup['disk_free_bytes'] = [int64]$drive.AvailableFreeSpace
+            }
+            Invoke-PretoolchainProbe 'memory' {
+              $memory = Get-CimInstance Win32_OperatingSystem
+              if ($null -eq $memory -or $null -eq $memory.FreePhysicalMemory) { throw 'Win32_OperatingSystem memory probe unavailable' }
+              $setup['ram_available_bytes'] = [int64]$memory.FreePhysicalMemory * 1024
+            }
+            Invoke-PretoolchainProbe 'git_head' {
+              $head = git rev-parse HEAD
+              if ($LASTEXITCODE -ne 0) { throw 'git rev-parse HEAD failed during preflight' }
+              $setup['head'] = $head.Trim()
+            }
+            Invoke-PretoolchainProbe 'git_tree' {
+              $tree = git rev-parse 'HEAD^{tree}'
+              if ($LASTEXITCODE -ne 0) { throw 'git rev-parse tree failed during preflight' }
+              $setup['tree'] = $tree.Trim()
+            }
+            Invoke-PretoolchainProbe 'git_status' {
+              $status = @(git status --porcelain --untracked-files=all)
+              if ($LASTEXITCODE -ne 0) { throw 'git status failed during preflight' }
+              $setup['status'] = $status
+            }
+            Invoke-PretoolchainProbe 'git_ignored_untracked' {
+              $ignoredUntracked = @(git ls-files --others --ignored --exclude-standard)
+              if ($LASTEXITCODE -ne 0) { throw 'git ls-files failed during preflight' }
+              $setup['ignored_untracked'] = $ignoredUntracked
+            }
+            if ($failedProbes.Count -gt 0) {
+              $setup['state'] = 'failed'
+              $setup['failed_probe'] = $failedProbes[0]
+              $setup['error'] = "required probes failed: $($failedProbes -join ', ')"
+              Save-Pretoolchain
+              throw $setup['error']
+            }
+            $setup['state'] = 'pre-copy'
+            Save-Pretoolchain
+            $currentProbe = 'github_env'
+            "P80_SETUP_START_UTC=$started" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            $currentProbe = 'cargo_lock_copy'
+            $rawLock = Join-Path $logs 'setup-pretoolchain.Cargo.lock.raw'
+            Copy-Item -LiteralPath Cargo.lock -Destination $rawLock -ErrorAction Stop
+            $currentProbe = 'cargo_lock_hash'
+            $sourceHash = (Get-FileHash -LiteralPath Cargo.lock -Algorithm SHA256).Hash
+            $snapshotHash = (Get-FileHash -LiteralPath $rawLock -Algorithm SHA256).Hash
+            if ($sourceHash -ne $snapshotHash) { throw 'Cargo.lock changed during pretoolchain snapshot' }
+            $setup['cargo_lock_sha256'] = $sourceHash
+            $setup['cargo_lock_raw_snapshot_sha256'] = $snapshotHash
+            $setup['cargo_lock_raw_snapshot_bytes'] = (Get-Item -LiteralPath $rawLock).Length
+            $setup['cargo_lock_raw_snapshot_path'] = $rawLock
+            $setup['state'] = 'complete'
+            $currentProbe = 'final_receipt'
+            Save-Pretoolchain
+            $exitCode = 0
+          } catch {
+            $setupError = $_.Exception.Message
+            $setup['state'] = 'failed'
+            if ($null -eq $setup['failed_probe']) { $setup['failed_probe'] = $currentProbe }
+            $setup['error'] = $setupError
+            try {
+              Save-Pretoolchain
+            } catch {
+              # Keep the original failure; the start and exit receipts remain available.
+            }
+            throw
+          } finally {
+            $state = 'failed'
+            if ($exitCode -eq 0) { $state = 'passed' }
+            [ordered]@{
+              event = 'exit'
+              utc = (Get-Date).ToUniversalTime().ToString('o')
+              exit_code = $exitCode
+              state = $state
+              error = $setupError
+            } | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $logs 'setup-pretoolchain.exit.json') -Encoding utf8
+          }
+      - name: Assert frozen source
         shell: pwsh
-        run: ./scripts/verify_storage_boundary.ps1
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if ((git rev-parse HEAD).Trim() -ne $env:EXPECTED_HEAD) { throw 'Checkout differs from event head' }
+          git rev-parse 'HEAD^{tree}'
+          if (git status --porcelain) { throw 'Checkout has changes' }
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Frozen-head Windows catalog platform gate
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python scripts/ci_catalog_platform_gate.py --platform windows
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: catalog-windows-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/p80-${{ github.run_id }}-${{ github.run_attempt }}/logs/
+          if-no-files-found: error
 
   feature-matrix:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      P80_SOFT_JOB_MINUTES: "70"
     strategy:
       fail-fast: false
       matrix:
@@ -50,42 +293,254 @@ jobs:
           - gpu-cuda,gpu-vulkan,gpu-metal,gpu-wgpu
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Record pre-gate feature setup
+        env:
+          FEATURE_SET: ${{ matrix.features }}
+        run: |
+          set -Ee -o pipefail
+          root="$RUNNER_TEMP/p80-feature-$FEATURE_SET-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$root/logs"
+          started="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          printf '{"event":"start","utc":"%s"}\n' "$started" > "$root/logs/setup-pretoolchain.start.json"
+          failed_line=0
+          trap 'failed_line=$LINENO; printf "line=%s\ncommand=%q\n" "$LINENO" "$BASH_COMMAND" > "$root/logs/setup-pretoolchain.error.txt"' ERR
+          setup_exit() {
+            status=$?
+            trap - EXIT
+            state=passed
+            error=none
+            if [ "$status" -ne 0 ]; then state=failed; error=pre_gate_setup_failed; fi
+            printf '{"event":"exit","utc":"%s","exit_code":%d,"state":"%s","failure_line":%d,"error":"%s"}\n' \
+              "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$status" "$state" "$failed_line" "$error" \
+              > "$root/logs/setup-pretoolchain.exit.json"
+            exit "$status"
+          }
+          trap setup_exit EXIT
+          setup_probe_failed=0
+          run_setup_probe() {
+            local name="$1" output rc
+            shift
+            if output="$("$@" 2>&1)"; then
+              printf '%s=%s\n%s_probe_status=ok\n' "$name" "$output" "$name"
+            else
+              rc=$?
+              printf '%s_probe_status=error\n%s_probe_exit_code=%d\n%s_probe_error=%q\n' \
+                "$name" "$name" "$rc" "$name" "$output"
+              setup_probe_failed=1
+            fi
+          }
+          {
+            printf 'setup_started_utc=%s\n' "$started"
+            printf 'runner_image=%s/%s\n' "$ImageOS" "$ImageVersion"
+            run_setup_probe disk df -B1 "$RUNNER_TEMP"
+            run_setup_probe memory free -b
+            run_setup_probe head git rev-parse HEAD
+            run_setup_probe tree git rev-parse HEAD^{tree}
+            run_setup_probe status git status --porcelain --untracked-files=all
+            run_setup_probe ignored_untracked git ls-files --others --ignored --exclude-standard
+          } > "$root/logs/setup-pretoolchain.raw.log" 2>&1
+          if [ "$setup_probe_failed" -ne 0 ]; then
+            printf 'required_probe_failure=1\n' >> "$root/logs/setup-pretoolchain.raw.log"
+            false
+          fi
+          mkdir -p "$root/target" "$root/fixtures" >> "$root/logs/setup-pretoolchain.raw.log" 2>&1
+          printf 'declared_target=%s\ndeclared_fixtures=%s\n' "$root/target" "$root/fixtures" >> "$root/logs/setup-pretoolchain.raw.log"
+          echo "CARGO_TARGET_DIR=$root/target" 2>> "$root/logs/setup-pretoolchain.raw.log" >> "$GITHUB_ENV"
+          echo "PRAXOR_TEST_TMP_ROOT=$root/fixtures" 2>> "$root/logs/setup-pretoolchain.raw.log" >> "$GITHUB_ENV"
+          echo "P80_SETUP_START_UTC=$started" 2>> "$root/logs/setup-pretoolchain.raw.log" >> "$GITHUB_ENV"
+          cp -- Cargo.lock "$root/logs/setup-pretoolchain.Cargo.lock.raw" >> "$root/logs/setup-pretoolchain.raw.log" 2>&1
+          cmp -s Cargo.lock "$root/logs/setup-pretoolchain.Cargo.lock.raw" >> "$root/logs/setup-pretoolchain.raw.log" 2>&1
+          {
+            printf 'cargo_lock_sha256='; sha256sum Cargo.lock
+            printf 'cargo_lock_raw_snapshot_sha256='; sha256sum "$root/logs/setup-pretoolchain.Cargo.lock.raw"
+            printf 'cargo_lock_raw_snapshot_bytes='; wc -c < "$root/logs/setup-pretoolchain.Cargo.lock.raw"
+          } >> "$root/logs/setup-pretoolchain.raw.log" 2>&1
+      - name: Assert frozen source
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          git rev-parse HEAD^{tree}
+          test -z "$(git status --porcelain)"
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-      - name: Check GPU fallback feature set
-        run: cargo check --locked --benches --tests --features "${{ matrix.features }}"
+      - name: Frozen-head feature command receipts
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          PRAXOR_CI_FEATURES: ${{ matrix.features }}
+        run: python scripts/ci_catalog_aux_gate.py --kind feature
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: feature-receipts-${{ matrix.features }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/p80-feature-${{ matrix.features }}-${{ github.run_id }}-${{ github.run_attempt }}/logs/
+          if-no-files-found: error
 
   benchmark-smoke:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      P80_SOFT_JOB_MINUTES: "70"
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Record pre-gate benchmark setup
+        run: |
+          set -Ee -o pipefail
+          root="$RUNNER_TEMP/p80-bench-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$root/logs"
+          started="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          printf '{"event":"start","utc":"%s"}\n' "$started" > "$root/logs/setup-pretoolchain.start.json"
+          failed_line=0
+          trap 'failed_line=$LINENO; printf "line=%s\ncommand=%q\n" "$LINENO" "$BASH_COMMAND" > "$root/logs/setup-pretoolchain.error.txt"' ERR
+          setup_exit() {
+            status=$?
+            trap - EXIT
+            state=passed
+            error=none
+            if [ "$status" -ne 0 ]; then state=failed; error=pre_gate_setup_failed; fi
+            printf '{"event":"exit","utc":"%s","exit_code":%d,"state":"%s","failure_line":%d,"error":"%s"}\n' \
+              "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$status" "$state" "$failed_line" "$error" \
+              > "$root/logs/setup-pretoolchain.exit.json"
+            exit "$status"
+          }
+          trap setup_exit EXIT
+          setup_probe_failed=0
+          run_setup_probe() {
+            local name="$1" output rc
+            shift
+            if output="$("$@" 2>&1)"; then
+              printf '%s=%s\n%s_probe_status=ok\n' "$name" "$output" "$name"
+            else
+              rc=$?
+              printf '%s_probe_status=error\n%s_probe_exit_code=%d\n%s_probe_error=%q\n' \
+                "$name" "$name" "$rc" "$name" "$output"
+              setup_probe_failed=1
+            fi
+          }
+          {
+            printf 'setup_started_utc=%s\n' "$started"
+            printf 'runner_image=%s/%s\n' "$ImageOS" "$ImageVersion"
+            run_setup_probe disk df -B1 "$RUNNER_TEMP"
+            run_setup_probe memory free -b
+            run_setup_probe head git rev-parse HEAD
+            run_setup_probe tree git rev-parse HEAD^{tree}
+            run_setup_probe status git status --porcelain --untracked-files=all
+            run_setup_probe ignored_untracked git ls-files --others --ignored --exclude-standard
+          } > "$root/logs/setup-pretoolchain.raw.log" 2>&1
+          if [ "$setup_probe_failed" -ne 0 ]; then
+            printf 'required_probe_failure=1\n' >> "$root/logs/setup-pretoolchain.raw.log"
+            false
+          fi
+          mkdir -p "$root/target" "$root/fixtures" >> "$root/logs/setup-pretoolchain.raw.log" 2>&1
+          printf 'declared_target=%s\ndeclared_fixtures=%s\n' "$root/target" "$root/fixtures" >> "$root/logs/setup-pretoolchain.raw.log"
+          echo "CARGO_TARGET_DIR=$root/target" 2>> "$root/logs/setup-pretoolchain.raw.log" >> "$GITHUB_ENV"
+          echo "PRAXOR_TEST_TMP_ROOT=$root/fixtures" 2>> "$root/logs/setup-pretoolchain.raw.log" >> "$GITHUB_ENV"
+          echo "P80_SETUP_START_UTC=$started" 2>> "$root/logs/setup-pretoolchain.raw.log" >> "$GITHUB_ENV"
+          cp -- Cargo.lock "$root/logs/setup-pretoolchain.Cargo.lock.raw" >> "$root/logs/setup-pretoolchain.raw.log" 2>&1
+          cmp -s Cargo.lock "$root/logs/setup-pretoolchain.Cargo.lock.raw" >> "$root/logs/setup-pretoolchain.raw.log" 2>&1
+          {
+            printf 'cargo_lock_sha256='; sha256sum Cargo.lock
+            printf 'cargo_lock_raw_snapshot_sha256='; sha256sum "$root/logs/setup-pretoolchain.Cargo.lock.raw"
+            printf 'cargo_lock_raw_snapshot_bytes='; wc -c < "$root/logs/setup-pretoolchain.Cargo.lock.raw"
+          } >> "$root/logs/setup-pretoolchain.raw.log" 2>&1
+      - name: Assert frozen source
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          git rev-parse HEAD^{tree}
+          test -z "$(git status --porcelain)"
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-      - name: Accel smoke benchmark
-        run: cargo bench --locked --bench accel_gpu_crc -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+      - name: Pin benchmark tracked source
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          root="$RUNNER_TEMP/p80-bench-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          python scripts/ci_catalog_source_check.py snapshot \
+            --expected-head "$EXPECTED_HEAD" --output "$root/source.before.json" \
+            --generated-root "$CARGO_TARGET_DIR" --generated-root "$PRAXOR_TEST_TMP_ROOT"
 
-      - name: Graph smoke benchmark
-        run: cargo bench --locked --bench graph_adjacency_traversal -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+      - name: Frozen-head benchmark command receipts
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python scripts/ci_catalog_aux_gate.py --kind benchmark
 
-      - name: Vector smoke benchmark
-        run: cargo bench --locked --bench vector_ivf_search -- --sample-size 10 --warm-up-time 1 --measurement-time 1
-
-      - name: Search smoke benchmark
-        run: cargo bench --locked --bench search_inverted_index -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+      - name: Diagnose and verify frozen source after benchmarks
+        if: always()
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          root="$RUNNER_TEMP/p80-bench-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          python scripts/ci_catalog_source_check.py verify \
+            --expected-head "$EXPECTED_HEAD" --baseline "$root/source.before.json" \
+            --output "$root/source.after.json" --generated-root "$CARGO_TARGET_DIR" \
+            --generated-root "$PRAXOR_TEST_TMP_ROOT"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-source-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/p80-bench-${{ github.run_id }}-${{ github.run_attempt }}/source.*.json
+            ${{ runner.temp }}/p80-bench-${{ github.run_id }}-${{ github.run_attempt }}/cargo-lock-*.patch
+            ${{ runner.temp }}/p80-bench-${{ github.run_id }}-${{ github.run_attempt }}/cargo-lock-*.raw
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-receipts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/p80-bench-${{ github.run_id }}-${{ github.run_attempt }}/logs/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-criterion-samples-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/p80-bench-${{ github.run_id }}-${{ github.run_attempt }}/target/criterion/**/sample.json
+          if-no-files-found: error
 
   ignored-stress:
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Assert frozen source
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          git rev-parse HEAD^{tree}
+          test -z "$(git status --porcelain)"
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify vendored Zstd source
+        run: python scripts/verify_zstd_vendor.py
 
       - name: Ignored concurrency benchmark
-        run: cargo test --locked --test concurrency_benchmark_integration test_phase3b_concurrent_benchmark -- --ignored --exact --test-threads=1
+        run: cargo test --locked --jobs 2 --test concurrency_benchmark_integration test_phase3b_concurrent_benchmark -- --ignored --exact --test-threads=1
 
       - name: Ignored stress workloads
-        run: cargo test --locked --test concurrency_stress -- --ignored --test-threads=1
+        run: cargo test --locked --jobs 2 --test concurrency_stress -- --ignored --test-threads=1
+
+      - name: Assert frozen source after stress
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test -z "$(git status --porcelain)"

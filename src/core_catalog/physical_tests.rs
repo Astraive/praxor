@@ -100,7 +100,7 @@ fn installed_create_rows() -> Vec<SegmentEntry> {
     rows
 }
 
-fn flushed_create_fixture() -> (tempfile::TempDir, PraxisConfig, WriterLease) {
+pub(super) fn flushed_create_fixture() -> (tempfile::TempDir, PraxisConfig, WriterLease) {
     let temp_root = std::env::var_os("PRAXOR_TEST_TMP_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
