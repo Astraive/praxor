@@ -533,7 +533,7 @@ pub(super) fn collect_value_witness(
     let mut count = 0_usize;
     let mut referenced_files = 0_usize;
     for row in rows {
-        if let Some((id, pointer)) = pointer_spec(root, manifest, row)? {
+        if let Some((id, _)) = pointer_spec(root, manifest, row)? {
             count = count
                 .checked_add(1)
                 .filter(|count| *count <= 65_536)
@@ -573,13 +573,13 @@ pub(super) fn collect_value_witness(
         .to_str()
         .ok_or_else(|| corrupt(&path, "external value canonical path is not UTF-8"))?;
     for row in rows {
-        if let Some((pointer_id, pointer)) = pointer_spec(root, manifest, row)? {
-            if pointer_id != id || pointer.path.as_str() != canonical {
-                return Err(corrupt(
-                    &path,
-                    "external value pointer path is not the exact canonical spelling",
-                ));
-            }
+        if pointer_spec(root, manifest, row)?.is_some_and(|(pointer_id, pointer)| {
+            pointer_id != id || pointer.path.as_str() != canonical
+        }) {
+            return Err(corrupt(
+                &path,
+                "external value pointer path is not the exact canonical spelling",
+            ));
         }
     }
     let path_allowance = path_charge(&path)?;
@@ -637,16 +637,17 @@ pub(super) fn collect_value_witness(
         }
     }
     let (mut opened, identity, len) = open_checked(&path)?;
-    let mut sink = BuildExtents(&mut extents);
     probe.proof_full_file_hashes = probe
         .proof_full_file_hashes
         .checked_add(1)
         .ok_or_else(|| corrupt(&path, "external value proof scan counter overflows"))?;
-    let digest = scan_file(&mut opened, &path, len, &mut sink, |row_index, bytes| {
-        validate_catalog_payload(&rows[row_index], bytes, &path, attempt.budget)
-    })?;
+    let digest = {
+        let mut sink = BuildExtents(&mut extents);
+        scan_file(&mut opened, &path, len, &mut sink, |row_index, bytes| {
+            validate_catalog_payload(&rows[row_index], bytes, &path, attempt.budget)
+        })?
+    };
     recheck_opened_path(&path, &opened, identity, len)?;
-    drop(sink);
     drop(opened);
     files.push(ValueFileWitness {
         id,
