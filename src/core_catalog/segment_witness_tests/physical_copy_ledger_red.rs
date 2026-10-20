@@ -1069,7 +1069,7 @@ fn ordered_record_head_group_case(case: OrderedHeadGroupCase) {
         assert_ne!(
             physical_id(&File::open(path).unwrap(), path).unwrap(),
             physical_id(
-                &File::open(&layout.segment_path(0, 1)).unwrap(),
+                &File::open(layout.segment_path(0, 1)).unwrap(),
                 &layout.segment_path(0, 1)
             )
             .unwrap()
