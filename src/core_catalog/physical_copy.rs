@@ -27,6 +27,7 @@ const MAX_PROTECTED_COPY_TRIPLES: usize = 65_536;
 const MAX_COPY_LEDGER_RETAINED_BYTES: usize = 32 * 1024 * 1024;
 const COPY_COMPARE_CHUNK_BYTES: usize = 64 * 1024;
 const CATALOG_HEAD_LITERAL_BYTES: usize = 48;
+const CATALOG_ANCHOR_BYTES: usize = 72;
 const RECORD_ALLOCATOR_LITERAL_BYTES: usize = 56;
 const RECORD_INDEX_HEAD_LITERAL_BYTES: usize = 40;
 
@@ -858,6 +859,81 @@ fn replay_fixed_copy_groups(
     Ok(())
 }
 
+/// An external Anchor is a singleton, so group comparison never visits it.
+/// Keep the selected value bytes provisional until both complete retained-file
+/// fences succeed under the collector's one monotone replay work allowance.
+fn replay_external_anchor_identity(
+    root: &Path,
+    manifest: &Manifest,
+    segment: &ProtectedSegmentCandidate,
+    value: &ValueWitnessCandidate,
+    locator: ValueRowLocator,
+    budget: &mut PhysicalWitnessBudget,
+    work: &mut CopyReplayWork,
+) -> Result<()> {
+    let mut bytes = [0_u8; CATALOG_ANCHOR_BYTES];
+    let mut copied = 0_usize;
+    let mut overflow = false;
+    {
+        let mut context = ValueReplayContext::new(work);
+        with_authenticated_value_payload(
+            root,
+            manifest,
+            value,
+            locator,
+            &mut context,
+            budget,
+            |chunk| {
+                if let Some(end) = copied
+                    .checked_add(chunk.len())
+                    .filter(|end| *end <= bytes.len())
+                {
+                    bytes[copied..end].copy_from_slice(chunk);
+                    copied = end;
+                } else {
+                    overflow = true;
+                }
+                Ok(())
+            },
+        )?;
+        let value_fence =
+            recheck_value_witness_for_copy(root, manifest, value, &mut context, budget)?;
+        if !value_fence.confirms(value) {
+            return Err(corrupt(root, "external Anchor value witness set changed"));
+        }
+    }
+    let segment_fence =
+        recheck_all_copy_replay_witnesses(root, manifest, &segment.witnesses, work)?;
+    if !segment_fence.confirms(&segment.witnesses) {
+        return Err(corrupt(root, "external Anchor segment witness set changed"));
+    }
+    if overflow || copied != CATALOG_ANCHOR_BYTES {
+        return Err(corrupt(
+            root,
+            "external catalog Anchor has invalid replay length",
+        ));
+    }
+    let CatalogValue::Anchor(anchor) = CatalogValue::decode(&CatalogKey::Anchor, &bytes, root)?
+    else {
+        return Err(corrupt(
+            root,
+            "external catalog Anchor has the wrong value tag",
+        ));
+    };
+    let expected = manifest
+        .record_authority
+        .as_ref()
+        .ok_or_else(|| corrupt(root, "record authority is absent"))?
+        .identity(root)?;
+    if anchor.database_id != expected {
+        return Err(corrupt(
+            root,
+            "catalog Anchor differs from MANIFEST identity",
+        ));
+    }
+    Ok(())
+}
+
 fn preflight_row(root: &Path, manifest: &Manifest, row: &ObservedSegmentRow) -> Result<bool> {
     if row.sequence == 0 || row.sequence > manifest.flushed_sequence {
         return Err(corrupt(
@@ -998,13 +1074,22 @@ pub(crate) fn collect_protected_copy_ledger(
         .rows;
     let mut anchors = 0usize;
     let mut pointers = 0usize;
+    let mut external_anchor_locator = None;
     let preflight = (|| -> Result<()> {
         if rows.len() > attempt.limits.max_rows {
             return Err(metadata_limit());
         }
         for row in rows {
-            anchors += usize::from(preflight_row(root, manifest, row)?);
+            let anchor = preflight_row(root, manifest, row)?;
+            anchors += usize::from(anchor);
             pointers += usize::from(matches!(&row.value, ObservedSegmentValue::Pointer { .. }));
+            if anchor && matches!(&row.value, ObservedSegmentValue::Pointer { .. }) {
+                external_anchor_locator = Some(ValueRowLocator {
+                    source: row.source,
+                    block_offset: row.block_offset,
+                    row_ordinal: row.row_ordinal,
+                });
+            }
         }
         if anchors != 1 {
             return Err(corrupt(root, "catalog Anchor must have one physical copy"));
@@ -1040,6 +1125,23 @@ pub(crate) fn collect_protected_copy_ledger(
         return attempt.fail(error);
     }
     let mut replay_work = CopyReplayWork::production();
+    if let Some(locator) = external_anchor_locator {
+        let anchor_replay = replay_external_anchor_identity(
+            root,
+            manifest,
+            attempt.segment.as_ref().expect("segment receipt exists"),
+            attempt
+                .value
+                .as_ref()
+                .expect("external value receipt exists"),
+            locator,
+            &mut *attempt.budget,
+            &mut replay_work,
+        );
+        if let Err(error) = anchor_replay {
+            return attempt.fail(error);
+        }
+    }
     let replay = replay_fixed_copy_groups(
         root,
         manifest,
