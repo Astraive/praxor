@@ -16,6 +16,9 @@ mod physical;
 mod segment_witness;
 
 #[cfg(test)]
+mod external_value_red;
+
+#[cfg(test)]
 mod frame_tests;
 #[cfg(test)]
 mod physical_tests;

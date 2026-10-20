@@ -1,3 +1,5 @@
+use super::codec::{CatalogKey, CatalogValue, Head};
+use super::external_value_red::{ValuePayloadProbe, resolve_catalog_head_external};
 use super::physical::inspect_v4_owner;
 use super::physical_tests::flushed_create_fixture;
 use super::segment_witness::{
@@ -26,6 +28,7 @@ use crate::values::ValueLog;
 use crate::wal::catalog_witness::{
     PhysicalWitnessBudget, WalCut, scan_v4_wals_with_budget, vector_charge,
 };
+use crate::wal::record::MAX_WAL_PAYLOAD_BYTES;
 use crate::writer_lease::{LOCK_FILE_NAME, WriterLease};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -6905,5 +6908,257 @@ fn zstd_final_recheck_detects_changed_earlier_file_after_stage() {
     mutator.flush().unwrap();
     assert_eq!(file_id(path), original_id);
     assert_eq!(fs::read(path).unwrap(), original);
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+fn writer_external_head_fixture() -> (
+    tempfile::TempDir,
+    PraxisConfig,
+    WriterLease,
+    Manifest,
+    Vec<u8>,
+) {
+    let (dir, mut config, lease, _) = two_literal_segments(false);
+    let root = lease.root();
+    let layout = DiskLayout::at(root);
+    config.large_value_threshold = 47;
+    config.validate().unwrap();
+    let key = CatalogKey::Head.encode().unwrap();
+    let encoded = CatalogValue::Head(Head {
+        database_id: [0x11; 16],
+        revision: 2,
+        collection_count: 1,
+    })
+    .encode()
+    .unwrap();
+    assert_eq!(key, [0]);
+    assert_eq!(encoded.len(), 48);
+
+    let value_path = layout.value_log_path(1);
+    let mut value_log = ValueLog::open(&value_path).unwrap();
+    let segment_path = layout.segment_path(0, 1);
+    let metadata = SegmentWriter::write(
+        SegmentWriteOptions {
+            path: &segment_path,
+            id: 1,
+            level: 0,
+            compression: Compression::None,
+            accelerator: &CpuAccelerator,
+            value_log: &mut value_log,
+            large_value_threshold: config.large_value_threshold,
+            block_size: 4096,
+            partitioned_bloom: None,
+            direct_io: false,
+        },
+        vec![row_in(
+            CATALOG_CF,
+            &key,
+            2,
+            StoredValue::Put(encoded.clone()),
+        )],
+    )
+    .unwrap();
+    drop(value_log);
+
+    let bytes = fs::read(&segment_path).unwrap();
+    let parsed = decode_segment(&bytes, &segment_path, &CpuAccelerator).unwrap();
+    assert_eq!(parsed.blocks.len(), 1);
+    assert_eq!(parsed.blocks[0].len(), 1);
+    let StoredValue::BlobPointer(pointer) = &parsed.blocks[0][0].entry.version.value else {
+        panic!("the writer must externalize the 48-byte Head")
+    };
+    assert_eq!(pointer.path.as_str(), value_path.to_str().unwrap());
+    assert_eq!(pointer.offset, 0);
+    assert_eq!(pointer.len, 48);
+    assert_eq!(pointer.checksum, crc32c(&encoded));
+    let value_file = fs::read(&value_path).unwrap();
+    assert_eq!(value_file.len(), 60);
+    assert_eq!(u64::from_le_bytes(value_file[..8].try_into().unwrap()), 48);
+    assert_eq!(
+        u32::from_le_bytes(value_file[8..12].try_into().unwrap()),
+        crc32c(&encoded)
+    );
+    assert_eq!(&value_file[12..], encoded.as_slice());
+
+    let manifest_path = layout.manifest_path();
+    let mut manifest =
+        Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    manifest.effective_config = config.persisted();
+    for family in &mut manifest.column_families {
+        if family.name.starts_with("__praxor_record_") {
+            family.large_value_threshold_bytes = config.large_value_threshold;
+        }
+    }
+    *manifest
+        .segments
+        .iter_mut()
+        .find(|segment| segment.id == 1)
+        .unwrap() = metadata;
+    ManifestStore::new(manifest_path.clone())
+        .save(&manifest)
+        .unwrap();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    assert_eq!(manifest.effective_config, config.persisted());
+    assert_eq!(
+        manifest
+            .column_families
+            .iter()
+            .find(|family| family.name == CATALOG_CF)
+            .unwrap()
+            .large_value_threshold_bytes,
+        config.large_value_threshold
+    );
+    (dir, config, lease, manifest, encoded)
+}
+
+#[test]
+fn private_external_head_resolves_writer_produced_48_bytes_without_tree_mutation() {
+    let (dir, config, lease, manifest, expected) = writer_external_head_fixture();
+    let root = lease.root();
+    let before = snapshot(dir.path());
+    assert!(matches!(
+        inspect_v4_owner(&lease, &config, &CpuAccelerator),
+        Err(PraxisError::UnsupportedCatalogFeature {
+            feature: "v4 installed cut beyond narrow D0 bootstrap"
+        })
+    ));
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let candidate = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+        let head = candidate
+            .rows
+            .iter()
+            .find(|row| row.source.id == 1 && row.cf == CATALOG_CF && row.key == [0])
+            .unwrap();
+        assert_eq!(
+            head.classification,
+            PhysicalRowClass::BoundProtected(ProtectedRole::Catalog)
+        );
+        assert!(matches!(
+            &head.value,
+            ObservedSegmentValue::Pointer {
+                expires_at_ms: None,
+                ..
+            }
+        ));
+        let mut probe = ValuePayloadProbe::default();
+        let resolved = resolve_catalog_head_external(root, head, &mut probe);
+        candidate.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(snapshot(dir.path()), before);
+        assert_eq!(resolved.unwrap(), expected);
+        assert_eq!(probe.open_attempts, 1);
+        assert!(probe.read_attempts >= 1);
+    });
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn private_external_head_rejects_noncanonical_pointer_before_open() {
+    let (dir, _config, lease, _manifest, _) = writer_external_head_fixture();
+    let root = lease.root();
+    let segment_path = DiskLayout::at(root).segment_path(0, 1);
+    let mut decoded = decode_segment(
+        &fs::read(&segment_path).unwrap(),
+        &segment_path,
+        &CpuAccelerator,
+    )
+    .unwrap();
+    let StoredValue::BlobPointer(pointer) = &mut decoded.blocks[0][0].entry.version.value else {
+        panic!("the writer must produce a pointer before mutation")
+    };
+    let noncanonical = root.join("outside.tval").to_string_lossy().into_owned();
+    pointer.path = noncanonical.clone();
+    let rechecksummed = decoded.encode(&CpuAccelerator).unwrap();
+    let manifest = replace_first_segment_bytes(root, &rechecksummed);
+    let before = snapshot(dir.path());
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let candidate = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+        let head = candidate
+            .rows
+            .iter()
+            .find(|row| row.source.id == 1 && row.cf == CATALOG_CF && row.key == [0])
+            .unwrap();
+        let ObservedSegmentValue::Pointer {
+            pointer,
+            expires_at_ms: None,
+        } = &head.value
+        else {
+            panic!("the rechecksummed segment must expose the claimed pointer")
+        };
+        assert_eq!(pointer.path, noncanonical);
+        let mut probe = ValuePayloadProbe::default();
+        let result = resolve_catalog_head_external(root, head, &mut probe);
+        candidate.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(probe.open_attempts, 0);
+        assert_eq!(probe.read_attempts, 0);
+        assert_eq!(probe.reserve_attempts, 0);
+        assert_eq!(snapshot(dir.path()), before);
+        assert!(
+            matches!(&result, Err(PraxisError::Corrupt { .. })),
+            "{result:?}"
+        );
+    });
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn private_external_head_rejects_atomic_cap_claim_before_payload_read_or_reserve() {
+    let (dir, _config, lease, _manifest, _) = writer_external_head_fixture();
+    let root = lease.root();
+    let segment_path = DiskLayout::at(root).segment_path(0, 1);
+    let mut decoded = decode_segment(
+        &fs::read(&segment_path).unwrap(),
+        &segment_path,
+        &CpuAccelerator,
+    )
+    .unwrap();
+    let StoredValue::BlobPointer(pointer) = &mut decoded.blocks[0][0].entry.version.value else {
+        panic!("the writer must produce a pointer before mutation")
+    };
+    pointer.len = MAX_WAL_PAYLOAD_BYTES as u64;
+    let rechecksummed = decoded.encode(&CpuAccelerator).unwrap();
+    let manifest = replace_first_segment_bytes(root, &rechecksummed);
+    assert_eq!(
+        manifest
+            .segments
+            .iter()
+            .find(|segment| segment.id == 1)
+            .unwrap()
+            .file_digest,
+        blake3::hash(&rechecksummed).to_hex().to_string()
+    );
+    let before = snapshot(dir.path());
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let candidate = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+        let head = candidate
+            .rows
+            .iter()
+            .find(|row| row.source.id == 1 && row.cf == CATALOG_CF && row.key == [0])
+            .unwrap();
+        let ObservedSegmentValue::Pointer {
+            pointer,
+            expires_at_ms: None,
+        } = &head.value
+        else {
+            panic!("the rechecksummed segment must expose the claimed pointer")
+        };
+        assert_eq!(pointer.len, MAX_WAL_PAYLOAD_BYTES as u64);
+        let mut probe = ValuePayloadProbe::default();
+        let result = resolve_catalog_head_external(root, head, &mut probe);
+        candidate.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(probe.open_attempts, 0);
+        assert_eq!(probe.read_attempts, 0);
+        assert_eq!(probe.reserve_attempts, 0);
+        assert_eq!(snapshot(dir.path()), before);
+        assert!(
+            matches!(&result, Err(PraxisError::Corrupt { .. })),
+            "{result:?}"
+        );
+    });
     assert_eq!(snapshot(dir.path()), before);
 }
