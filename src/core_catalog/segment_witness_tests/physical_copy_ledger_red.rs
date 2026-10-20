@@ -2,6 +2,9 @@ use super::*;
 use crate::core_catalog::physical_copy::{
     admit_protected_physical_copies, collect_protected_copy_ledger,
 };
+use crate::core_records::codec::{
+    Decision as RecordDecision, Key as RecordKey, Role as RecordRole, Row as RecordRow,
+};
 use crate::segments::format::SEGMENT_FOOTER_MAGIC;
 
 const FIXED_ORACLE: &str = include_str!("../../../tests/fixtures/catalog_v4_wal_oracle.json");
@@ -901,4 +904,290 @@ fn second_writer_produced_anchor_refuses_before_copy_replay_and_refunds() {
         assert_eq!(snapshot(dir.path()), before);
     });
     assert_eq!(snapshot(dir.path()), before);
+}
+
+#[derive(Clone, Copy)]
+enum OrderedHeadGroupCase {
+    Identical,
+    Reordered,
+    ChangedLastMember,
+}
+
+fn fixed_record_head_bytes(append_ordinal: u64, rid: u64) -> Vec<u8> {
+    let mut bytes = b"PRH1\x01\0\0\0".to_vec();
+    bytes.extend_from_slice(&2u64.to_le_bytes());
+    bytes.extend_from_slice(&append_ordinal.to_le_bytes());
+    bytes.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
+    bytes.extend_from_slice(&rid.to_le_bytes());
+    assert_eq!(bytes.len(), 40);
+    bytes
+}
+
+fn ordered_record_head_group_case(case: OrderedHeadGroupCase) {
+    let (dir, config, lease) = flushed_create_fixture();
+    let root = lease.root();
+    let layout = DiskLayout::at(root);
+    let manifest_path = layout.manifest_path();
+    let mut manifest =
+        Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    assert_eq!(manifest.flushed_sequence, 2);
+    assert_eq!(manifest.segments.len(), 1);
+
+    // This is a physical-copy fixture. #83/#84 still own the relationship
+    // between these decoded Head events, their Facts, and the durable WAL.
+    let head_key = RecordKey::Head {
+        index: 1,
+        incarnation: 1,
+        key: b"ordered-copy",
+    }
+    .encode()
+    .unwrap();
+    let head_cf = RecordRole::Index.cf();
+    let first_value = RecordRow::Head {
+        raw_sequence: 2,
+        append_ordinal: 1,
+        decision: RecordDecision::Put(1),
+    }
+    .encode()
+    .unwrap();
+    let last_value = RecordRow::Head {
+        raw_sequence: 2,
+        append_ordinal: 2,
+        decision: RecordDecision::Put(2),
+    }
+    .encode()
+    .unwrap();
+    let changed_last = RecordRow::Head {
+        raw_sequence: 2,
+        append_ordinal: 2,
+        decision: RecordDecision::Put(3),
+    }
+    .encode()
+    .unwrap();
+    assert_eq!(first_value, fixed_record_head_bytes(1, 1));
+    assert_eq!(last_value, fixed_record_head_bytes(2, 2));
+    assert_eq!(changed_last, fixed_record_head_bytes(2, 3));
+    assert_eq!(last_value.len(), changed_last.len());
+    assert_ne!(last_value, changed_last);
+    let first_group = [
+        row_in(head_cf, &head_key, 2, StoredValue::Put(first_value.clone())),
+        row_in(head_cf, &head_key, 2, StoredValue::Put(last_value.clone())),
+    ];
+    let second_group = match case {
+        OrderedHeadGroupCase::Identical => first_group.clone(),
+        OrderedHeadGroupCase::Reordered => [first_group[1].clone(), first_group[0].clone()],
+        OrderedHeadGroupCase::ChangedLastMember => [
+            first_group[0].clone(),
+            row_in(head_cf, &head_key, 2, StoredValue::Put(changed_last)),
+        ],
+    };
+
+    let write_group = |level: u32, id: u64, rows: &[SegmentEntry; 2]| {
+        let path = layout.segment_path(level, id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let value_path = layout.value_log_path(id);
+        let mut value_log = ValueLog::open(&value_path).unwrap();
+        let metadata = SegmentWriter::write(
+            SegmentWriteOptions {
+                path: &path,
+                id,
+                level,
+                compression: Compression::None,
+                accelerator: &CpuAccelerator,
+                value_log: &mut value_log,
+                large_value_threshold: config.large_value_threshold,
+                block_size: 1,
+                partitioned_bloom: None,
+                direct_io: false,
+            },
+            rows.to_vec(),
+        )
+        .unwrap();
+        drop(value_log);
+        fs::remove_file(value_path).unwrap();
+        (path, metadata)
+    };
+    let (first_path, first_meta) = write_group(0, 2, &first_group);
+    let (second_path, second_meta) = write_group(1, 3, &second_group);
+    let paths = [first_path, second_path];
+    let metadata = [first_meta, second_meta];
+    let groups = [first_group, second_group];
+    let mut block_offsets = Vec::new();
+    let mut file_bytes = Vec::new();
+    for (index, ((path, meta), expected)) in paths
+        .iter()
+        .zip(metadata.iter())
+        .zip(groups.iter())
+        .enumerate()
+    {
+        let level = u32::try_from(index).unwrap();
+        let id = u64::try_from(index + 2).unwrap();
+        let bytes = fs::read(path).unwrap();
+        assert_eq!(meta.entries, 2);
+        assert_eq!(meta.path, path.to_str().unwrap());
+        assert_eq!(meta.file_digest, blake3::hash(&bytes).to_hex().to_string());
+        let decoded = decode_segment(&bytes, path, &CpuAccelerator).unwrap();
+        assert_eq!((decoded.level, decoded.id), (level, id));
+        assert_eq!(
+            decoded.blocks.len(),
+            2,
+            "one same-key row per literal block"
+        );
+        assert!(decoded.blocks.iter().all(|block| block.len() == 1));
+        let offsets = literal_block_offsets(&bytes, level, id, decoded.blocks.len());
+        for (row, entry) in decoded.blocks.iter().flatten().zip(expected) {
+            assert_eq!(&row.entry, entry);
+            assert!(row.blob_expiry.is_none());
+            assert_eq!(
+                RecordKey::decode(RecordRole::Index, &row.entry.key, path).unwrap(),
+                RecordKey::Head {
+                    index: 1,
+                    incarnation: 1,
+                    key: b"ordered-copy",
+                }
+            );
+            let StoredValue::Put(value) = &row.entry.version.value else {
+                panic!("ordered Head must be literal Put")
+            };
+            assert!(matches!(
+                RecordRow::decode(
+                    &RecordKey::Head {
+                        index: 1,
+                        incarnation: 1,
+                        key: b"ordered-copy",
+                    },
+                    value,
+                    path,
+                )
+                .unwrap(),
+                RecordRow::Head {
+                    raw_sequence: 2,
+                    ..
+                }
+            ));
+        }
+        assert_ne!(
+            physical_id(&File::open(path).unwrap(), path).unwrap(),
+            physical_id(
+                &File::open(&layout.segment_path(0, 1)).unwrap(),
+                &layout.segment_path(0, 1)
+            )
+            .unwrap()
+        );
+        block_offsets.push(offsets);
+        file_bytes.push(bytes);
+    }
+    assert_ne!(
+        physical_id(&File::open(&paths[0]).unwrap(), &paths[0]).unwrap(),
+        physical_id(&File::open(&paths[1]).unwrap(), &paths[1]).unwrap()
+    );
+    manifest.segments.extend(metadata);
+    manifest.next_segment_id = 4;
+    ManifestStore::new(manifest_path.clone())
+        .save(&manifest)
+        .unwrap();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    assert_eq!(manifest.segments.len(), 3);
+    let before = snapshot(dir.path());
+    assert!(matches!(
+        inspect_v4_owner(&lease, &config, &CpuAccelerator),
+        Err(PraxisError::UnsupportedCatalogFeature {
+            feature: "v4 installed cut beyond narrow D0 bootstrap"
+        })
+    ));
+    assert_eq!(snapshot(dir.path()), before);
+
+    with_wal_budget(root, &manifest, |budget| {
+        let mut observed = Vec::new();
+        let witnesses = visit_v4_segments(root, &manifest, budget, |row| {
+            observed.push(row);
+            Ok(())
+        })
+        .expect("bounded visitor must retain both complete Head groups");
+        assert_eq!(witnesses.len(), 3);
+        assert_eq!(observed.len(), 11);
+        let head_rows = observed
+            .iter()
+            .filter(|row| row.cf == head_cf && row.key == head_key && row.sequence == 2)
+            .collect::<Vec<_>>();
+        assert_eq!(head_rows.len(), 4);
+        for (index, ((witness, expected), offsets)) in witnesses[1..]
+            .iter()
+            .zip(groups.iter())
+            .zip(block_offsets.iter())
+            .enumerate()
+        {
+            let path = &paths[index];
+            assert_eq!(witness.path, *path);
+            assert_eq!(witness.len, file_bytes[index].len() as u64);
+            assert_eq!(witness.digest, blake3::hash(&file_bytes[index]));
+            assert_eq!(witness.observed_rows, 2);
+            assert_eq!(
+                witness.identity,
+                physical_id(&File::open(path).unwrap(), path).unwrap()
+            );
+            let source = SegmentSource {
+                level: u32::try_from(index).unwrap(),
+                id: u64::try_from(index + 2).unwrap(),
+                manifest_ordinal: index + 1,
+            };
+            assert_eq!(witness.source, source);
+            let group = head_rows
+                .iter()
+                .filter(|row| row.source == source)
+                .collect::<Vec<_>>();
+            assert_eq!(group.len(), 2);
+            for (position, (row, entry)) in group.iter().zip(expected).enumerate() {
+                assert_eq!((row.block_offset, row.row_ordinal), (offsets[position], 0));
+                let StoredValue::Put(value) = &entry.version.value else {
+                    unreachable!()
+                };
+                assert_eq!(row.value, ObservedSegmentValue::Put(value.clone()));
+            }
+        }
+        assert_eq!(snapshot(dir.path()), before);
+        let balance = budget.remaining_bytes();
+        let result = collect_protected_copy_ledger(root, &manifest, budget);
+        match case {
+            OrderedHeadGroupCase::Identical => {
+                let candidate = match result {
+                    Ok(candidate) => candidate,
+                    Err(PraxisError::UnsupportedCatalogFeature {
+                        feature: "protected physical-copy bytes await authenticated replay",
+                    }) => panic!("RED: exact ordered Head groups await physical-copy replay"),
+                    Err(other) => panic!("exact Head groups must be admitted: {other:?}"),
+                };
+                candidate.discard(root, budget).unwrap();
+            }
+            OrderedHeadGroupCase::Reordered | OrderedHeadGroupCase::ChangedLastMember => {
+                match result {
+                    Err(PraxisError::Corrupt { reason, .. }) => {
+                        assert!(reason.contains("copy") || reason.contains("group"));
+                    }
+                    Err(PraxisError::UnsupportedCatalogFeature {
+                        feature: "protected physical-copy bytes await authenticated replay",
+                    }) => panic!("RED: conflicting full Head groups await physical comparison"),
+                    other => panic!("conflicting full Head groups must be Corrupt: {other:?}"),
+                }
+            }
+        }
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(snapshot(dir.path()), before);
+    });
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn exact_ordered_record_head_groups_require_private_copy_admission() {
+    ordered_record_head_group_case(OrderedHeadGroupCase::Identical);
+}
+
+#[test]
+fn reordered_record_head_group_requires_private_copy_corrupt() {
+    ordered_record_head_group_case(OrderedHeadGroupCase::Reordered);
+}
+
+#[test]
+fn rechecksummed_record_head_group_byte_conflict_requires_private_copy_corrupt() {
+    ordered_record_head_group_case(OrderedHeadGroupCase::ChangedLastMember);
 }
