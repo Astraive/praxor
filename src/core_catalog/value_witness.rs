@@ -1978,6 +1978,129 @@ mod direct_replay_tests {
     }
 
     #[test]
+    fn writer_inline_and_external_head_copies_require_equal_logical_bytes() {
+        let (_dir, mut config, lease) = flushed_create_fixture();
+        let root = lease.root();
+        let layout = DiskLayout::at(root);
+        let manifest_path = layout.manifest_path();
+        let mut manifest =
+            Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+        assert_eq!(manifest.segments.len(), 1);
+        let first_path = layout.segment_path(0, 1);
+        let first = decode_segment(
+            &fs::read(&first_path).unwrap(),
+            &first_path,
+            &CpuAccelerator,
+        )
+        .unwrap();
+        let head = first
+            .blocks
+            .into_iter()
+            .flatten()
+            .map(|raw| raw.entry)
+            .find(|row| {
+                row.cf.0 == CATALOG_CF && row.key.as_ref() == [0] && row.version.sequence == 2
+            })
+            .unwrap();
+        let StoredValue::Put(head_bytes) = &head.version.value else {
+            panic!("first writer segment must retain a literal Head@2")
+        };
+        assert_eq!(head_bytes.len(), 48);
+
+        config.large_value_threshold = 11;
+        config.validate().unwrap();
+        let second_path = layout.segment_path(1, 2);
+        fs::create_dir_all(second_path.parent().unwrap()).unwrap();
+        let value_path = layout.value_log_path(2);
+        let mut value_log = ValueLog::open(&value_path).unwrap();
+        let second_meta = SegmentWriter::write(
+            SegmentWriteOptions {
+                path: &second_path,
+                id: 2,
+                level: 1,
+                compression: Compression::None,
+                accelerator: &CpuAccelerator,
+                value_log: &mut value_log,
+                large_value_threshold: config.large_value_threshold,
+                block_size: config.block_size,
+                partitioned_bloom: None,
+                direct_io: false,
+            },
+            vec![head.clone()],
+        )
+        .unwrap();
+        drop(value_log);
+        let second = decode_segment(
+            &fs::read(&second_path).unwrap(),
+            &second_path,
+            &CpuAccelerator,
+        )
+        .unwrap();
+        assert_eq!(second.blocks.len(), 1);
+        assert_eq!(second.blocks[0].len(), 1);
+        let external = &second.blocks[0][0].entry;
+        assert_eq!(
+            (external.cf.clone(), external.key.clone()),
+            (head.cf.clone(), head.key.clone())
+        );
+        assert_eq!(external.version.sequence, 2);
+        let StoredValue::BlobPointer(pointer) = &external.version.value else {
+            panic!("second writer segment must externalize Head@2")
+        };
+        let value_bytes = fs::read(&value_path).unwrap();
+        assert_written_pointer(pointer, head_bytes, &value_bytes, &value_path);
+        assert_eq!(
+            second_meta.file_digest,
+            blake3::hash(&fs::read(&second_path).unwrap())
+                .to_hex()
+                .to_string()
+        );
+
+        manifest.effective_config = config.persisted();
+        for family in &mut manifest.column_families {
+            if family.name.starts_with("__praxor_record_") {
+                family.large_value_threshold_bytes = config.large_value_threshold;
+            }
+        }
+        manifest.segments.push(second_meta);
+        manifest.next_segment_id = 3;
+        ManifestStore::new(manifest_path.clone())
+            .save(&manifest)
+            .unwrap();
+        let manifest =
+            Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+        manifest.validate_v4(&manifest_path).unwrap();
+        let cut = WalCut {
+            flushed_sequence: manifest.flushed_sequence,
+            last_sequence: manifest.last_sequence,
+            flushed_wal_id: manifest.flushed_wal_id,
+            active_wal_id: manifest.active_wal_id,
+            next_wal_id: manifest.next_wal_id,
+        };
+        let (_wals, mut budget) = scan_v4_wals_with_budget(root, cut, |_, _, _, _| Ok(())).unwrap();
+        let retained = budget.remaining_bytes();
+        let before = writer_tree_snapshot(root);
+        let error = match collect_protected_copy_ledger(root, &manifest, &mut budget) {
+            Ok(candidate) => {
+                candidate.discard(root, &mut budget).unwrap();
+                panic!("mixed Head copies must remain private until owner composition")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(budget.remaining_bytes(), retained);
+        assert_eq!(writer_tree_snapshot(root), before);
+        assert!(
+            matches!(
+                &error,
+                PraxisError::UnsupportedCatalogFeature {
+                    feature: "protected physical-copy bytes await authenticated replay"
+                }
+            ),
+            "mixed Head copies must reach private admission: {error:?}"
+        );
+    }
+
+    #[test]
     fn writer_external_copies_stream_exact_head_and_large_payload_chunks() {
         let fixture = writer_external_replay_fixture(false);
         assert_eq!(fixture.first_head, fixture.second_head);
