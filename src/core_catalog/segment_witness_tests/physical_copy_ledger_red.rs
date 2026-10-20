@@ -2748,7 +2748,7 @@ fn writer_fixed_catalog_pair_case(role: FixedCatalogPair, conflicting: bool) {
             assert!(matches!(
                 error,
                 PraxisError::UnsupportedCatalogFeature {
-                    feature: "protected physical-copy role group provenance awaits proof"
+                    feature: "protected physical-copy bytes await authenticated replay"
                 }
             ));
         }

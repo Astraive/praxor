@@ -29,6 +29,8 @@ const MAX_PROTECTED_COPY_TRIPLES: usize = 65_536;
 const MAX_COPY_LEDGER_RETAINED_BYTES: usize = 32 * 1024 * 1024;
 const COPY_COMPARE_CHUNK_BYTES: usize = 64 * 1024;
 const CATALOG_HEAD_LITERAL_BYTES: usize = 48;
+const CATALOG_NAME_LITERAL_BYTES: usize = 12;
+const CATALOG_NAMESPACE_LITERAL_BYTES: usize = 16;
 const CATALOG_ANCHOR_BYTES: usize = 72;
 const RECORD_ALLOCATOR_LITERAL_BYTES: usize = 56;
 const RECORD_INDEX_HEAD_LITERAL_BYTES: usize = 40;
@@ -907,6 +909,93 @@ fn replay_schema_copy_group(
     Ok(())
 }
 
+/// Reassemble one selected fixed Catalog value on the stack before checking
+/// its syntax. Value-file callbacks can split an extent at a scan boundary.
+#[allow(clippy::too_many_arguments)] // Exact row, receipts, key, budget, and work are separate proof inputs.
+fn replay_fixed_catalog_value(
+    root: &Path,
+    manifest: &Manifest,
+    segment: &ProtectedSegmentCandidate,
+    value: Option<&ValueWitnessCandidate>,
+    copy: &CopyDescriptor,
+    key: &CatalogKey<'_>,
+    width: usize,
+    budget: &mut PhysicalWitnessBudget,
+    work: &mut CopyReplayWork,
+) -> Result<[u8; CATALOG_NAMESPACE_LITERAL_BYTES]> {
+    let mut bytes = [0_u8; CATALOG_NAMESPACE_LITERAL_BYTES];
+    if width > bytes.len() {
+        return Err(unproven_copy_group());
+    }
+    let mut copied = 0_usize;
+    with_authenticated_singleton_copy(
+        root,
+        manifest,
+        segment,
+        value,
+        copy,
+        width,
+        budget,
+        work,
+        |chunk| {
+            let end = copied
+                .checked_add(chunk.len())
+                .filter(|end| *end <= width)
+                .ok_or_else(|| corrupt(root, "replayed fixed Catalog value exceeds width"))?;
+            bytes[copied..end].copy_from_slice(chunk);
+            copied = end;
+            Ok(())
+        },
+    )?;
+    if copied != width {
+        return Err(corrupt(root, "replayed fixed Catalog value length changed"));
+    }
+    // The visitor's earlier decode is not a substitute for validating the
+    // selected bytes obtained from this authenticated physical locator.
+    let role_matches = matches!(
+        (key, CatalogValue::decode(key, &bytes[..width], root)?),
+        (CatalogKey::Name(_), CatalogValue::Name(_))
+            | (CatalogKey::Namespace(_), CatalogValue::Namespace(_))
+    );
+    if !role_matches {
+        return Err(corrupt(root, "fixed Catalog copy has an unexpected role"));
+    }
+    Ok(bytes)
+}
+
+/// Catalog Name and Namespace have one logical Put per (CF,key,S). Keep any
+/// valid-byte mismatch provisional until the caller's complete file fences.
+#[allow(clippy::too_many_arguments)] // Retained segment/value receipts and one work ledger remain distinct.
+fn replay_fixed_catalog_copy_group(
+    root: &Path,
+    manifest: &Manifest,
+    segment: &ProtectedSegmentCandidate,
+    value: Option<&ValueWitnessCandidate>,
+    copies: &[CopyDescriptor],
+    key: &CatalogKey<'_>,
+    budget: &mut PhysicalWitnessBudget,
+    work: &mut CopyReplayWork,
+    actual_bytes_conflict: &mut bool,
+) -> Result<()> {
+    let width = match key {
+        CatalogKey::Name(_) => CATALOG_NAME_LITERAL_BYTES,
+        CatalogKey::Namespace(_) => CATALOG_NAMESPACE_LITERAL_BYTES,
+        _ => return Err(unproven_copy_group()),
+    };
+    let canonical = replay_fixed_catalog_value(
+        root, manifest, segment, value, &copies[0], key, width, budget, work,
+    )?;
+    for copy in &copies[1..] {
+        let peer = replay_fixed_catalog_value(
+            root, manifest, segment, value, copy, key, width, budget, work,
+        )?;
+        if canonical[..width] != peer[..width] {
+            *actual_bytes_conflict = true;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // Segment/value receipts and replay limits are distinct proof inputs.
 fn replay_fixed_copy_groups(
     root: &Path,
@@ -937,23 +1026,38 @@ fn replay_fixed_copy_groups(
             )?;
             continue;
         }
-        if copies[0].cf == CATALOG_CF
-            && matches!(
-                CatalogKey::decode(&copies[0].key, root)?,
-                CatalogKey::Schema(_)
-            )
-        {
-            replay_schema_copy_group(
-                root,
-                manifest,
-                segment,
-                value,
-                copies,
-                budget,
-                work,
-                &mut actual_bytes_conflict,
-            )?;
-            continue;
+        if copies[0].cf == CATALOG_CF {
+            let key = CatalogKey::decode(&copies[0].key, root)?;
+            match &key {
+                CatalogKey::Schema(_) => {
+                    replay_schema_copy_group(
+                        root,
+                        manifest,
+                        segment,
+                        value,
+                        copies,
+                        budget,
+                        work,
+                        &mut actual_bytes_conflict,
+                    )?;
+                    continue;
+                }
+                CatalogKey::Name(_) | CatalogKey::Namespace(_) => {
+                    replay_fixed_catalog_copy_group(
+                        root,
+                        manifest,
+                        segment,
+                        value,
+                        copies,
+                        &key,
+                        budget,
+                        work,
+                        &mut actual_bytes_conflict,
+                    )?;
+                    continue;
+                }
+                _ => {}
+            }
         }
         let width = singleton_literal_width(root, &copies[0])?;
         let mut canonical = LiteralComparisonBuffer::new(root, budget, work, width)?;
