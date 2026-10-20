@@ -6,6 +6,7 @@ import argparse
 import ctypes
 import hashlib
 import json
+import ntpath
 import os
 import re
 import shutil
@@ -21,6 +22,7 @@ from pathlib import Path
 
 GIB = 1024**3
 WINDOWS_JOB_QUIESCENCE_SECONDS = 5
+WINDOWS_VCTIP_QUIESCENCE_SECONDS = 60
 MAX_LOCK_DIFF_BYTES = 16 * 1024
 SAFE_ENVIRONMENT_KEYS = frozenset(
     {
@@ -419,6 +421,10 @@ class JobAccounting(ctypes.Structure):
     ]
 
 
+class WinFileTime(ctypes.Structure):
+    _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+
+
 class JobBasicLimitInformation(ctypes.Structure):
     _fields_ = [
         ("per_process_user_time_limit", ctypes.c_longlong),
@@ -764,7 +770,7 @@ class StageRecorder:
         """Identify members of a live Job Object for the failure receipt."""
         kernel = ctypes.windll.kernel32
         kernel.QueryInformationJobObject.argtypes = [
-            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p,
         ]
         kernel.QueryInformationJobObject.restype = ctypes.c_int
         width = ctypes.sizeof(ctypes.c_size_t)
@@ -774,8 +780,8 @@ class StageRecorder:
             if kernel.QueryInformationJobObject(
                 ctypes.c_void_p(job), 3, buffer, ctypes.sizeof(buffer), None,
             ):
-                assigned = ctypes.c_ulong.from_buffer(buffer, 0).value
-                count = ctypes.c_ulong.from_buffer(buffer, 4).value
+                assigned = ctypes.c_uint32.from_buffer(buffer, 0).value
+                count = ctypes.c_uint32.from_buffer(buffer, 4).value
                 if count > capacity or count < assigned:
                     capacity = max(capacity * 2, assigned)
                     continue
@@ -790,8 +796,8 @@ class StageRecorder:
         raise RuntimeError("Windows Job Object PID list exceeded 4096 entries")
 
     @staticmethod
-    def _windows_job_member_diagnostics(pids: list[int]) -> list[dict]:
-        """Names are best-effort evidence; a lookup failure never clears a live PID."""
+    def _windows_job_member_diagnostics(pids: list[int], job: int | None = None) -> list[dict]:
+        """Native image paths are evidence; a lookup failure never clears a live PID."""
         kernel = ctypes.windll.kernel32
         kernel.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
         kernel.OpenProcess.restype = ctypes.c_void_p
@@ -799,11 +805,24 @@ class StageRecorder:
             ctypes.c_void_p, ctypes.c_ulong, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_ulong),
         ]
         kernel.QueryFullProcessImageNameW.restype = ctypes.c_int
+        if job is not None:
+            kernel.IsProcessInJob.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
+            ]
+            kernel.IsProcessInJob.restype = ctypes.c_int
+            kernel.GetProcessTimes.argtypes = [
+                ctypes.c_void_p, *([ctypes.POINTER(WinFileTime)] * 4),
+            ]
+            kernel.GetProcessTimes.restype = ctypes.c_int
         kernel.CloseHandle.argtypes = [ctypes.c_void_p]
         kernel.CloseHandle.restype = ctypes.c_int
         members: list[dict] = []
         for pid in pids:
-            detail = {"pid": pid, "image_name": None, "name_lookup_error": None}
+            detail = {
+                "pid": pid, "image_name": None, "image_path": None,
+                "name_lookup_error": None, "in_job": None,
+                "creation_time_100ns": None, "identity_lookup_error": None,
+            }
             handle = kernel.OpenProcess(0x1000, 0, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
             if not handle:
                 detail["name_lookup_error"] = str(ctypes.WinError(kernel.GetLastError()))
@@ -816,11 +835,82 @@ class StageRecorder:
                     ):
                         detail["name_lookup_error"] = str(ctypes.WinError(kernel.GetLastError()))
                     else:
-                        detail["image_name"] = Path(image.value).name
+                        detail["image_path"] = image.value
+                        detail["image_name"] = ntpath.basename(image.value)
+                    if job is not None:
+                        in_job = ctypes.c_int()
+                        if not kernel.IsProcessInJob(
+                            ctypes.c_void_p(handle), ctypes.c_void_p(job), ctypes.byref(in_job),
+                        ):
+                            detail["identity_lookup_error"] = str(ctypes.WinError(kernel.GetLastError()))
+                        else:
+                            detail["in_job"] = bool(in_job.value)
+                        created, exited, kernel_time, user_time = (WinFileTime() for _ in range(4))
+                        if not kernel.GetProcessTimes(
+                            ctypes.c_void_p(handle), ctypes.byref(created), ctypes.byref(exited),
+                            ctypes.byref(kernel_time), ctypes.byref(user_time),
+                        ):
+                            detail["identity_lookup_error"] = str(ctypes.WinError(kernel.GetLastError()))
+                        else:
+                            detail["creation_time_100ns"] = (created.high << 32) | created.low
                 finally:
                     kernel.CloseHandle(ctypes.c_void_p(handle))
             members.append(detail)
         return members
+
+    @staticmethod
+    def _windows_vctip_members_verified(
+        members: list[dict], baseline: list[dict] | None = None,
+    ) -> bool:
+        """Grant extra wait only to native MSVC telemetry images in the VS toolchain tree."""
+        if not members:
+            return False
+        originals = {item.get("pid"): item for item in baseline} if baseline is not None else None
+        if originals is not None and len(originals) != len(baseline):
+            return False
+        seen: set[int] = set()
+        for member in members:
+            image = member.get("image_path")
+            name = member.get("image_name")
+            if (
+                not isinstance(member.get("pid"), int) or member["pid"] <= 0
+                or member["pid"] in seen
+                or member.get("name_lookup_error") is not None
+                or member.get("identity_lookup_error") is not None
+                or member.get("in_job") is not True
+                or not isinstance(member.get("creation_time_100ns"), int)
+                or member["creation_time_100ns"] <= 0
+                or not isinstance(image, str) or not isinstance(name, str)
+                or name.casefold() != "vctip.exe"
+                or not ntpath.isabs(image)
+                or ntpath.normpath(image).casefold() != image.casefold()
+            ):
+                return False
+            seen.add(member["pid"])
+            parts = [part.casefold() for part in image.split("\\")]
+            if (
+                len(parts) != 13
+                or not re.fullmatch(r"[a-z]:", parts[0])
+                or parts[1] not in {"program files", "program files (x86)"}
+                or parts[2] != "microsoft visual studio"
+                or not parts[3] or not parts[4] or not parts[8]
+                or parts[5:8] != ["vc", "tools", "msvc"]
+                or parts[9] != "bin"
+                or parts[10] not in {"hostx86", "hostx64", "hostarm64"}
+                or parts[11] not in {"x86", "x64", "arm64"}
+                or parts[12] != "vctip.exe"
+            ):
+                return False
+            if originals is not None:
+                previous = originals.get(member["pid"])
+                if (
+                    previous is None
+                    or previous.get("creation_time_100ns") != member["creation_time_100ns"]
+                    or not isinstance(previous.get("image_path"), str)
+                    or previous["image_path"].casefold() != image.casefold()
+                ):
+                    return False
+        return True
 
     @staticmethod
     def _linux_group_live_pids(pgid: int, proc_root: Path = Path("/proc")) -> list[int]:
@@ -955,6 +1045,11 @@ class StageRecorder:
         leader_exit_at: float | None = None
         last_quiescence_sample = 0.0
         quiescence_seconds: float | None = None
+        quiescence_budget = WINDOWS_JOB_QUIESCENCE_SECONDS
+        vctip_verified_members: list[dict] | None = None
+        vctip_first_seen_seconds: float | None = None
+        vctip_last_seen_seconds: float | None = None
+        quiescence_terminal_reason: str | None = None
         survivor_pids: list[int] | None = None
         survivor_members: list[dict] | None = None
 
@@ -1031,6 +1126,7 @@ class StageRecorder:
                         now = time.monotonic()
                         if leader_exit_at is None:
                             leader_exit_at = now
+                        quiescence_seconds = now - leader_exit_at
                         if now - last_quiescence_sample >= 0.25:
                             self._sample(name, samples, guard, lock)
                             last_quiescence_sample = now
@@ -1038,25 +1134,66 @@ class StageRecorder:
                                 raise RuntimeError(guard["violation"])
                         alive = self._owned_tree_alive(process, job)
                         if not alive and reader_done.is_set():
-                            quiescence_seconds = now - leader_exit_at
+                            if vctip_verified_members is not None:
+                                remaining = self._windows_job_pids(job)
+                                if remaining:
+                                    survivor_pids = remaining
+                                    quiescence_terminal_reason = "job_accounting_pid_disagreement"
+                                    raise RuntimeError("Job Object PID list remained nonempty after accounting reached zero")
+                            quiescence_terminal_reason = "job_empty_and_pipe_drained"
                             break
                         if now - leader_exit_at >= WINDOWS_JOB_QUIESCENCE_SECONDS:
-                            quiescence_seconds = now - leader_exit_at
                             if alive:
                                 try:
-                                    survivor_pids = self._windows_job_pids(job)
+                                    active_pids = self._windows_job_pids(job)
                                 except Exception as exc:
                                     detail = f"Job Object PID query failed: {exc}"
                                 else:
                                     try:
-                                        survivor_members = self._windows_job_member_diagnostics(survivor_pids)
-                                        detail = f"active job members {survivor_members}"
+                                        active_members = self._windows_job_member_diagnostics(active_pids, job)
+                                        confirmed_pids = self._windows_job_pids(job)
                                     except Exception as exc:
-                                        detail = f"active job PIDs {survivor_pids}; image lookup failed: {exc}"
+                                        survivor_pids = active_pids
+                                        detail = f"active job PIDs {active_pids}; image lookup failed: {exc}"
+                                    else:
+                                        if (
+                                            sorted(confirmed_pids) == sorted(active_pids)
+                                            and self._windows_vctip_members_verified(
+                                                active_members, vctip_verified_members,
+                                            )
+                                        ):
+                                            if vctip_verified_members is None:
+                                                vctip_verified_members = active_members
+                                                vctip_first_seen_seconds = quiescence_seconds
+                                            vctip_last_seen_seconds = quiescence_seconds
+                                            quiescence_budget = WINDOWS_VCTIP_QUIESCENCE_SECONDS
+                                            if quiescence_seconds < quiescence_budget:
+                                                time.sleep(0.1)
+                                                continue
+                                            quiescence_terminal_reason = "vctip_quiescence_cap_reached"
+                                        else:
+                                            quiescence_terminal_reason = "unverified_or_changed_job_member"
+                                        survivor_pids = active_pids
+                                        survivor_members = active_members
+                                        detail = (
+                                            f"active job members {active_members}; "
+                                            f"confirmed job PIDs {confirmed_pids}"
+                                        )
+                                if quiescence_terminal_reason is None:
+                                    quiescence_terminal_reason = "job_member_query_failed"
                                 raise RuntimeError(
                                     f"owned process group has unresolved Job Object activity "
-                                    f"(possible surviving descendant; {detail})"
+                                    f"(possible surviving descendant after {quiescence_seconds:.3f}s; {detail})"
                                 )
+                            if vctip_verified_members is not None and quiescence_seconds < quiescence_budget:
+                                remaining = self._windows_job_pids(job)
+                                if remaining:
+                                    survivor_pids = remaining
+                                    quiescence_terminal_reason = "job_accounting_pid_disagreement"
+                                    raise RuntimeError("Job Object PID list remained nonempty after accounting reached zero")
+                                time.sleep(0.1)
+                                continue
+                            quiescence_terminal_reason = "pipe_open_after_job_empty"
                             raise RuntimeError("raw stage pipe remained open after owned Job Object exited")
                     elif reader_done.is_set():
                         break
@@ -1074,6 +1211,10 @@ class StageRecorder:
             if watcher.is_alive():
                 raise RuntimeError("resource watcher did not stop before receipt")
         except BaseException as exc:
+            if leader_exit_at is not None and quiescence_terminal_reason != "job_empty_and_pipe_drained":
+                quiescence_seconds = time.monotonic() - leader_exit_at
+            if vctip_verified_members is not None and quiescence_terminal_reason is None:
+                quiescence_terminal_reason = "interrupted_during_vctip_quiescence"
             errors.append(str(exc) or type(exc).__name__)
         finally:
             if errors:
@@ -1155,9 +1296,17 @@ class StageRecorder:
             "watcher_alive_at_receipt": watcher is not None and watcher.is_alive(),
             "reader_alive_at_receipt": reader is not None and reader.is_alive(),
             "post_leader_quiescence_budget_seconds": (
-                WINDOWS_JOB_QUIESCENCE_SECONDS if self.platform == "windows" else None
+                quiescence_budget if self.platform == "windows" else None
             ),
             "post_leader_quiescence_seconds": quiescence_seconds,
+            "post_leader_quiescence_terminal_reason": quiescence_terminal_reason,
+            "post_leader_vctip_first_seen_seconds": vctip_first_seen_seconds,
+            "post_leader_vctip_last_seen_seconds": vctip_last_seen_seconds,
+            "post_leader_vctip_extension_seconds": (
+                max(0.0, quiescence_seconds - WINDOWS_JOB_QUIESCENCE_SECONDS)
+                if vctip_verified_members is not None and quiescence_seconds is not None else None
+            ),
+            "post_leader_vctip_verified_members": vctip_verified_members,
             "surviving_job_pids": survivor_pids,
             "surviving_job_members": survivor_members,
             "raw_log_complete": process is None or (

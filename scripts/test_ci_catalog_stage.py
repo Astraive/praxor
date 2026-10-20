@@ -1185,8 +1185,8 @@ class StageReceiptTests(unittest.TestCase):
 
             def __call__(self, _job, _kind, buffer, _size, _returned):
                 self.calls += 1
-                ctypes.c_ulong.from_buffer(buffer, 0).value = 2
-                ctypes.c_ulong.from_buffer(buffer, 4).value = 1 if self.calls == 1 else 2
+                ctypes.c_uint32.from_buffer(buffer, 0).value = 2
+                ctypes.c_uint32.from_buffer(buffer, 4).value = 1 if self.calls == 1 else 2
                 ctypes.c_size_t.from_buffer(buffer, 8).value = 1001
                 if self.calls > 1:
                     ctypes.c_size_t.from_buffer(buffer, 8 + ctypes.sizeof(ctypes.c_size_t)).value = 1002
@@ -1194,9 +1194,223 @@ class StageReceiptTests(unittest.TestCase):
 
         query = PartialQuery()
         kernel = SimpleNamespace(QueryInformationJobObject=query, GetLastError=lambda: 0)
-        with patch("ci_catalog_stage.ctypes.windll", SimpleNamespace(kernel32=kernel), create=True):
+        # Windows DWORD stays 32 bits even on an LP64 test host.
+        with patch("ci_catalog_stage.ctypes.windll", SimpleNamespace(kernel32=kernel), create=True), patch.object(
+            ctypes, "c_ulong", ctypes.c_uint64,
+        ):
             self.assertEqual(StageRecorder._windows_job_pids(123), [1001, 1002])
         self.assertEqual(query.calls, 2)
+
+    def test_windows_job_member_diagnostics_preserve_full_native_image_path(self) -> None:
+        image_path = (
+            r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
+            r"\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\VCTIP.EXE"
+        )
+
+        def image_name(_handle, _flags, image, _length):
+            image.value = image_path
+            return 1
+
+        def in_job(_handle, _job, result):
+            result._obj.value = 1
+            return 1
+
+        def process_times(_handle, created, _exited, _kernel, _user):
+            created._obj.low = 0x12345678
+            created._obj.high = 0x9ABCDEF0
+            return 1
+
+        kernel = SimpleNamespace(
+            OpenProcess=lambda *_args: 123,
+            QueryFullProcessImageNameW=image_name,
+            IsProcessInJob=in_job,
+            GetProcessTimes=process_times,
+            CloseHandle=lambda *_args: 1,
+        )
+        with patch("ci_catalog_stage.ctypes.windll", SimpleNamespace(kernel32=kernel), create=True):
+            members = StageRecorder._windows_job_member_diagnostics([9080], 123)
+        self.assertEqual(members[0]["image_path"], image_path)
+        self.assertEqual(members[0]["image_name"], "VCTIP.EXE")
+        self.assertTrue(members[0]["in_job"])
+        self.assertEqual(members[0]["creation_time_100ns"], 0x9ABCDEF012345678)
+        def not_in_job(_handle, _job, result):
+            result._obj.value = 0
+            return 1
+
+        kernel.IsProcessInJob = not_in_job
+        with patch("ci_catalog_stage.ctypes.windll", SimpleNamespace(kernel32=kernel), create=True):
+            nonmember = StageRecorder._windows_job_member_diagnostics([9080], 123)
+        self.assertFalse(nonmember[0]["in_job"])
+        self.assertFalse(StageRecorder._windows_vctip_members_verified(nonmember))
+
+    def test_windows_telemetry_grace_requires_only_verified_vs_vctip_images(self) -> None:
+        valid = {
+            "pid": 9080,
+            "image_name": "VCTIP.EXE",
+            "image_path": (
+                r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
+                r"\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\VCTIP.EXE"
+            ),
+            "name_lookup_error": None,
+            "in_job": True,
+            "creation_time_100ns": 0x12345678,
+        }
+        self.assertTrue(StageRecorder._windows_vctip_members_verified([valid]))
+        self.assertTrue(StageRecorder._windows_vctip_members_verified([valid], [valid]))
+        for bad in (
+            [],
+            [valid, {**valid, "pid": 9081, "image_name": "python.exe"}],
+            [{**valid, "image_path": None}],
+            [{**valid, "name_lookup_error": "access denied"}],
+            [{**valid, "in_job": False}],
+            [{**valid, "creation_time_100ns": None}],
+            [{**valid, "image_path": r"C:\temp\vctip.exe"}],
+            [{**valid, "image_path": r"C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44\bin\Hostx64\x64\..\vctip.exe"}],
+            [{**valid, "image_path": r"vctip.exe"}],
+        ):
+            with self.subTest(bad=bad):
+                self.assertFalse(StageRecorder._windows_vctip_members_verified(bad))
+        self.assertFalse(StageRecorder._windows_vctip_members_verified(
+            [{**valid, "creation_time_100ns": valid["creation_time_100ns"] + 1}], [valid],
+        ))
+        self.assertFalse(StageRecorder._windows_vctip_members_verified(
+            [valid, {**valid, "pid": 9081}], [valid],
+        ))
+
+    def test_windows_verified_vctip_grace_waits_for_empty_job_and_pipe(self) -> None:
+        if os.name != "nt":
+            self.skipTest("native Windows Job Object required")
+        image_path = (
+            r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
+            r"\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\vctip.exe"
+        )
+        child = (
+            "import subprocess,sys; "
+            "subprocess.Popen([sys.executable,'-c','import time; time.sleep(6.2)'], "
+            "stdin=subprocess.DEVNULL,stdout=sys.stdout,stderr=sys.stderr); "
+            "print('leader exited', flush=True)"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            repo.mkdir()
+            environment = os.environ.copy()
+            environment.update(CARGO_TARGET_DIR=str(root / "target"), PRAXOR_TEST_TMP_ROOT=str(root / "fixtures"), TEMP=str(root / "tmp"))
+            with patch("ci_catalog_stage.tracked_manifest", return_value=synthetic_manifest()), patch.object(
+                StageRecorder, "_sample", synthetic_resource_sample
+            ), patch.object(
+                StageRecorder, "_windows_job_member_diagnostics",
+                side_effect=lambda pids, _job: [
+                    {"pid": pid, "image_name": "vctip.exe", "image_path": image_path,
+                     "name_lookup_error": None, "in_job": True, "creation_time_100ns": pid * 1000}
+                    for pid in pids
+                ],
+            ):
+                gate = StageRecorder(repo, root / "artifacts", "a" * 40, environment, "windows")
+                gate.run("telemetry", [sys.executable, "-c", child], timeout_seconds=12)
+            receipt = json.loads((gate.logs / "telemetry.receipt.json").read_text(encoding="utf-8"))
+            self.assertIsNone(receipt["error"])
+            self.assertEqual(receipt["post_leader_quiescence_budget_seconds"], 60)
+            self.assertGreater(receipt["post_leader_vctip_extension_seconds"], 0)
+            self.assertEqual(receipt["post_leader_vctip_verified_members"][0]["image_path"], image_path)
+            self.assertEqual(receipt["post_leader_quiescence_terminal_reason"], "job_empty_and_pipe_drained")
+            self.assertGreaterEqual(receipt["post_leader_vctip_last_seen_seconds"], receipt["post_leader_vctip_first_seen_seconds"])
+            self.assertTrue(receipt["raw_log_complete"])
+            self.assertIsNone(receipt["surviving_job_pids"])
+
+    def test_windows_verified_vctip_still_fails_at_bounded_cap(self) -> None:
+        if os.name != "nt":
+            self.skipTest("native Windows Job Object required")
+        image_path = (
+            r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
+            r"\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\vctip.exe"
+        )
+        child = (
+            "import subprocess,sys,pathlib; "
+            "member=subprocess.Popen([sys.executable,'-c','import time; time.sleep(20)'], "
+            "stdin=subprocess.DEVNULL,stdout=sys.stdout,stderr=sys.stderr); "
+            "pathlib.Path('telemetry.pid').write_text(str(member.pid)); "
+            "print('leader exited', flush=True)"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            repo.mkdir()
+            environment = os.environ.copy()
+            environment.update(CARGO_TARGET_DIR=str(root / "target"), PRAXOR_TEST_TMP_ROOT=str(root / "fixtures"), TEMP=str(root / "tmp"))
+            with patch("ci_catalog_stage.tracked_manifest", return_value=synthetic_manifest()), patch.object(
+                StageRecorder, "_sample", synthetic_resource_sample
+            ), patch.object(
+                StageRecorder, "_windows_job_member_diagnostics",
+                side_effect=lambda pids, _job: [
+                    {"pid": pid, "image_name": "vctip.exe", "image_path": image_path,
+                     "name_lookup_error": None, "in_job": True, "creation_time_100ns": pid * 1000}
+                    for pid in pids
+                ],
+            ), patch("ci_catalog_stage.WINDOWS_VCTIP_QUIESCENCE_SECONDS", 5.5):
+                gate = StageRecorder(repo, root / "artifacts", "a" * 40, environment, "windows")
+                started = time.monotonic()
+                with self.assertRaisesRegex(RuntimeError, "surviving descendant"):
+                    gate.run("telemetry-persistent", [sys.executable, "-c", child], timeout_seconds=12)
+                self.assertLess(time.monotonic() - started, 10)
+            pid = int((repo / "telemetry.pid").read_text(encoding="utf-8"))
+            receipt = json.loads((gate.logs / "telemetry-persistent.receipt.json").read_text(encoding="utf-8"))
+            self.assertEqual(receipt["post_leader_quiescence_budget_seconds"], 5.5)
+            self.assertGreaterEqual(receipt["post_leader_quiescence_seconds"], 5.5)
+            self.assertGreater(receipt["post_leader_vctip_extension_seconds"], 0)
+            self.assertEqual(receipt["surviving_job_pids"], [pid])
+            self.assertEqual(receipt["surviving_job_members"][0]["image_path"], image_path)
+            self.assertEqual(receipt["post_leader_quiescence_terminal_reason"], "vctip_quiescence_cap_reached")
+            self.assertTrue(receipt["raw_log_complete"])
+            self.assert_pid_exited(pid)
+
+    def test_windows_vctip_identity_change_during_grace_fails_and_kills_member(self) -> None:
+        if os.name != "nt":
+            self.skipTest("native Windows Job Object required")
+        image_path = (
+            r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
+            r"\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\vctip.exe"
+        )
+        child = (
+            "import subprocess,sys,pathlib; "
+            "member=subprocess.Popen([sys.executable,'-c','import time; time.sleep(20)'], "
+            "stdin=subprocess.DEVNULL,stdout=sys.stdout,stderr=sys.stderr); "
+            "pathlib.Path('telemetry.pid').write_text(str(member.pid)); "
+            "print('leader exited', flush=True)"
+        )
+        calls = 0
+
+        def changed_identity(pids, _job):
+            nonlocal calls
+            calls += 1
+            return [
+                {"pid": pid, "image_name": "vctip.exe", "image_path": image_path,
+                 "name_lookup_error": None, "in_job": True,
+                 "creation_time_100ns": pid * 1000 + (1 if calls > 1 else 0)}
+                for pid in pids
+            ]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            repo.mkdir()
+            environment = os.environ.copy()
+            environment.update(CARGO_TARGET_DIR=str(root / "target"), PRAXOR_TEST_TMP_ROOT=str(root / "fixtures"), TEMP=str(root / "tmp"))
+            with patch("ci_catalog_stage.tracked_manifest", return_value=synthetic_manifest()), patch.object(
+                StageRecorder, "_sample", synthetic_resource_sample
+            ), patch.object(StageRecorder, "_windows_job_member_diagnostics", side_effect=changed_identity):
+                gate = StageRecorder(repo, root / "artifacts", "a" * 40, environment, "windows")
+                started = time.monotonic()
+                with self.assertRaisesRegex(RuntimeError, "surviving descendant"):
+                    gate.run("telemetry-reused", [sys.executable, "-c", child], timeout_seconds=12)
+                self.assertLess(time.monotonic() - started, 10)
+            pid = int((repo / "telemetry.pid").read_text(encoding="utf-8"))
+            receipt = json.loads((gate.logs / "telemetry-reused.receipt.json").read_text(encoding="utf-8"))
+            self.assertGreater(calls, 1)
+            self.assertEqual(receipt["post_leader_quiescence_budget_seconds"], 60)
+            self.assertEqual(receipt["post_leader_quiescence_terminal_reason"], "unverified_or_changed_job_member")
+            self.assertEqual(receipt["surviving_job_pids"], [pid])
+            self.assert_pid_exited(pid)
 
     def test_windows_persistent_pipe_holder_fails_and_job_kills_member(self) -> None:
         if os.name != "nt":
@@ -1230,6 +1444,8 @@ class StageReceiptTests(unittest.TestCase):
             details = [item for item in receipt["surviving_job_members"] if item["pid"] == member_pid]
             self.assertEqual(len(details), 1)
             self.assertTrue(details[0]["image_name"] or details[0]["name_lookup_error"])
+            self.assertTrue(details[0]["in_job"])
+            self.assertGreater(details[0]["creation_time_100ns"], 0)
             self.assertGreaterEqual(receipt["post_leader_quiescence_seconds"], 5)
             self.assertFalse(receipt["reader_alive_at_receipt"])
             self.assertTrue(receipt["raw_log_complete"])
