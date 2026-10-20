@@ -6,9 +6,10 @@
 use super::authority::CATALOG_CF;
 use super::codec::{CatalogKey, CatalogValue};
 use super::segment_witness::{
-    ObservedSegmentRow, ObservedSegmentValue, PhysicalRowClass, ProtectedRole,
-    ProtectedSegmentCandidate, SegmentFileWitness, SegmentSource,
-    collect_protected_segment_candidate,
+    CopyReplayWork, ExpectedLiteralPut, ObservedSegmentRow, ObservedSegmentValue, PhysicalRowClass,
+    PhysicalRowLocator, ProtectedRole, ProtectedSegmentCandidate, SegmentFileWitness,
+    SegmentSource, collect_protected_segment_candidate, recheck_all_copy_replay_witnesses,
+    with_authenticated_literal_put,
 };
 use super::value_witness::{ValueFileScanProbe, ValueWitnessCandidate, collect_value_witness};
 use crate::core_records::codec::{Key as RecordKey, Role as RecordRole, Row as RecordRow};
@@ -21,6 +22,9 @@ use std::path::Path;
 const MAX_PROTECTED_COPY_ROWS: usize = 65_536;
 const MAX_PROTECTED_COPY_TRIPLES: usize = 65_536;
 const MAX_COPY_LEDGER_RETAINED_BYTES: usize = 32 * 1024 * 1024;
+const COPY_COMPARE_CHUNK_BYTES: usize = 64 * 1024;
+const CATALOG_HEAD_LITERAL_BYTES: usize = 48;
+const RECORD_ALLOCATOR_LITERAL_BYTES: usize = 56;
 
 #[derive(Clone, Copy)]
 struct CopyProofLimits {
@@ -51,6 +55,30 @@ fn metadata_limit() -> PraxisError {
 fn pending_replay() -> PraxisError {
     PraxisError::UnsupportedCatalogFeature {
         feature: "protected physical-copy bytes await authenticated replay",
+    }
+}
+
+fn unproven_copy_group() -> PraxisError {
+    PraxisError::UnsupportedCatalogFeature {
+        feature: "protected physical-copy role group provenance awaits proof",
+    }
+}
+
+fn unproven_index_head_group() -> PraxisError {
+    PraxisError::UnsupportedCatalogFeature {
+        feature: "record-index Head physical group provenance awaits compaction proof",
+    }
+}
+
+fn unproven_external_copy() -> PraxisError {
+    PraxisError::UnsupportedCatalogFeature {
+        feature: "external protected physical-copy bytes await value replay",
+    }
+}
+
+fn literal_buffer_limit() -> PraxisError {
+    PraxisError::UnsupportedCatalogFeature {
+        feature: "literal physical-copy comparison buffer exceeds proof profile",
     }
 }
 
@@ -370,6 +398,204 @@ fn same_triple(a: &CopyDescriptor, b: &CopyDescriptor) -> bool {
     a.cf == b.cf && a.key == b.key && a.sequence == b.sequence
 }
 
+/// This slice knows only two roles whose protocol has one logical Put per
+/// sequence. In particular, a record-index Head may contain several ordered
+/// Puts at one sequence, and compaction can shrink that source group.
+fn singleton_literal_width(root: &Path, descriptor: &CopyDescriptor) -> Result<usize> {
+    if descriptor.cf == CATALOG_CF {
+        return match CatalogKey::decode(&descriptor.key, root)? {
+            CatalogKey::Head => Ok(CATALOG_HEAD_LITERAL_BYTES),
+            _ => Err(unproven_copy_group()),
+        };
+    }
+    let role = RecordRole::from_cf(&descriptor.cf)
+        .ok_or_else(|| corrupt(root, "copy descriptor lacks a protected role"))?;
+    match RecordKey::decode(role, &descriptor.key, root)? {
+        RecordKey::Allocator => Ok(RECORD_ALLOCATOR_LITERAL_BYTES),
+        RecordKey::Head { .. } => Err(unproven_index_head_group()),
+        _ => Err(unproven_copy_group()),
+    }
+}
+
+fn witnessed_source<'a>(
+    root: &Path,
+    witnesses: &'a [SegmentFileWitness],
+    descriptor: &CopyDescriptor,
+) -> Result<&'a SegmentFileWitness> {
+    let index = witnesses
+        .binary_search_by_key(
+            &(descriptor.source.level, descriptor.source.id),
+            |witness| (witness.source.level, witness.source.id),
+        )
+        .map_err(|_| corrupt(root, "copy row source has no replay witness"))?;
+    let witness = &witnesses[index];
+    if witness.source != descriptor.source {
+        return Err(corrupt(root, "copy row source differs from replay witness"));
+    }
+    Ok(witness)
+}
+
+/// The shared budget debit outlives both selected-row callbacks. Unwinding
+/// drops its allocated bytes before the exact refund, like the source capture.
+struct LiteralComparisonBuffer<'a> {
+    bytes: Vec<u8>,
+    budget: &'a mut PhysicalWitnessBudget,
+    root: &'a Path,
+    charge: usize,
+}
+
+impl<'a> LiteralComparisonBuffer<'a> {
+    fn new(
+        root: &'a Path,
+        budget: &'a mut PhysicalWitnessBudget,
+        work: &mut CopyReplayWork,
+        width: usize,
+    ) -> Result<Self> {
+        let charge = width
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(64))
+            .ok_or_else(literal_buffer_limit)?;
+        work.reserve_literal_comparison_buffer(charge)?;
+        if charge > budget.remaining_bytes() {
+            return Err(literal_buffer_limit());
+        }
+        budget.charge(root, charge)?;
+        Ok(Self {
+            bytes: Vec::new(),
+            budget,
+            root,
+            charge,
+        })
+    }
+}
+
+impl Drop for LiteralComparisonBuffer<'_> {
+    fn drop(&mut self) {
+        drop(std::mem::take(&mut self.bytes));
+        if self.budget.release(self.root, self.charge).is_err() {
+            std::process::abort();
+        }
+    }
+}
+
+fn exact_literal_bytes_equal(canonical: &[u8], other: &[u8]) -> bool {
+    canonical.len() == other.len()
+        && canonical
+            .chunks(COPY_COMPARE_CHUNK_BYTES)
+            .zip(other.chunks(COPY_COMPARE_CHUNK_BYTES))
+            .all(|(left, right)| left == right)
+}
+
+fn replay_literal_copy_groups(
+    root: &Path,
+    manifest: &Manifest,
+    segment: &ProtectedSegmentCandidate,
+    descriptors: &[CopyDescriptor],
+    groups: &[CopyTripleGroup],
+    budget: &mut PhysicalWitnessBudget,
+    work: &mut CopyReplayWork,
+) -> Result<()> {
+    for group in groups {
+        let copies = &descriptors[group.start..group.end];
+        if copies.len() < 2 {
+            continue;
+        }
+        let width = singleton_literal_width(root, &copies[0])?;
+        if copies
+            .iter()
+            .any(|copy| matches!(copy.operation, CopyWireOperation::Pointer { .. }))
+        {
+            return Err(unproven_external_copy());
+        }
+        if copies.iter().any(
+            |copy| !matches!(copy.operation, CopyWireOperation::Put { len } if len == width as u64),
+        ) {
+            return Err(corrupt(
+                root,
+                "singleton protected copy has conflicting wire operation or length",
+            ));
+        }
+        let mut canonical = LiteralComparisonBuffer::new(root, budget, work, width)?;
+        let first = &copies[0];
+        let first_witness = witnessed_source(root, &segment.witnesses, first)?;
+        let charge = canonical.charge;
+        let bytes = &mut canonical.bytes;
+        let replay_budget = &mut *canonical.budget;
+        with_authenticated_literal_put(
+            root,
+            manifest,
+            first_witness,
+            PhysicalRowLocator {
+                source: first.source,
+                block_offset: first.block_offset,
+                row_ordinal: first.row_ordinal,
+            },
+            ExpectedLiteralPut {
+                cf: &first.cf,
+                key: &first.key,
+                sequence: first.sequence,
+            },
+            work,
+            replay_budget,
+            |actual| {
+                if actual.len() != width {
+                    return Err(corrupt(
+                        root,
+                        "singleton protected copy has invalid replay length",
+                    ));
+                }
+                bytes
+                    .try_reserve_exact(width)
+                    .map_err(|_| literal_buffer_limit())?;
+                if bytes.capacity() > charge {
+                    return Err(literal_buffer_limit());
+                }
+                bytes.extend_from_slice(actual);
+                Ok(())
+            },
+        )?;
+        for copy in &copies[1..] {
+            let witness = witnessed_source(root, &segment.witnesses, copy)?;
+            let expected = &canonical.bytes;
+            let replay_budget = &mut *canonical.budget;
+            with_authenticated_literal_put(
+                root,
+                manifest,
+                witness,
+                PhysicalRowLocator {
+                    source: copy.source,
+                    block_offset: copy.block_offset,
+                    row_ordinal: copy.row_ordinal,
+                },
+                ExpectedLiteralPut {
+                    cf: &copy.cf,
+                    key: &copy.key,
+                    sequence: copy.sequence,
+                },
+                work,
+                replay_budget,
+                |actual| {
+                    if !exact_literal_bytes_equal(expected, actual) {
+                        return Err(corrupt(
+                            root,
+                            "protected physical-copy actual bytes conflict",
+                        ));
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        drop(canonical);
+    }
+    // Selected-row callbacks are provisional until every retained source is
+    // rebound to its MANIFEST identity and full digest at one complete fence.
+    let fence = recheck_all_copy_replay_witnesses(root, manifest, &segment.witnesses, work)?;
+    if !fence.confirms(&segment.witnesses) {
+        return Err(corrupt(root, "complete copy replay witness set changed"));
+    }
+    Ok(())
+}
+
 fn preflight_row(root: &Path, manifest: &Manifest, row: &ObservedSegmentRow) -> Result<bool> {
     if row.sequence == 0 || row.sequence > manifest.flushed_sequence {
         return Err(corrupt(
@@ -551,8 +777,22 @@ pub(crate) fn collect_protected_copy_ledger(
     if let Err(error) = metadata {
         return attempt.fail(error);
     }
-    // No positive result is possible until a witnessed row accessor has
-    // compared each group's actual bytes while all receipts remain live.
+    let mut replay_work = CopyReplayWork::production();
+    let replay = replay_literal_copy_groups(
+        root,
+        manifest,
+        attempt.segment.as_ref().expect("segment receipt exists"),
+        &attempt.descriptors,
+        &attempt.groups,
+        &mut *attempt.budget,
+        &mut replay_work,
+    );
+    if let Err(error) = replay {
+        return attempt.fail(error);
+    }
+    // This slice validates only fixed singleton literal copies. No private
+    // candidate can be returned until all other groups and logical value
+    // forms have a complete proof and consumption-boundary recheck.
     attempt.fail(pending_replay())
 }
 
@@ -589,4 +829,191 @@ pub(crate) fn admit_protected_physical_copies(
     Err(PraxisError::UnsupportedCatalogFeature {
         feature: "protected physical-copy ledger not implemented",
     })
+}
+
+#[cfg(test)]
+mod literal_comparison_tests {
+    use super::*;
+    use crate::accel::cpu::scalar::CpuAccelerator;
+    use crate::config::Compression;
+    use crate::core_catalog::physical::inspect_v4_owner;
+    use crate::core_catalog::physical_tests::flushed_create_fixture;
+    use crate::disk::DiskLayout;
+    use crate::manifest::ManifestStore;
+    use crate::segments::codec::decode_segment;
+    use crate::segments::{SegmentWriteOptions, SegmentWriter};
+    use crate::types::StoredValue;
+    use crate::values::ValueLog;
+    use crate::wal::catalog_witness::{WalCut, scan_v4_wals_with_budget};
+    use std::fs;
+
+    #[derive(Clone, Copy)]
+    enum Case {
+        IdenticalAllocator,
+        ConflictingHead,
+    }
+
+    fn exercise(case: Case) {
+        let (_dir, config, lease) = flushed_create_fixture();
+        let root = lease.root();
+        let layout = DiskLayout::at(root);
+        let manifest_path = layout.manifest_path();
+        let mut manifest =
+            Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+        let first_path = layout.segment_path(0, 1);
+        let original_file = fs::read(&first_path).unwrap();
+        let original_segment =
+            decode_segment(&original_file, &first_path, &CpuAccelerator).unwrap();
+        let (cf, key, sequence) = match case {
+            Case::IdenticalAllocator => (RecordRole::Meta.cf(), &[1_u8][..], 1),
+            Case::ConflictingHead => (CATALOG_CF, &[0_u8][..], 2),
+        };
+        let mut duplicate = original_segment
+            .blocks
+            .iter()
+            .flatten()
+            .find(|row| {
+                row.entry.cf.0 == cf
+                    && row.entry.key.as_ref() == key
+                    && row.entry.version.sequence == sequence
+            })
+            .unwrap()
+            .entry
+            .clone();
+        if matches!(case, Case::ConflictingHead) {
+            let StoredValue::Put(original_bytes) = &duplicate.version.value else {
+                panic!("writer Head must be a literal Put")
+            };
+            let CatalogValue::Head(mut head) =
+                CatalogValue::decode(&CatalogKey::Head, original_bytes, &first_path).unwrap()
+            else {
+                panic!("writer Head must decode")
+            };
+            head.collection_count += 1;
+            let changed = CatalogValue::Head(head).encode().unwrap();
+            assert_eq!(changed.len(), original_bytes.len());
+            assert_ne!(changed, *original_bytes);
+            duplicate.version.value = StoredValue::Put(changed);
+        }
+
+        let second_path = layout.segment_path(1, 2);
+        fs::create_dir_all(second_path.parent().unwrap()).unwrap();
+        let value_path = layout.value_log_path(2);
+        let mut value_log = ValueLog::open(&value_path).unwrap();
+        let second_meta = SegmentWriter::write(
+            SegmentWriteOptions {
+                path: &second_path,
+                id: 2,
+                level: 1,
+                compression: Compression::None,
+                accelerator: &CpuAccelerator,
+                value_log: &mut value_log,
+                large_value_threshold: config.large_value_threshold,
+                block_size: config.block_size,
+                partitioned_bloom: None,
+                direct_io: false,
+            },
+            vec![duplicate],
+        )
+        .unwrap();
+        drop(value_log);
+        fs::remove_file(value_path).unwrap();
+        manifest.segments.push(second_meta);
+        manifest.next_segment_id = 3;
+        ManifestStore::new(manifest_path.clone())
+            .save(&manifest)
+            .unwrap();
+        let manifest =
+            Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+        let before = [
+            fs::read(&first_path).unwrap(),
+            fs::read(&second_path).unwrap(),
+            fs::read(&manifest_path).unwrap(),
+        ];
+        assert!(matches!(
+            inspect_v4_owner(&lease, &config, &CpuAccelerator),
+            Err(PraxisError::UnsupportedCatalogFeature {
+                feature: "v4 installed cut beyond narrow D0 bootstrap"
+            })
+        ));
+
+        let cut = WalCut {
+            flushed_sequence: manifest.flushed_sequence,
+            last_sequence: manifest.last_sequence,
+            flushed_wal_id: manifest.flushed_wal_id,
+            active_wal_id: manifest.active_wal_id,
+            next_wal_id: manifest.next_wal_id,
+        };
+        let (_wal_witnesses, mut budget) =
+            scan_v4_wals_with_budget(root, cut, |_, _, _, _| Ok(())).unwrap();
+        let balance = budget.remaining_bytes();
+        match (
+            case,
+            collect_protected_copy_ledger(root, &manifest, &mut budget),
+        ) {
+            (
+                Case::IdenticalAllocator,
+                Err(PraxisError::UnsupportedCatalogFeature {
+                    feature: "protected physical-copy bytes await authenticated replay",
+                }),
+            ) => {}
+            (Case::ConflictingHead, Err(PraxisError::Corrupt { reason, .. })) => {
+                assert!(
+                    reason.contains("actual bytes conflict"),
+                    "unexpected refusal: {reason}"
+                );
+            }
+            (_, other) => panic!("unexpected private literal-comparison result: {other:?}"),
+        }
+        assert_eq!(budget.remaining_bytes(), balance, "exact witness refund");
+        assert_eq!(fs::read(&first_path).unwrap(), before[0]);
+        assert_eq!(fs::read(&second_path).unwrap(), before[1]);
+        assert_eq!(fs::read(&manifest_path).unwrap(), before[2]);
+        assert!(matches!(
+            inspect_v4_owner(&lease, &config, &CpuAccelerator),
+            Err(PraxisError::UnsupportedCatalogFeature {
+                feature: "v4 installed cut beyond narrow D0 bootstrap"
+            })
+        ));
+    }
+
+    #[test]
+    fn writer_identical_allocator_replays_actual_bytes_but_stays_private() {
+        exercise(Case::IdenticalAllocator);
+    }
+
+    #[test]
+    fn writer_rechecksummed_head_conflict_refunds_after_actual_byte_compare() {
+        exercise(Case::ConflictingHead);
+    }
+
+    #[test]
+    fn record_index_head_group_waits_for_compaction_provenance() {
+        let key = RecordKey::Head {
+            index: 1,
+            incarnation: 1,
+            key: b"test",
+        }
+        .encode()
+        .unwrap();
+        let descriptor = CopyDescriptor {
+            cf: RecordRole::Index.cf().into(),
+            key,
+            sequence: 2,
+            source: SegmentSource {
+                level: 0,
+                id: 1,
+                manifest_ordinal: 0,
+            },
+            block_offset: 21,
+            row_ordinal: 0,
+            operation: CopyWireOperation::Put { len: 40 },
+        };
+        assert!(matches!(
+            singleton_literal_width(Path::new("copy-test"), &descriptor),
+            Err(PraxisError::UnsupportedCatalogFeature {
+                feature: "record-index Head physical group provenance awaits compaction proof"
+            })
+        ));
+    }
 }

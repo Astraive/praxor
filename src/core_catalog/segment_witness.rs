@@ -1239,6 +1239,16 @@ impl CopyReplayWork {
         self.peak_transient_bytes = self.peak_transient_bytes.max(transient);
         Ok(())
     }
+
+    /// The ledger retains one small, charged canonical value while the
+    /// selected literal replay holds its bounded full-file capture. Account
+    /// for the simultaneous peak before either callback can allocate bytes.
+    pub(crate) fn reserve_literal_comparison_buffer(&mut self, allowance: usize) -> Result<()> {
+        let peak = (MAX_LITERAL_SEGMENT_BYTES * 2 + 64)
+            .checked_add(allowance)
+            .ok_or_else(|| unsupported("literal copy comparison buffer exceeds proof profile"))?;
+        self.reserve(0, 0, peak)
+    }
 }
 
 /// The charge precedes capture allocation and remains live through callback
