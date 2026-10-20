@@ -1717,6 +1717,15 @@ fn preflight_row(
             "record Payload Put copy is before Create sequence",
         ));
     }
+    if matches!(&key, RecordKey::Payload(_))
+        && row.sequence == 1
+        && matches!(&row.value, ObservedSegmentValue::Delete)
+    {
+        return Err(corrupt(
+            root,
+            "record Payload Delete copy is before Create sequence",
+        ));
+    }
     match &row.value {
         ObservedSegmentValue::Put(bytes) => {
             let _decoded = RecordRow::decode(&key, bytes, root)?;
