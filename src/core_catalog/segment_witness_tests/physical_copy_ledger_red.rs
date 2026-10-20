@@ -2,7 +2,8 @@ use super::*;
 use crate::core_catalog::codec::{Anchor, anchor_digest};
 use crate::core_catalog::physical_copy::{
     CopyWireOperation, collect_protected_copy_admission,
-    collect_protected_copy_admission_with_limits_for_test, collect_protected_copy_ledger,
+    collect_protected_copy_admission_with_limits_for_test,
+    collect_protected_copy_admission_with_profile_for_test, collect_protected_copy_ledger,
 };
 use crate::core_catalog::value_witness::{
     ValueFileScanProbe, ValueRowLocator, collect_value_witness, validate_inline_catalog_schema_put,
@@ -1309,6 +1310,100 @@ fn distinct_triple_cap_refuses_before_private_candidate_and_refunds() {
             budget.remaining_bytes(),
             balance,
             "control must refund exactly"
+        );
+        assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+    });
+
+    assert!(matches!(
+        inspect_v4_owner(&fixture.lease, &fixture.config, &CpuAccelerator),
+        Err(PraxisError::UnsupportedCatalogFeature {
+            feature: "v4 installed cut beyond narrow D0 bootstrap"
+        })
+    ));
+    assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+}
+
+#[test]
+fn row_and_retained_metadata_caps_refuse_before_private_candidate_and_refund() {
+    let fixture = next_copy_fixture(NextCopyCase::IdenticalAllocator);
+    let root = fixture.lease.root();
+    assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+
+    with_wal_budget(root, &fixture.manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let row_error = collect_protected_copy_admission_with_limits_for_test(
+            root,
+            &fixture.manifest,
+            budget,
+            7,
+            7,
+        )
+        .err()
+        .expect("eight authenticated rows must exceed the seven-row cap");
+        assert!(matches!(
+            row_error,
+            PraxisError::UnsupportedCatalogFeature {
+                feature: "protected physical-copy metadata exceeds the private proof profile"
+            }
+        ));
+        assert_eq!(budget.remaining_bytes(), balance, "row-cap refund");
+        assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+
+        let candidate = collect_protected_copy_admission_with_limits_for_test(
+            root,
+            &fixture.manifest,
+            budget,
+            8,
+            7,
+        )
+        .expect("eight-row, seven-triple boundary must stage");
+        let exact_metadata_bytes = candidate.retained_metadata_bytes_for_test();
+        assert!(exact_metadata_bytes > 0);
+        let ledger = candidate
+            .consume()
+            .expect("boundary must pass the consumption fence");
+        assert_eq!(ledger.copies().len(), 8);
+        drop(ledger);
+        assert_eq!(budget.remaining_bytes(), balance, "row-boundary refund");
+        assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+
+        let metadata_error = collect_protected_copy_admission_with_profile_for_test(
+            root,
+            &fixture.manifest,
+            budget,
+            8,
+            7,
+            exact_metadata_bytes - 1,
+        )
+        .err()
+        .expect("one byte below the measured metadata charge must refuse");
+        assert!(matches!(
+            metadata_error,
+            PraxisError::UnsupportedCatalogFeature {
+                feature: "protected physical-copy metadata exceeds the private proof profile"
+            }
+        ));
+        assert_eq!(budget.remaining_bytes(), balance, "metadata-cap refund");
+        assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+
+        let candidate = collect_protected_copy_admission_with_profile_for_test(
+            root,
+            &fixture.manifest,
+            budget,
+            8,
+            7,
+            exact_metadata_bytes,
+        )
+        .expect("the exact retained-metadata boundary must stage");
+        let ledger = candidate
+            .consume()
+            .expect("the exact metadata boundary must pass the consumption fence");
+        assert_eq!(ledger.copies().len(), 8);
+        drop(ledger);
+        assert_eq!(
+            budget.remaining_bytes(),
+            balance,
+            "metadata-boundary refund"
         );
         assert_eq!(snapshot(fixture.dir.path()), fixture.before);
     });

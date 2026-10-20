@@ -457,6 +457,11 @@ pub(crate) struct PhysicalCopySourceRef<'a> {
 #[allow(dead_code)] // Private tests exercise this before installed-cut composition.
 impl<'a> ProtectedCopyAdmissionCandidate<'a> {
     #[cfg(test)]
+    pub(crate) fn retained_metadata_bytes_for_test(&self) -> usize {
+        self.attempt.metadata_charge
+    }
+
+    #[cfg(test)]
     pub(crate) fn replay_reads_for_test(&self) -> u64 {
         self.work.physical_bytes()
     }
@@ -1899,8 +1904,29 @@ pub(crate) fn collect_protected_copy_admission_with_limits_for_test<'a>(
     max_rows: usize,
     max_triples: usize,
 ) -> Result<ProtectedCopyAdmissionCandidate<'a>> {
+    collect_protected_copy_admission_with_profile_for_test(
+        root,
+        manifest,
+        budget,
+        max_rows,
+        max_triples,
+        MAX_COPY_LEDGER_RETAINED_BYTES,
+    )
+}
+
+/// Lower the retained-metadata ceiling without changing production limits.
+#[cfg(test)]
+pub(crate) fn collect_protected_copy_admission_with_profile_for_test<'a>(
+    root: &'a Path,
+    manifest: &'a Manifest,
+    budget: &'a mut PhysicalWitnessBudget,
+    max_rows: usize,
+    max_triples: usize,
+    max_metadata_bytes: usize,
+) -> Result<ProtectedCopyAdmissionCandidate<'a>> {
     assert!(max_rows <= MAX_PROTECTED_COPY_ROWS);
     assert!(max_triples <= MAX_PROTECTED_COPY_TRIPLES);
+    assert!(max_metadata_bytes <= MAX_COPY_LEDGER_RETAINED_BYTES);
     collect_protected_copy_admission_with_limits(
         root,
         manifest,
@@ -1908,7 +1934,7 @@ pub(crate) fn collect_protected_copy_admission_with_limits_for_test<'a>(
         CopyProofLimits {
             max_rows,
             max_triples,
-            max_metadata_bytes: MAX_COPY_LEDGER_RETAINED_BYTES,
+            max_metadata_bytes,
         },
     )
 }
