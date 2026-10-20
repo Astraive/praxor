@@ -1271,6 +1271,13 @@ impl CopyReplayWork {
         self.physical_bytes
     }
 
+    /// Preserve all prior charges while forcing the next physical read to
+    /// cross the cap. Used to test the candidate's consumption boundary.
+    #[cfg(test)]
+    pub(crate) fn exhaust_physical_reads_for_test(&mut self) {
+        self.limits.max_physical_bytes = self.physical_bytes;
+    }
+
     #[cfg(test)]
     pub(crate) fn file_opens(&self) -> u64 {
         self.file_opens

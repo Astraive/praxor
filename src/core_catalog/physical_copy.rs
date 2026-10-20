@@ -1,7 +1,7 @@
-//! Private physical-copy admission seam for protected installed rows.
+//! Private physical-copy equivalence relative to one validated Manifest object.
 //!
-//! The bounded segment visitor and its witnesses precede this ledger. The
-//! current narrow byte comparisons do not grant copy admission.
+//! The bounded segment visitor and its witnesses precede this ledger. An
+//! installed cut and public owner authority require separate witnesses.
 
 use super::authority::CATALOG_CF;
 use super::codec::{CatalogKey, CatalogValue};
@@ -111,9 +111,9 @@ fn schema_buffer_limit() -> PraxisError {
     }
 }
 
-#[allow(dead_code)] // Compared only after authenticated replay lands.
+#[allow(dead_code)] // Retained in the private physical-source view.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CopyWireOperation {
+pub(crate) enum CopyWireOperation {
     Put { len: u64 },
     Delete,
     Pointer { len: u64 },
@@ -416,6 +416,116 @@ impl Drop for CopyAttempt<'_> {
         if self.cleanup().is_err() {
             std::process::abort();
         }
+    }
+}
+
+/// A staged private, object-relative copy proof. The attempt owns the budget
+/// borrow and all three receipts, so dropping either this candidate or its
+/// consumed ledger refunds the exact charges even during unwinding. The same
+/// replay meter moves into the consumed ledger; it is never reconstructed.
+#[allow(dead_code)] // The public owner remains fenced pending #83 and #84.
+pub(crate) struct ProtectedCopyAdmissionCandidate<'a> {
+    manifest: &'a Manifest,
+    attempt: CopyAttempt<'a>,
+    work: CopyReplayWork,
+}
+
+/// Physical equivalence relative to one validated Manifest object. No
+/// current-version choice, installed-MANIFEST witness, or public owner proof
+/// is carried by this result.
+#[allow(dead_code)] // The public owner remains fenced pending #83 and #84.
+pub(crate) struct ProtectedCopyAdmissionLedger<'a> {
+    _manifest: &'a Manifest,
+    attempt: CopyAttempt<'a>,
+    _work: CopyReplayWork,
+}
+
+/// A borrowing view preserves every physical locator and wire operation
+/// without allocating a second, uncharged copy of the descriptors.
+#[allow(dead_code)] // Consumed by the later installed-relation composer.
+pub(crate) struct PhysicalCopySourceRef<'a> {
+    pub(crate) source: SegmentSource,
+    pub(crate) block_offset: u64,
+    pub(crate) row_ordinal: u32,
+    pub(crate) cf: &'a str,
+    pub(crate) key: &'a [u8],
+    pub(crate) sequence: u64,
+    pub(crate) operation: CopyWireOperation,
+}
+
+#[allow(dead_code)] // Private tests exercise this before installed-cut composition.
+impl<'a> ProtectedCopyAdmissionCandidate<'a> {
+    #[cfg(test)]
+    pub(crate) fn replay_reads_for_test(&self) -> u64 {
+        self.work.physical_bytes()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exhaust_replay_reads_for_test(&mut self) {
+        self.work.exhaust_physical_reads_for_test();
+    }
+
+    pub(crate) fn consume(mut self) -> Result<ProtectedCopyAdmissionLedger<'a>> {
+        let root = self.attempt.root;
+        let segment = self
+            .attempt
+            .segment
+            .as_ref()
+            .expect("copy admission owns its segment receipt");
+        let segment_fence = recheck_all_copy_replay_witnesses(
+            root,
+            self.manifest,
+            &segment.witnesses,
+            &mut self.work,
+        )?;
+        if !segment_fence.confirms(&segment.witnesses) {
+            return Err(corrupt(root, "complete consumed copy source set changed"));
+        }
+        if let Some(value) = self.attempt.value.as_ref() {
+            let mut context = ValueReplayContext::new(&mut self.work);
+            let value_fence = recheck_value_witness_for_copy(
+                root,
+                self.manifest,
+                value,
+                &mut context,
+                &mut *self.attempt.budget,
+            )?;
+            if !value_fence.confirms(value) {
+                return Err(corrupt(root, "complete consumed value source set changed"));
+            }
+        }
+        Ok(ProtectedCopyAdmissionLedger {
+            _manifest: self.manifest,
+            attempt: self.attempt,
+            _work: self.work,
+        })
+    }
+}
+
+#[allow(dead_code)] // Private tests exercise this before installed-cut composition.
+impl ProtectedCopyAdmissionLedger<'_> {
+    pub(crate) fn copies(&self) -> impl ExactSizeIterator<Item = PhysicalCopySourceRef<'_>> {
+        self.attempt
+            .descriptors
+            .iter()
+            .map(|copy| PhysicalCopySourceRef {
+                source: copy.source,
+                block_offset: copy.block_offset,
+                row_ordinal: copy.row_ordinal,
+                cf: &copy.cf,
+                key: &copy.key,
+                sequence: copy.sequence,
+                operation: copy.operation,
+            })
+    }
+
+    pub(crate) fn segment_witnesses(&self) -> &[SegmentFileWitness] {
+        &self
+            .attempt
+            .segment
+            .as_ref()
+            .expect("copy admission owns its segment receipt")
+            .witnesses
     }
 }
 
@@ -1519,14 +1629,14 @@ fn preflight_row(
     Ok(false)
 }
 
-/// Stages an owned, bounded physical ledger candidate without granting copy
-/// equivalence. The next slice must replay authenticated bytes before `finish`.
-#[allow(dead_code)] // Called by the private #82 integration after replay lands.
-pub(crate) fn collect_protected_copy_ledger(
-    root: &Path,
+/// Stages the complete physical row set and proves every currently supported
+/// repeated group. The attempt retains all receipts while the same replay
+/// meter is transferred to the later consumption boundary.
+fn stage_protected_copy_attempt<'a>(
+    root: &'a Path,
     manifest: &Manifest,
-    budget: &mut PhysicalWitnessBudget,
-) -> Result<ProtectedCopyLedgerCandidate> {
+    budget: &'a mut PhysicalWitnessBudget,
+) -> Result<(CopyAttempt<'a>, CopyReplayWork)> {
     manifest.validate_v4(root)?;
     let mut attempt = CopyAttempt::new(root, budget, COPY_PROOF_LIMITS);
     match collect_protected_segment_candidate(root, manifest, &mut *attempt.budget) {
@@ -1621,44 +1731,38 @@ pub(crate) fn collect_protected_copy_ledger(
     if let Err(error) = replay {
         return attempt.fail(error);
     }
-    // This slice compares bounded fixed and Schema inline/external copy groups
-    // and complete ordered record-index Head literal groups. Other variable or
-    // compressed groups and consumption-boundary admission remain separate.
+    Ok((attempt, replay_work))
+}
+
+/// The legacy nonadmitting collector remains until its callers migrate to the
+/// budget-borrowing, consumption-bound private path below. It cannot leak a
+/// partially admitted ledger through its old explicit-discard API.
+#[allow(dead_code)] // Existing RED tests exercise this historical seam.
+pub(crate) fn collect_protected_copy_ledger(
+    root: &Path,
+    manifest: &Manifest,
+    budget: &mut PhysicalWitnessBudget,
+) -> Result<ProtectedCopyLedgerCandidate> {
+    let (attempt, _work) = stage_protected_copy_attempt(root, manifest, budget)?;
     attempt.fail(pending_replay())
 }
 
-/// A source locator stays tied to a physical row, before any version fold.
-#[allow(dead_code)] // Deliberately unconstructed until the #82 GREEN admission proof.
-#[derive(Debug)]
-pub(crate) struct PhysicalCopySource {
-    pub(crate) source: SegmentSource,
-    pub(crate) block_offset: u64,
-    pub(crate) row_ordinal: u32,
-    pub(crate) cf: String,
-    pub(crate) key: Vec<u8>,
-    pub(crate) sequence: u64,
-}
-
-/// Admitted copy locations and their authenticated source-file receipts.
-#[allow(dead_code)] // The RED stub cannot construct a ledger before equivalence proof.
-#[derive(Debug)]
-pub(crate) struct ProtectedCopyLedger {
-    pub(crate) copies: Vec<PhysicalCopySource>,
-    pub(crate) segment_witnesses: Vec<SegmentFileWitness>,
-}
-
-/// The future ledger must prove every same-(CF,key,S) physical source before
-/// selecting a current version. It does not expose public owner authority.
-#[allow(dead_code)] // Called only by the focused RED until private admission exists.
-pub(crate) fn admit_protected_physical_copies(
-    _root: &Path,
-    _manifest: &Manifest,
-    _observed: &[ObservedSegmentRow],
-    _witnesses: &[SegmentFileWitness],
-    _budget: &mut PhysicalWitnessBudget,
-) -> Result<ProtectedCopyLedger> {
-    Err(PraxisError::UnsupportedCatalogFeature {
-        feature: "protected physical-copy ledger not implemented",
+/// Begin an object-relative private equivalence proof. Inline Schema syntax is
+/// checked during charged preflight, and an external Anchor is bound to the
+/// passed Manifest identity before this candidate can be returned. Every
+/// unsupported role group fails the complete candidate; no installed-cut or
+/// public owner proof is produced.
+#[allow(dead_code)] // Private tests exercise this before installed-cut composition.
+pub(crate) fn collect_protected_copy_admission<'a>(
+    root: &'a Path,
+    manifest: &'a Manifest,
+    budget: &'a mut PhysicalWitnessBudget,
+) -> Result<ProtectedCopyAdmissionCandidate<'a>> {
+    let (attempt, work) = stage_protected_copy_attempt(root, manifest, budget)?;
+    Ok(ProtectedCopyAdmissionCandidate {
+        manifest,
+        attempt,
+        work,
     })
 }
 

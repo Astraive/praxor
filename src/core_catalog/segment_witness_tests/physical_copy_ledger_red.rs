@@ -1,7 +1,7 @@
 use super::*;
 use crate::core_catalog::codec::{Anchor, anchor_digest};
 use crate::core_catalog::physical_copy::{
-    admit_protected_physical_copies, collect_protected_copy_ledger,
+    CopyWireOperation, collect_protected_copy_admission, collect_protected_copy_ledger,
 };
 use crate::core_catalog::value_witness::{
     ValueFileScanProbe, ValueRowLocator, collect_value_witness, validate_inline_catalog_schema_put,
@@ -489,29 +489,25 @@ fn writer_produced_duplicate_head_at_s2_reaches_private_copy_ledger() {
         }
         assert_eq!(snapshot(dir.path()), before);
 
-        // Expected compiling RED: only the new private ledger Unsupported
-        // remains after the bounded visitor, witness and public-fence checks.
         let balance = budget.remaining_bytes();
-        let result =
-            admit_protected_physical_copies(root, &manifest, &observed, &witnesses, budget);
-        assert_eq!(budget.remaining_bytes(), balance);
-        assert_eq!(snapshot(dir.path()), before);
-        let ledger = match result {
-            Ok(ledger) => ledger,
-            Err(PraxisError::UnsupportedCatalogFeature {
-                feature: "protected physical-copy ledger not implemented",
-            }) => {
-                panic!("RED: the private physical-copy ledger has not admitted valid Head@2 copies")
-            }
-            Err(other) => panic!("unexpected private copy-ledger error: {other:?}"),
-        };
-        assert_eq!(ledger.segment_witnesses.len(), 2);
+        let candidate = collect_protected_copy_admission(root, &manifest, budget)
+            .expect("authenticated equal Head@2 copies must stage a private candidate");
+        let ledger = candidate
+            .consume()
+            .expect("all retained source witnesses must survive consumption");
+        assert_eq!(ledger.segment_witnesses().len(), 2);
         let head_copies = ledger
-            .copies
-            .iter()
-            .filter(|copy| copy.cf == CATALOG_CF && copy.key == head_key && copy.sequence == 2)
+            .copies()
+            .filter(|copy| {
+                copy.cf == CATALOG_CF && copy.key == head_key.as_slice() && copy.sequence == 2
+            })
             .collect::<Vec<_>>();
         assert_eq!(head_copies.len(), 2);
+        assert!(
+            head_copies
+                .iter()
+                .all(|copy| copy.operation == CopyWireOperation::Put { len: 48 })
+        );
         assert_eq!(
             (head_copies[0].source, head_copies[1].source),
             (sources[0], sources[1])
@@ -523,6 +519,14 @@ fn writer_produced_duplicate_head_at_s2_reaches_private_copy_ledger() {
         assert_eq!(
             (head_copies[1].block_offset, head_copies[1].row_ordinal),
             (second_offsets[0], 0)
+        );
+        assert_eq!(snapshot(dir.path()), before);
+        drop(head_copies);
+        drop(ledger);
+        assert_eq!(
+            budget.remaining_bytes(),
+            balance,
+            "exact owned-receipt refund"
         );
         assert_eq!(snapshot(dir.path()), before);
     });
@@ -920,31 +924,27 @@ fn exercise_next_copy_case(case: NextCopyCase) {
         assert_eq!(snapshot(fixture.dir.path()), fixture.before);
 
         let balance = budget.remaining_bytes();
-        let result =
-            admit_protected_physical_copies(root, &fixture.manifest, &observed, &witnesses, budget);
-        match case {
-            NextCopyCase::IdenticalAllocator => {
-                let ledger = match result {
-                    Ok(ledger) => ledger,
-                    Err(PraxisError::UnsupportedCatalogFeature {
-                        feature: "protected physical-copy ledger not implemented",
-                    }) => panic!("RED: valid Allocator@1 copies await private copy admission"),
-                    Err(other) => panic!("unexpected allocator copy-ledger error: {other:?}"),
-                };
-                // A correct future candidate may retain a charged receipt until
-                // its explicit discard/consume API exists; it cannot mint budget.
-                assert!(budget.remaining_bytes() <= balance);
-                assert_eq!(ledger.segment_witnesses.len(), 2);
+        let result = collect_protected_copy_admission(root, &fixture.manifest, budget);
+        match (case, result) {
+            (NextCopyCase::IdenticalAllocator, Ok(candidate)) => {
+                let ledger = candidate
+                    .consume()
+                    .expect("all retained source witnesses must survive consumption");
+                assert_eq!(ledger.segment_witnesses().len(), 2);
                 let admitted = ledger
-                    .copies
-                    .iter()
+                    .copies()
                     .filter(|row| {
                         row.cf == fixture.original.cf.0
-                            && row.key.as_slice() == fixture.original.key.as_ref()
+                            && row.key == fixture.original.key.as_ref()
                             && row.sequence == 1
                     })
                     .collect::<Vec<_>>();
                 assert_eq!(admitted.len(), 2);
+                assert!(
+                    admitted
+                        .iter()
+                        .all(|row| row.operation == CopyWireOperation::Put { len: 56 })
+                );
                 assert_eq!(
                     (admitted[0].source, admitted[1].source),
                     (sources[0], sources[1])
@@ -957,28 +957,34 @@ fn exercise_next_copy_case(case: NextCopyCase) {
                     (admitted[1].block_offset, admitted[1].row_ordinal),
                     fixture.second_location
                 );
+                assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+                drop(admitted);
+                drop(ledger);
             }
-            NextCopyCase::ConflictingHead => match result {
-                Err(PraxisError::Corrupt { reason, .. }) => {
-                    assert!(reason.contains("copy"), "wrong ledger rejection: {reason}");
-                    assert_eq!(
-                        budget.remaining_bytes(),
-                        balance,
-                        "refusal must refund exactly"
-                    );
-                }
-                Err(PraxisError::UnsupportedCatalogFeature {
-                    feature: "protected physical-copy ledger not implemented",
-                }) => {
-                    panic!("RED: equal-length, rechecksummed Head@2 conflict awaits ledger Corrupt")
-                }
-                Err(other) => panic!("unexpected conflicting-copy error: {other:?}"),
-                Ok(_) => panic!("ledger admitted rechecksummed conflicting Head@2 copies"),
-            },
-            NextCopyCase::IdenticalBinding | NextCopyCase::ConflictingBinding => {
-                unreachable!("Binding cases use their own test-first role-group gate")
+            (NextCopyCase::IdenticalAllocator, Err(error)) => {
+                panic!("authenticated equal Allocator@1 copies must stage: {error:?}")
+            }
+            (NextCopyCase::ConflictingHead, Err(PraxisError::Corrupt { reason, .. })) => {
+                assert_eq!(
+                    reason.as_str(),
+                    "protected physical-copy actual bytes conflict"
+                );
+            }
+            (NextCopyCase::ConflictingHead, Err(error)) => {
+                panic!("rechecksummed Head@2 conflict must be Corrupt: {error:?}")
+            }
+            (NextCopyCase::ConflictingHead, Ok(_)) => {
+                panic!("candidate admitted rechecksummed conflicting Head@2 copies")
+            }
+            (NextCopyCase::IdenticalBinding | NextCopyCase::ConflictingBinding, _) => {
+                unreachable!("Binding cases use dedicated tests")
             }
         }
+        assert_eq!(
+            budget.remaining_bytes(),
+            balance,
+            "exact owned-receipt refund"
+        );
         assert_eq!(snapshot(fixture.dir.path()), fixture.before);
     });
 }
@@ -991,6 +997,116 @@ fn writer_produced_duplicate_allocator_at_s1_requires_private_copy_admission() {
 #[test]
 fn rechecksummed_equal_length_head_at_s2_conflict_requires_private_copy_corrupt() {
     exercise_next_copy_case(NextCopyCase::ConflictingHead);
+}
+
+#[test]
+fn staged_private_candidate_rechecks_segment_mutation_and_refunds() {
+    let fixture = next_copy_fixture(NextCopyCase::IdenticalAllocator);
+    let root = fixture.lease.root();
+    assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+    with_wal_budget(root, &fixture.manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let candidate = collect_protected_copy_admission(root, &fixture.manifest, budget)
+            .expect("valid equal Allocator copies must stage");
+        let mut mutator = OpenOptions::new()
+            .write(true)
+            .open(&fixture.second_path)
+            .unwrap();
+        mutator.seek(SeekFrom::Start(13)).unwrap();
+        mutator.write_all(&[fixture.second_bytes[13] ^ 1]).unwrap();
+        mutator.sync_data().unwrap();
+        assert!(matches!(
+            candidate.consume(),
+            Err(PraxisError::Corrupt { .. })
+        ));
+        mutator.seek(SeekFrom::Start(13)).unwrap();
+        mutator.write_all(&fixture.second_bytes[13..14]).unwrap();
+        mutator.sync_data().unwrap();
+        drop(mutator);
+        assert_eq!(
+            budget.remaining_bytes(),
+            balance,
+            "consume error must refund"
+        );
+        assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+    });
+    assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+}
+
+#[derive(Clone, Copy)]
+enum CandidateBoundary {
+    ConsumptionCap,
+    CandidateUnwind,
+    LedgerUnwind,
+}
+
+fn exercise_candidate_boundary(boundary: CandidateBoundary) {
+    let fixture = next_copy_fixture(NextCopyCase::IdenticalAllocator);
+    let root = fixture.lease.root();
+    assert!(matches!(
+        inspect_v4_owner(&fixture.lease, &fixture.config, &CpuAccelerator),
+        Err(PraxisError::UnsupportedCatalogFeature {
+            feature: "v4 installed cut beyond narrow D0 bootstrap"
+        })
+    ));
+    assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+    with_wal_budget(root, &fixture.manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        match boundary {
+            CandidateBoundary::ConsumptionCap => {
+                let mut candidate =
+                    collect_protected_copy_admission(root, &fixture.manifest, budget)
+                        .expect("equal Allocator copies must stage");
+                assert!(candidate.replay_reads_for_test() > 0);
+                candidate.exhaust_replay_reads_for_test();
+                assert!(matches!(
+                    candidate.consume(),
+                    Err(PraxisError::UnsupportedCatalogFeature {
+                        feature: "physical-copy replay reads exceed proof profile"
+                    })
+                ));
+            }
+            CandidateBoundary::CandidateUnwind => {
+                let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _candidate =
+                        collect_protected_copy_admission(root, &fixture.manifest, budget)
+                            .expect("equal Allocator copies must stage");
+                    panic!("intentional candidate unwind");
+                }));
+                assert!(panic.is_err());
+            }
+            CandidateBoundary::LedgerUnwind => {
+                let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let candidate =
+                        collect_protected_copy_admission(root, &fixture.manifest, budget)
+                            .expect("equal Allocator copies must stage");
+                    let _ledger = candidate
+                        .consume()
+                        .expect("all retained witnesses must survive consumption");
+                    panic!("intentional consumed-ledger unwind");
+                }));
+                assert!(panic.is_err());
+            }
+        }
+        assert_eq!(budget.remaining_bytes(), balance, "cap/unwind must refund");
+        assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+    });
+    assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+}
+
+#[test]
+fn private_candidate_consumption_cap_refunds_retained_meter() {
+    exercise_candidate_boundary(CandidateBoundary::ConsumptionCap);
+}
+
+#[test]
+fn private_candidate_unwind_refunds_owned_receipts() {
+    exercise_candidate_boundary(CandidateBoundary::CandidateUnwind);
+}
+
+#[test]
+fn private_ledger_unwind_refunds_owned_receipts() {
+    exercise_candidate_boundary(CandidateBoundary::LedgerUnwind);
 }
 
 fn writer_record_binding_pair_case(conflicting: bool) {
@@ -1137,6 +1253,51 @@ fn writer_record_binding_pair_case(conflicting: bool) {
             ));
         }
         assert_eq!(budget.remaining_bytes(), balance, "exact witness refund");
+        assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+
+        match collect_protected_copy_admission(root, &fixture.manifest, budget) {
+            Ok(candidate) if !conflicting => {
+                let ledger = candidate
+                    .consume()
+                    .expect("equal Binding copies must survive consumption fences");
+                assert_eq!(ledger.segment_witnesses().len(), 2);
+                let admitted = ledger
+                    .copies()
+                    .filter(|copy| {
+                        copy.cf == "__praxor_record_meta_v1"
+                            && copy.key == key.as_slice()
+                            && copy.sequence == 1
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(admitted.len(), 2);
+                for (index, copy) in admitted.iter().enumerate() {
+                    assert_eq!(
+                        copy.source,
+                        SegmentSource {
+                            level: index as u32,
+                            id: index as u64 + 1,
+                            manifest_ordinal: index,
+                        }
+                    );
+                    assert_eq!(
+                        (copy.block_offset, copy.row_ordinal),
+                        [fixture.first_location, fixture.second_location][index]
+                    );
+                    assert_eq!(copy.operation, CopyWireOperation::Put { len: 80 });
+                }
+                drop(admitted);
+                drop(ledger);
+            }
+            Err(PraxisError::Corrupt { reason, .. }) if conflicting => {
+                assert_eq!(reason, "protected physical-copy actual bytes conflict");
+            }
+            Ok(candidate) => {
+                drop(candidate);
+                panic!("changed Binding copies reached a private candidate");
+            }
+            Err(error) => panic!("Binding candidate failed at the wrong gate: {error:?}"),
+        }
+        assert_eq!(budget.remaining_bytes(), balance);
         assert_eq!(snapshot(fixture.dir.path()), fixture.before);
     });
     assert_eq!(snapshot(fixture.dir.path()), fixture.before);
@@ -1817,19 +1978,78 @@ fn exercise_compressed_head_copy_ledger(conflicting: bool) {
                 feature: "protected physical-copy bytes await authenticated replay",
             } if !conflicting => {}
             PraxisError::Corrupt { reason, .. } if conflicting => {
-                assert!(
-                    reason.contains("actual bytes conflict"),
-                    "expected authenticated decoded Head conflict, got {reason}"
+                assert_eq!(
+                    reason.as_str(),
+                    "protected physical-copy actual bytes conflict"
                 );
             }
             other => panic!("unexpected compressed Head copy outcome: {other:?}"),
         }
+
+        // The legacy collector remains deliberately nonadmitting. The new
+        // candidate must independently prove the same selected LZ4 copies and
+        // retain every file receipt through its consumption boundary.
+        match (
+            conflicting,
+            collect_protected_copy_admission(root, &fixture.manifest, budget),
+        ) {
+            (false, Ok(candidate)) => {
+                let ledger = candidate
+                    .consume()
+                    .expect("equal LZ4 Head copies must survive all witness rechecks");
+                assert_eq!(ledger.segment_witnesses().len(), 2);
+                let admitted = ledger
+                    .copies()
+                    .filter(|copy| {
+                        copy.cf == CATALOG_CF
+                            && copy.key == head_key.as_slice()
+                            && copy.sequence == 2
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(admitted.len(), 2);
+                assert_eq!(
+                    (admitted[0].source, admitted[1].source),
+                    (sources[0], sources[1])
+                );
+                assert_eq!(
+                    (admitted[0].block_offset, admitted[0].row_ordinal),
+                    fixture.first_location
+                );
+                assert_eq!(
+                    (admitted[1].block_offset, admitted[1].row_ordinal),
+                    fixture.second_location
+                );
+                assert!(
+                    admitted
+                        .iter()
+                        .all(|copy| copy.operation == CopyWireOperation::Put { len: 48 })
+                );
+                assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+                drop(admitted);
+                drop(ledger);
+            }
+            (false, Err(error)) => panic!("equal LZ4 copies must stage: {error:?}"),
+            (true, Err(PraxisError::Corrupt { reason, .. })) => {
+                assert_eq!(
+                    reason.as_str(),
+                    "protected physical-copy actual bytes conflict"
+                );
+            }
+            (true, Err(error)) => panic!("LZ4 Head conflict must be Corrupt: {error:?}"),
+            (true, Ok(_)) => panic!("conflicting LZ4 Head copies produced a candidate"),
+        }
+        assert_eq!(
+            budget.remaining_bytes(),
+            balance,
+            "candidate must refund exactly"
+        );
+        assert_eq!(snapshot(fixture.dir.path()), fixture.before);
     });
     assert_eq!(snapshot(fixture.dir.path()), fixture.before);
 }
 
 #[test]
-fn writer_equal_lz4_head_copies_reach_pending_private_admission() {
+fn writer_equal_lz4_head_copies_prove_private_candidate() {
     exercise_compressed_head_copy_ledger(false);
 }
 
@@ -2237,37 +2457,68 @@ fn ordered_record_head_group_case(case: OrderedHeadGroupCase) {
         }
         assert_eq!(snapshot(dir.path()), before);
         let balance = budget.remaining_bytes();
-        let result = collect_protected_copy_ledger(root, &manifest, budget);
-        match case {
-            OrderedHeadGroupCase::Identical => {
-                let candidate = match result {
-                    Ok(candidate) => candidate,
-                    Err(PraxisError::UnsupportedCatalogFeature {
-                        feature: "protected physical-copy bytes await authenticated replay",
-                    }) => panic!("RED: exact ordered Head groups await physical-copy replay"),
-                    Err(other) => panic!("exact Head groups must be admitted: {other:?}"),
-                };
-                candidate.discard(root, budget).unwrap();
-            }
-            OrderedHeadGroupCase::Reordered | OrderedHeadGroupCase::ChangedLastMember => {
-                match result {
-                    Err(PraxisError::Corrupt { reason, .. }) => {
-                        assert!(reason.contains("copy") || reason.contains("group"));
-                    }
-                    Err(PraxisError::UnsupportedCatalogFeature {
-                        feature: "protected physical-copy bytes await authenticated replay",
-                    }) => panic!("RED: conflicting full Head groups await physical comparison"),
-                    other => panic!("conflicting full Head groups must be Corrupt: {other:?}"),
+        let result = collect_protected_copy_admission(root, &manifest, budget);
+        match (case, result) {
+            (OrderedHeadGroupCase::Identical, Ok(candidate)) => {
+                let ledger = candidate
+                    .consume()
+                    .expect("the complete ordered Head source set must survive consumption");
+                assert_eq!(ledger.segment_witnesses().len(), 3);
+                let admitted = ledger
+                    .copies()
+                    .filter(|copy| {
+                        copy.cf == head_cf && copy.key == head_key.as_slice() && copy.sequence == 2
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(admitted.len(), head_rows.len());
+                for (copy, observed) in admitted.iter().zip(&head_rows) {
+                    assert_eq!(copy.source, observed.source);
+                    assert_eq!(
+                        (copy.block_offset, copy.row_ordinal),
+                        (observed.block_offset, observed.row_ordinal)
+                    );
+                    assert_eq!(copy.operation, CopyWireOperation::Put { len: 40 });
                 }
+                assert_eq!(snapshot(dir.path()), before);
+                drop(admitted);
+                drop(ledger);
             }
-            OrderedHeadGroupCase::ShorterPeer => assert!(matches!(
-                result,
+            (OrderedHeadGroupCase::Identical, Err(error)) => {
+                panic!("equal complete Head groups must stage: {error:?}")
+            }
+            (
+                OrderedHeadGroupCase::Reordered | OrderedHeadGroupCase::ChangedLastMember,
+                Err(PraxisError::Corrupt { reason, .. }),
+            ) => assert_eq!(
+                reason.as_str(),
+                "ordered record Head physical-copy bytes conflict"
+            ),
+            (
+                OrderedHeadGroupCase::Reordered | OrderedHeadGroupCase::ChangedLastMember,
+                Err(error),
+            ) => panic!("conflicting complete Head groups must be Corrupt: {error:?}"),
+            (OrderedHeadGroupCase::Reordered | OrderedHeadGroupCase::ChangedLastMember, Ok(_)) => {
+                panic!("conflicting complete Head groups produced a candidate")
+            }
+            (
+                OrderedHeadGroupCase::ShorterPeer,
                 Err(PraxisError::UnsupportedCatalogFeature {
-                    feature: "record-index Head unequal source-group cardinality awaits provenance proof"
-                })
-            )),
+                    feature:
+                        "record-index Head unequal source-group cardinality awaits provenance proof",
+                }),
+            ) => {}
+            (OrderedHeadGroupCase::ShorterPeer, Err(error)) => {
+                panic!("shorter Head group must refuse provenance: {error:?}")
+            }
+            (OrderedHeadGroupCase::ShorterPeer, Ok(_)) => {
+                panic!("shorter Head group produced an unproved candidate")
+            }
         }
-        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(
+            budget.remaining_bytes(),
+            balance,
+            "exact owned-receipt refund"
+        );
         assert_eq!(snapshot(dir.path()), before);
     });
     assert_eq!(snapshot(dir.path()), before);
@@ -2293,7 +2544,8 @@ fn shorter_co_resident_record_head_group_refuses_without_provenance() {
     ordered_record_head_group_case(OrderedHeadGroupCase::ShorterPeer);
 }
 
-fn exercise_external_anchor_manifest_identity(foreign_identity: bool) {
+fn exercise_external_anchor_manifest_identity(foreign_identity: bool, mutate_at_consume: bool) {
+    assert!(!(foreign_identity && mutate_at_consume));
     let (dir, mut config, lease) = flushed_create_fixture();
     let root = lease.root();
     let layout = DiskLayout::at(root);
@@ -2522,18 +2774,68 @@ fn exercise_external_anchor_manifest_identity(foreign_identity: bool) {
         }
         assert_eq!(budget.remaining_bytes(), balance);
         assert_eq!(snapshot(dir.path()), before);
+
+        if !foreign_identity {
+            let candidate = collect_protected_copy_admission(root, &manifest, budget)
+                .expect("bound external Anchor must stage a private candidate");
+            let ledger = candidate
+                .consume()
+                .expect("unchanged segment and value receipts must survive consumption");
+            assert_eq!(ledger.segment_witnesses().len(), 1);
+            let anchors = ledger
+                .copies()
+                .filter(|copy| {
+                    copy.cf == CATALOG_CF && copy.key == anchor_key.as_slice() && copy.sequence == 1
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(anchors.len(), 1);
+            assert_eq!(anchors[0].operation, CopyWireOperation::Pointer { len: 72 });
+            assert_eq!(snapshot(dir.path()), before);
+            drop(anchors);
+            drop(ledger);
+            assert_eq!(budget.remaining_bytes(), balance, "value receipt refund");
+            assert_eq!(snapshot(dir.path()), before);
+        }
+
+        if mutate_at_consume {
+            let candidate = collect_protected_copy_admission(root, &manifest, budget)
+                .expect("bound external Anchor must stage a private candidate");
+            let mut mutator = OpenOptions::new().write(true).open(&value_path).unwrap();
+            mutator.seek(SeekFrom::Start(0)).unwrap();
+            mutator.write_all(&[value_bytes[0] ^ 1]).unwrap();
+            mutator.sync_data().unwrap();
+            assert!(matches!(
+                candidate.consume(),
+                Err(PraxisError::Corrupt { .. })
+            ));
+            mutator.seek(SeekFrom::Start(0)).unwrap();
+            mutator.write_all(&value_bytes[..1]).unwrap();
+            mutator.sync_data().unwrap();
+            drop(mutator);
+            assert_eq!(
+                budget.remaining_bytes(),
+                balance,
+                "value refusal must refund"
+            );
+            assert_eq!(snapshot(dir.path()), before);
+        }
     });
     assert_eq!(snapshot(dir.path()), before);
 }
 
 #[test]
 fn writer_external_anchor_matching_manifest_identity_reaches_next_private_gate() {
-    exercise_external_anchor_manifest_identity(false);
+    exercise_external_anchor_manifest_identity(false, false);
 }
 
 #[test]
 fn rechecksummed_external_anchor_foreign_manifest_identity_requires_corrupt() {
-    exercise_external_anchor_manifest_identity(true);
+    exercise_external_anchor_manifest_identity(true, false);
+}
+
+#[test]
+fn staged_private_candidate_rechecks_value_mutation_and_refunds() {
+    exercise_external_anchor_manifest_identity(false, true);
 }
 
 fn writer_schema_pair_case(conflicting: bool) {
@@ -2706,6 +3008,41 @@ fn writer_schema_pair_case(conflicting: bool) {
             assert_eq!(budget.remaining_bytes(), balance);
             assert_eq!(snapshot(dir.path()), before);
         }
+
+        match collect_protected_copy_admission(root, &manifest, budget) {
+            Ok(candidate) if !conflicting => {
+                let ledger = candidate
+                    .consume()
+                    .expect("equal Schema copies must survive the consumption fence");
+                let admitted = ledger
+                    .copies()
+                    .filter(|copy| {
+                        copy.cf == CATALOG_CF
+                            && copy.key == schema_key.as_slice()
+                            && copy.sequence == 2
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(admitted.len(), 2);
+                assert!(admitted.iter().all(|copy| {
+                    copy.operation
+                        == CopyWireOperation::Put {
+                            len: original_bytes.len() as u64,
+                        }
+                }));
+                drop(admitted);
+                drop(ledger);
+            }
+            Err(PraxisError::Corrupt { reason, .. }) if conflicting => {
+                assert_eq!(reason, "protected physical-copy actual bytes conflict");
+            }
+            Ok(candidate) => {
+                drop(candidate);
+                panic!("changed Schema copies reached a private candidate");
+            }
+            Err(error) => panic!("Schema candidate failed at the wrong gate: {error:?}"),
+        }
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(snapshot(dir.path()), before);
     });
     assert_eq!(snapshot(dir.path()), before);
 }
@@ -3145,6 +3482,61 @@ fn writer_schema_pair_topology_case(topology: SchemaPairTopology, change: Schema
                 ),
             },
         }
+
+        match collect_protected_copy_admission(root, &manifest, budget) {
+            Ok(candidate) if matches!(change, SchemaPeerChange::Equal) => {
+                let ledger = candidate
+                    .consume()
+                    .expect("equal Schema topology must survive consumption fences");
+                assert_eq!(ledger.segment_witnesses().len(), 2);
+                let admitted = ledger
+                    .copies()
+                    .filter(|copy| {
+                        copy.cf == CATALOG_CF
+                            && copy.key == key_bytes.as_slice()
+                            && copy.sequence == 2
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(admitted.len(), 2);
+                for (index, copy) in admitted.iter().enumerate() {
+                    assert_eq!(
+                        copy.source,
+                        SegmentSource {
+                            level: index as u32,
+                            id: index as u64 + 1,
+                            manifest_ordinal: index,
+                        }
+                    );
+                    assert_eq!((copy.block_offset, copy.row_ordinal), locations[index]);
+                    assert_eq!(
+                        copy.operation,
+                        if [first_external, second_external][index] {
+                            CopyWireOperation::Pointer {
+                                len: [&original_bytes, &peer_bytes][index].len() as u64,
+                            }
+                        } else {
+                            CopyWireOperation::Put {
+                                len: [&original_bytes, &peer_bytes][index].len() as u64,
+                            }
+                        }
+                    );
+                }
+                drop(admitted);
+                drop(ledger);
+            }
+            Err(PraxisError::Corrupt { reason, .. })
+                if !matches!(change, SchemaPeerChange::Equal) =>
+            {
+                assert_eq!(reason, "protected physical-copy actual bytes conflict");
+            }
+            Ok(candidate) => {
+                drop(candidate);
+                panic!("changed Schema topology reached a private candidate");
+            }
+            Err(error) => panic!("Schema topology candidate failed at the wrong gate: {error:?}"),
+        }
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(snapshot(dir.path()), before);
     });
     assert_eq!(snapshot(dir.path()), before);
 }
@@ -3400,6 +3792,51 @@ fn writer_fixed_catalog_pair_case(role: FixedCatalogPair, conflicting: bool) {
                 }
             ));
         }
+
+        match collect_protected_copy_admission(root, &manifest, budget) {
+            Ok(candidate) if !conflicting => {
+                let ledger = candidate
+                    .consume()
+                    .expect("equal fixed Catalog copies must survive consumption fences");
+                assert_eq!(ledger.segment_witnesses().len(), 2);
+                let admitted = ledger
+                    .copies()
+                    .filter(|copy| {
+                        copy.cf == CATALOG_CF
+                            && copy.key == key_bytes.as_slice()
+                            && copy.sequence == 2
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(admitted.len(), 2);
+                for (index, copy) in admitted.iter().enumerate() {
+                    assert_eq!(
+                        copy.source,
+                        SegmentSource {
+                            level: index as u32,
+                            id: index as u64 + 1,
+                            manifest_ordinal: index,
+                        }
+                    );
+                    assert_eq!(
+                        (copy.block_offset, copy.row_ordinal),
+                        [first_location, second_location][index]
+                    );
+                    assert_eq!(copy.operation, CopyWireOperation::Put { len: width as u64 });
+                }
+                drop(admitted);
+                drop(ledger);
+            }
+            Err(PraxisError::Corrupt { reason, .. }) if conflicting => {
+                assert_eq!(reason, "protected physical-copy actual bytes conflict");
+            }
+            Ok(candidate) => {
+                drop(candidate);
+                panic!("changed fixed Catalog copies reached a private candidate");
+            }
+            Err(error) => panic!("fixed Catalog candidate failed at the wrong gate: {error:?}"),
+        }
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(snapshot(dir.path()), before);
     });
     assert_eq!(snapshot(dir.path()), before);
 }
@@ -3734,6 +4171,53 @@ fn writer_external_catalog_name_pair_case(
                 }
             }
         }
+
+        match collect_protected_copy_admission(root, &manifest, budget) {
+            Ok(candidate) if !conflicting => {
+                let ledger = candidate
+                    .consume()
+                    .expect("equal external Name copies must survive consumption fences");
+                assert_eq!(ledger.segment_witnesses().len(), 2);
+                let admitted = ledger
+                    .copies()
+                    .filter(|copy| {
+                        copy.cf == CATALOG_CF
+                            && copy.key == key_bytes.as_slice()
+                            && copy.sequence == 2
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(admitted.len(), 2);
+                for (index, copy) in admitted.iter().enumerate() {
+                    assert_eq!(
+                        copy.source,
+                        SegmentSource {
+                            level: index as u32,
+                            id: index as u64 + 1,
+                            manifest_ordinal: index,
+                        }
+                    );
+                    assert_eq!((copy.block_offset, copy.row_ordinal), locations[index]);
+                    assert_eq!(
+                        copy.operation,
+                        CopyWireOperation::Pointer {
+                            len: [first_pointer.len, second_pointer.len][index],
+                        }
+                    );
+                }
+                drop(admitted);
+                drop(ledger);
+            }
+            Err(PraxisError::Corrupt { reason, .. }) if conflicting => {
+                assert_eq!(reason, "protected physical-copy actual bytes conflict");
+            }
+            Ok(candidate) => {
+                drop(candidate);
+                panic!("changed external Name copies reached a private candidate");
+            }
+            Err(error) => panic!("external Name candidate failed at the wrong gate: {error:?}"),
+        }
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(snapshot(dir.path()), before);
     });
     assert_eq!(snapshot(dir.path()), before);
 }
@@ -4033,6 +4517,57 @@ fn writer_mixed_catalog_name_pair_case(first_external: bool, conflicting: bool) 
                 }
             ));
         }
+
+        match collect_protected_copy_admission(root, &manifest, budget) {
+            Ok(candidate) if !conflicting => {
+                let ledger = candidate
+                    .consume()
+                    .expect("equal mixed Name copies must survive consumption fences");
+                assert_eq!(ledger.segment_witnesses().len(), 2);
+                let admitted = ledger
+                    .copies()
+                    .filter(|copy| {
+                        copy.cf == CATALOG_CF
+                            && copy.key == key_bytes.as_slice()
+                            && copy.sequence == 2
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(admitted.len(), 2);
+                for (index, copy) in admitted.iter().enumerate() {
+                    assert_eq!(
+                        copy.source,
+                        SegmentSource {
+                            level: index as u32,
+                            id: index as u64 + 1,
+                            manifest_ordinal: index,
+                        }
+                    );
+                    assert_eq!((copy.block_offset, copy.row_ordinal), locations[index]);
+                    assert_eq!(
+                        copy.operation,
+                        if [first_external, !first_external][index] {
+                            CopyWireOperation::Pointer { len: pointer.len }
+                        } else {
+                            CopyWireOperation::Put {
+                                len: original_bytes.len() as u64,
+                            }
+                        }
+                    );
+                }
+                drop(admitted);
+                drop(ledger);
+            }
+            Err(PraxisError::Corrupt { reason, .. }) if conflicting => {
+                assert_eq!(reason, "protected physical-copy actual bytes conflict");
+            }
+            Ok(candidate) => {
+                drop(candidate);
+                panic!("changed mixed Name copies reached a private candidate");
+            }
+            Err(error) => panic!("mixed Name candidate failed at the wrong gate: {error:?}"),
+        }
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(snapshot(dir.path()), before);
     });
     assert_eq!(snapshot(dir.path()), before);
 }
