@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import io
 import json
@@ -105,6 +106,31 @@ def workflow_run_block(step_name: str) -> str:
 
 
 class StageReceiptTests(unittest.TestCase):
+    def assert_pid_exited(self, pid: int) -> None:
+        if os.name == "nt":
+            kernel = ctypes.windll.kernel32
+            kernel.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+            kernel.OpenProcess.restype = ctypes.c_void_p
+            kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            kernel.WaitForSingleObject.restype = ctypes.c_ulong
+            handle = kernel.OpenProcess(0x00100000, 0, pid)  # SYNCHRONIZE
+            if not handle:
+                error = kernel.GetLastError()
+                self.assertEqual(error, 87, f"OpenProcess failed without proving PID {pid} exited: {ctypes.WinError(error)}")
+                return
+            try:
+                self.assertEqual(kernel.WaitForSingleObject(ctypes.c_void_p(handle), 1000), 0)
+            finally:
+                kernel.CloseHandle(ctypes.c_void_p(handle))
+        else:
+            try:
+                raw = (Path("/proc") / str(pid) / "stat").read_bytes()
+            except FileNotFoundError:
+                return
+            end = raw.rfind(b") ")
+            self.assertGreaterEqual(end, 0)
+            self.assertIn(raw[end + 2:].split()[0], (b"Z", b"X", b"x"))
+
     def setUp(self) -> None:
         self.soft_env = patch.dict(
             os.environ, {"P80_SOFT_JOB_MINUTES": "70", "P80_SETUP_START_UTC": utc_now()}
@@ -915,8 +941,19 @@ class StageReceiptTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "version.raw.log"
-            path.write_text("rustc 1.99.0 (candidate)\n", encoding="utf-8")
+            path.write_text(
+                "rustc 1.99.0 (b940084d7 2026-09-28)\n"
+                "binary: rustc\n"
+                "commit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\n"
+                "commit-date: 2026-09-28\n"
+                "host: x86_64-unknown-linux-gnu\n"
+                "release: 1.99.0\n"
+                "LLVM version: 23.1.1\n", encoding="utf-8",
+            )
             assert_rust_version(path, "rustc")
+            path.write_text("rustc 1.99.0 (candidate)\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "expected rustc 1.99.0"):
+                assert_rust_version(path, "rustc")
             path.write_text("rustc 1.98.2 (old)\n", encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "expected rustc 1.99.0"):
                 assert_rust_version(path, "rustc")
@@ -1049,6 +1086,7 @@ class StageReceiptTests(unittest.TestCase):
             root = Path(temporary)
             repo = root / "repo"
             repo.mkdir()
+            marker = root / "timeout-child.pid"
             expected_head = "a" * 40
             environment = os.environ.copy()
             environment.update(CARGO_TARGET_DIR=str(root / "target"), PRAXOR_TEST_TMP_ROOT=str(root / "fixtures"), TEMP=str(root / "tmp"))
@@ -1058,10 +1096,144 @@ class StageReceiptTests(unittest.TestCase):
                 gate = StageRecorder(repo, root, expected_head, environment, "linux")
                 start = time.monotonic()
                 with self.assertRaisesRegex(RuntimeError, "stage timeout failed"):
-                    gate.run("timeout", [sys.executable, "-c", "import time; time.sleep(3)"], timeout_seconds=0.2)
-                self.assertLess(time.monotonic() - start, 2.5)
+                    gate.run("timeout", [
+                        sys.executable, "-c",
+                        "import os,sys,time; from pathlib import Path; "
+                        "Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(30)",
+                        str(marker),
+                    ], timeout_seconds=2)
+                self.assertLess(time.monotonic() - start, 8, "timeout cleanup must remain bounded")
+            self.assertTrue(marker.is_file(), "child must start before timeout")
+            self.assert_pid_exited(int(marker.read_text(encoding="utf-8")))
             receipt = json.loads((gate.logs / "timeout.receipt.json").read_text(encoding="utf-8"))
             self.assertIn("timeout", receipt["error"])
+            self.assertTrue(receipt["raw_log_complete"])
+            self.assertFalse(receipt["reader_alive_at_receipt"])
+
+    def test_linux_proc_group_ignores_zombies_but_keeps_live_members(self) -> None:
+        def stat(pid: int, group: int, state: str) -> str:
+            return f"{pid} (nested ) command) {state} 1 {group} {group} 0 0\n"
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for pid, group, state in ((101, 900, "Z"), (102, 900, "X"), (103, 901, "S")):
+                child = root / str(pid)
+                child.mkdir()
+                (child / "stat").write_text(stat(pid, group, state), encoding="ascii")
+            unrelated = root / "105"
+            unrelated.mkdir()
+            (unrelated / "stat").write_bytes(b"105 (non-\xff-ascii) S 1 901 901 0 0\n")
+            self.assertEqual(StageRecorder._linux_group_live_pids(900, root), [])
+            live = root / "104"
+            live.mkdir()
+            (live / "stat").write_text(stat(104, 900, "S"), encoding="ascii")
+            self.assertEqual(StageRecorder._linux_group_live_pids(900, root), [104])
+            (live / "stat").write_text(stat(104, 900, "?"), encoding="ascii")
+            with self.assertRaisesRegex(RuntimeError, "unknown .* state"):
+                StageRecorder._linux_group_live_pids(900, root)
+            with patch.object(Path, "read_bytes", side_effect=PermissionError("synthetic inaccessible stat")):
+                with self.assertRaises(PermissionError):
+                    StageRecorder._linux_group_live_pids(900, root)
+
+    def test_linux_cleanup_reaps_exited_leader_without_zombie_delay(self) -> None:
+        if os.name != "posix" or not Path("/proc").is_dir():
+            self.skipTest("Linux /proc process groups required")
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+        try:
+            start = time.monotonic()
+            StageRecorder._terminate_tree(process)
+            self.assertLess(time.monotonic() - start, 3, "zombie leader must not exhaust both polls")
+            self.assertIsNotNone(process.poll())
+            self.assertFalse(StageRecorder._owned_tree_alive(process, None))
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=3)
+
+    def test_windows_transient_descendants_quiesce_with_and_without_pipe(self) -> None:
+        if os.name != "nt":
+            self.skipTest("native Windows Job Object required")
+        for pipe in (True, False):
+            with self.subTest(pipe=pipe), tempfile.TemporaryDirectory() as temporary:
+                output = "sys.stdout" if pipe else "subprocess.DEVNULL"
+                child = (
+                    "import subprocess,sys; "
+                    "subprocess.Popen([sys.executable,'-c','import time; time.sleep(0.8)'], "
+                    f"stdin=subprocess.DEVNULL,stdout={output},stderr={output}); "
+                    "print('leader exited', flush=True)"
+                )
+                root = Path(temporary)
+                repo = root / "repo"
+                repo.mkdir()
+                environment = os.environ.copy()
+                environment.update(CARGO_TARGET_DIR=str(root / "target"), PRAXOR_TEST_TMP_ROOT=str(root / "fixtures"), TEMP=str(root / "tmp"))
+                with patch("ci_catalog_stage.tracked_manifest", return_value=synthetic_manifest()), patch.object(
+                    StageRecorder, "_sample", synthetic_resource_sample
+                ):
+                    gate = StageRecorder(repo, root / "artifacts", "a" * 40, environment, "windows")
+                    gate.run("transient", [sys.executable, "-c", child], timeout_seconds=5)
+                receipt = json.loads((gate.logs / "transient.receipt.json").read_text(encoding="utf-8"))
+                self.assertEqual(receipt["exit_code"], 0)
+                self.assertIsNone(receipt["error"])
+                self.assertTrue(receipt["raw_log_complete"])
+                self.assertEqual(receipt["post_leader_quiescence_budget_seconds"], 5)
+                self.assertIsNotNone(receipt["post_leader_quiescence_seconds"])
+
+    def test_windows_job_pid_query_retries_successful_partial_list(self) -> None:
+        class PartialQuery:
+            calls = 0
+
+            def __call__(self, _job, _kind, buffer, _size, _returned):
+                self.calls += 1
+                ctypes.c_ulong.from_buffer(buffer, 0).value = 2
+                ctypes.c_ulong.from_buffer(buffer, 4).value = 1 if self.calls == 1 else 2
+                ctypes.c_size_t.from_buffer(buffer, 8).value = 1001
+                if self.calls > 1:
+                    ctypes.c_size_t.from_buffer(buffer, 8 + ctypes.sizeof(ctypes.c_size_t)).value = 1002
+                return 1
+
+        query = PartialQuery()
+        kernel = SimpleNamespace(QueryInformationJobObject=query, GetLastError=lambda: 0)
+        with patch("ci_catalog_stage.ctypes.windll", SimpleNamespace(kernel32=kernel), create=True):
+            self.assertEqual(StageRecorder._windows_job_pids(123), [1001, 1002])
+        self.assertEqual(query.calls, 2)
+
+    def test_windows_persistent_pipe_holder_fails_and_job_kills_member(self) -> None:
+        if os.name != "nt":
+            self.skipTest("native Windows Job Object required")
+        child = (
+            "import subprocess,sys,pathlib; "
+            "member=subprocess.Popen([sys.executable,'-c','import time; time.sleep(20)'], "
+            "stdin=subprocess.DEVNULL,stdout=sys.stdout,stderr=sys.stderr); "
+            "pathlib.Path('survivor.pid').write_text(str(member.pid)); "
+            "print('leader exited', flush=True)"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            repo.mkdir()
+            environment = os.environ.copy()
+            environment.update(CARGO_TARGET_DIR=str(root / "target"), PRAXOR_TEST_TMP_ROOT=str(root / "fixtures"), TEMP=str(root / "tmp"))
+            with patch("ci_catalog_stage.tracked_manifest", return_value=synthetic_manifest()), patch.object(
+                StageRecorder, "_sample", synthetic_resource_sample
+            ):
+                gate = StageRecorder(repo, root / "artifacts", "a" * 40, environment, "windows")
+                start = time.monotonic()
+                with self.assertRaisesRegex(RuntimeError, "surviving descendant"):
+                    gate.run("persistent", [sys.executable, "-c", child], timeout_seconds=15)
+                self.assertLess(time.monotonic() - start, 12, "inherited pipe must not wait for stage deadline")
+            member_pid = int((repo / "survivor.pid").read_text(encoding="utf-8"))
+            receipt = json.loads((gate.logs / "persistent.receipt.json").read_text(encoding="utf-8"))
+            self.assertIn(str(member_pid), receipt["error"])
+            self.assertIn(member_pid, receipt["surviving_job_pids"])
+            self.assertEqual(receipt["post_leader_quiescence_budget_seconds"], 5)
+            details = [item for item in receipt["surviving_job_members"] if item["pid"] == member_pid]
+            self.assertEqual(len(details), 1)
+            self.assertTrue(details[0]["image_name"] or details[0]["name_lookup_error"])
+            self.assertGreaterEqual(receipt["post_leader_quiescence_seconds"], 5)
+            self.assertFalse(receipt["reader_alive_at_receipt"])
+            self.assertTrue(receipt["raw_log_complete"])
+            self.assert_pid_exited(member_pid)
 
     def test_soft_overall_deadline_interrupts_stage_before_job_hard_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1108,14 +1280,16 @@ class StageReceiptTests(unittest.TestCase):
 
     def test_leaderless_descendant_cannot_hold_stage_pipe_forever(self) -> None:
         child = (
-            "import subprocess,sys; "
-            "subprocess.Popen([sys.executable,'-c','import time; time.sleep(5)'], "
-            "stdout=sys.stdout, stderr=sys.stderr); print('leader exited', flush=True)"
+            "import subprocess,sys,pathlib; "
+            "member=subprocess.Popen([sys.executable,'-c','import time; time.sleep(20)'], "
+            "stdout=sys.stdout, stderr=sys.stderr); "
+            "pathlib.Path(sys.argv[1]).write_text(str(member.pid)); print('leader exited', flush=True)"
         )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             repo = root / "repo"
             repo.mkdir()
+            marker = root / "descendant-child.pid"
             expected_head = "a" * 40
             environment = os.environ.copy()
             environment.update(CARGO_TARGET_DIR=str(root / "target"), PRAXOR_TEST_TMP_ROOT=str(root / "fixtures"), TEMP=str(root / "tmp"))
@@ -1126,8 +1300,9 @@ class StageReceiptTests(unittest.TestCase):
                 gate = StageRecorder(repo, root, expected_head, environment, platform)
                 start = time.monotonic()
                 with self.assertRaisesRegex(RuntimeError, "stage descendant failed"):
-                    gate.run("descendant", [sys.executable, "-c", child], timeout_seconds=0.4)
-                self.assertLess(time.monotonic() - start, 3)
+                    gate.run("descendant", [sys.executable, "-c", child, str(marker)], timeout_seconds=3)
+                self.assertLess(time.monotonic() - start, 12, "descendant cleanup must remain bounded")
+            self.assert_pid_exited(int(marker.read_text(encoding="utf-8")))
             receipt = json.loads((gate.logs / "descendant.receipt.json").read_text(encoding="utf-8"))
             self.assertIn("wall-clock timeout", receipt["error"])
             self.assertFalse(receipt["reader_alive_at_receipt"])

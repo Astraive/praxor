@@ -20,6 +20,7 @@ from pathlib import Path
 
 
 GIB = 1024**3
+WINDOWS_JOB_QUIESCENCE_SECONDS = 5
 MAX_LOCK_DIFF_BYTES = 16 * 1024
 SAFE_ENVIRONMENT_KEYS = frozenset(
     {
@@ -759,6 +760,104 @@ class StageRecorder:
             raise ctypes.WinError()
 
     @staticmethod
+    def _windows_job_pids(job: int) -> list[int]:
+        """Identify members of a live Job Object for the failure receipt."""
+        kernel = ctypes.windll.kernel32
+        kernel.QueryInformationJobObject.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p,
+        ]
+        kernel.QueryInformationJobObject.restype = ctypes.c_int
+        width = ctypes.sizeof(ctypes.c_size_t)
+        capacity = 32
+        while capacity <= 4096:
+            buffer = ctypes.create_string_buffer(8 + width * capacity)
+            if kernel.QueryInformationJobObject(
+                ctypes.c_void_p(job), 3, buffer, ctypes.sizeof(buffer), None,
+            ):
+                assigned = ctypes.c_ulong.from_buffer(buffer, 0).value
+                count = ctypes.c_ulong.from_buffer(buffer, 4).value
+                if count > capacity or count < assigned:
+                    capacity = max(capacity * 2, assigned)
+                    continue
+                return [
+                    ctypes.c_size_t.from_buffer(buffer, 8 + width * index).value
+                    for index in range(count)
+                ]
+            error = kernel.GetLastError()
+            if error not in (122, 234):  # ERROR_INSUFFICIENT_BUFFER / ERROR_MORE_DATA
+                raise ctypes.WinError(error)
+            capacity *= 2
+        raise RuntimeError("Windows Job Object PID list exceeded 4096 entries")
+
+    @staticmethod
+    def _windows_job_member_diagnostics(pids: list[int]) -> list[dict]:
+        """Names are best-effort evidence; a lookup failure never clears a live PID."""
+        kernel = ctypes.windll.kernel32
+        kernel.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+        kernel.OpenProcess.restype = ctypes.c_void_p
+        kernel.QueryFullProcessImageNameW.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_ulong),
+        ]
+        kernel.QueryFullProcessImageNameW.restype = ctypes.c_int
+        kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel.CloseHandle.restype = ctypes.c_int
+        members: list[dict] = []
+        for pid in pids:
+            detail = {"pid": pid, "image_name": None, "name_lookup_error": None}
+            handle = kernel.OpenProcess(0x1000, 0, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                detail["name_lookup_error"] = str(ctypes.WinError(kernel.GetLastError()))
+            else:
+                try:
+                    image = ctypes.create_unicode_buffer(32768)
+                    length = ctypes.c_ulong(len(image))
+                    if not kernel.QueryFullProcessImageNameW(
+                        ctypes.c_void_p(handle), 0, image, ctypes.byref(length),
+                    ):
+                        detail["name_lookup_error"] = str(ctypes.WinError(kernel.GetLastError()))
+                    else:
+                        detail["image_name"] = Path(image.value).name
+                finally:
+                    kernel.CloseHandle(ctypes.c_void_p(handle))
+            members.append(detail)
+        return members
+
+    @staticmethod
+    def _linux_group_live_pids(pgid: int, proc_root: Path = Path("/proc")) -> list[int]:
+        """Ignore exited zombies, but fail closed if a group member cannot be classified."""
+        live: list[int] = []
+        with os.scandir(proc_root) as entries:
+            for entry in entries:
+                if not entry.name.isdecimal():
+                    continue
+                try:
+                    raw = (proc_root / entry.name / "stat").read_bytes()
+                except FileNotFoundError:
+                    # A process may leave /proc between enumeration and the read.
+                    continue
+                end = raw.rfind(b") ")
+                if end < 0:
+                    raise RuntimeError(f"malformed /proc/{entry.name}/stat")
+                fields = raw[end + 2:].split()
+                if len(fields) < 3:
+                    raise RuntimeError(f"incomplete /proc/{entry.name}/stat")
+                try:
+                    member_group = int(fields[2])
+                except ValueError as exc:
+                    raise RuntimeError(f"invalid /proc/{entry.name}/stat process group") from exc
+                if member_group != pgid:
+                    continue
+                try:
+                    state = fields[0].decode("ascii")
+                except UnicodeDecodeError as exc:
+                    raise RuntimeError(f"invalid /proc/{entry.name}/stat state") from exc
+                if state not in {"R", "S", "D", "Z", "T", "t", "W", "X", "x", "K", "P", "I"}:
+                    raise RuntimeError(f"unknown /proc/{entry.name}/stat state {state!r}")
+                if state not in {"Z", "X", "x"}:
+                    live.append(int(entry.name))
+        return live
+
+    @staticmethod
     def _owned_tree_alive(process: subprocess.Popen, job: int | None) -> bool:
         if os.name == "nt":
             if job is None:
@@ -778,7 +877,7 @@ class StageRecorder:
             os.killpg(process.pid, 0)
         except ProcessLookupError:
             return False
-        return True
+        return bool(StageRecorder._linux_group_live_pids(process.pid))
 
     @staticmethod
     def _terminate_tree(process: subprocess.Popen, job: int | None = None) -> None:
@@ -804,6 +903,7 @@ class StageRecorder:
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             if not StageRecorder._owned_tree_alive(process, None):
+                process.poll()  # Reap the leader after the group has no live members.
                 return
             time.sleep(0.1)
         try:
@@ -813,6 +913,7 @@ class StageRecorder:
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             if not StageRecorder._owned_tree_alive(process, None):
+                process.poll()
                 return
             time.sleep(0.1)
         raise RuntimeError("Linux process group remains alive after forced termination")
@@ -851,6 +952,11 @@ class StageRecorder:
         stop_writing = threading.Event()
         reader_done = threading.Event()
         reader_errors: list[str] = []
+        leader_exit_at: float | None = None
+        last_quiescence_sample = 0.0
+        quiescence_seconds: float | None = None
+        survivor_pids: list[int] | None = None
+        survivor_members: list[dict] | None = None
 
         def watch() -> None:
             while not stopped.wait(2):
@@ -914,8 +1020,46 @@ class StageRecorder:
                     raise RuntimeError(f"soft overall job deadline after {self.soft_job_minutes} minutes")
                 if time.monotonic() >= deadline:
                     raise RuntimeError(f"wall-clock timeout after {timeout_seconds} seconds")
-                if reader_done.is_set() and process.poll() is not None:
-                    break
+                # Keep the Linux session leader unreaped while inherited pipes are
+                # open, so its numeric PID/PGID cannot be reused before cleanup.
+                observed_code = process.poll() if self.platform == "windows" or reader_done.is_set() else None
+                if observed_code is not None:
+                    if observed_code != 0:
+                        code = observed_code
+                        raise RuntimeError(f"command exited {observed_code}")
+                    if self.platform == "windows" and job is not None:
+                        now = time.monotonic()
+                        if leader_exit_at is None:
+                            leader_exit_at = now
+                        if now - last_quiescence_sample >= 0.25:
+                            self._sample(name, samples, guard, lock)
+                            last_quiescence_sample = now
+                            if guard["violation"]:
+                                raise RuntimeError(guard["violation"])
+                        alive = self._owned_tree_alive(process, job)
+                        if not alive and reader_done.is_set():
+                            quiescence_seconds = now - leader_exit_at
+                            break
+                        if now - leader_exit_at >= WINDOWS_JOB_QUIESCENCE_SECONDS:
+                            quiescence_seconds = now - leader_exit_at
+                            if alive:
+                                try:
+                                    survivor_pids = self._windows_job_pids(job)
+                                except Exception as exc:
+                                    detail = f"Job Object PID query failed: {exc}"
+                                else:
+                                    try:
+                                        survivor_members = self._windows_job_member_diagnostics(survivor_pids)
+                                        detail = f"active job members {survivor_members}"
+                                    except Exception as exc:
+                                        detail = f"active job PIDs {survivor_pids}; image lookup failed: {exc}"
+                                raise RuntimeError(
+                                    f"owned process group has unresolved Job Object activity "
+                                    f"(possible surviving descendant; {detail})"
+                                )
+                            raise RuntimeError("raw stage pipe remained open after owned Job Object exited")
+                    elif reader_done.is_set():
+                        break
                 time.sleep(0.1)
             code = process.wait(timeout=1)
             self._sample(name, samples, guard, lock)
@@ -1010,6 +1154,12 @@ class StageRecorder:
             "setup_elapsed_seconds_before_gate": self.setup_elapsed_seconds,
             "watcher_alive_at_receipt": watcher is not None and watcher.is_alive(),
             "reader_alive_at_receipt": reader is not None and reader.is_alive(),
+            "post_leader_quiescence_budget_seconds": (
+                WINDOWS_JOB_QUIESCENCE_SECONDS if self.platform == "windows" else None
+            ),
+            "post_leader_quiescence_seconds": quiescence_seconds,
+            "surviving_job_pids": survivor_pids,
+            "surviving_job_members": survivor_members,
             "raw_log_complete": process is None or (
                 reader is not None and reader_done.is_set()
                 and not reader_errors and not reader.is_alive()

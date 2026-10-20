@@ -9,6 +9,7 @@ import os
 import re
 import sys
 from collections import Counter
+from datetime import date
 from pathlib import Path
 
 from ci_catalog_stage import StageRecorder, install_termination_handler, sha256_file
@@ -65,6 +66,24 @@ TIMING = re.compile(
     rf"(?P<high>{NUMBER})\s*(?P<high_unit>{UNIT})\s*\]"
 )
 SECONDS_PER_UNIT = {"ns": 1e-9, "µs": 1e-6, "us": 1e-6, "ms": 1e-3, "s": 1.0}
+RUSTUP_INFO = (
+    re.compile(r"info: syncing channel updates for 1\.99\.0-(?P<host>[A-Za-z0-9_+.-]+)"),
+    re.compile(
+        r"info: latest update on (?P<published>\d{4}-\d{2}-\d{2}) for version 1\.99\.0 "
+        r"\((?P<hash>[0-9a-f]{7,40}) (?P<commit_date>\d{4}-\d{2}-\d{2})\)"
+    ),
+    re.compile(r"info: downloading \d+ components?"),
+    re.compile(r"info: (?:downloading|installing) component '[A-Za-z0-9_-]+'"),
+    re.compile(r"info: component '[A-Za-z0-9_-]+' is up to date"),
+)
+RUSTC_VERBOSE = (
+    re.compile(r"binary: rustc"),
+    re.compile(r"commit-hash: [0-9a-f]{40}"),
+    re.compile(r"commit-date: \d{4}-\d{2}-\d{2}"),
+    re.compile(r"host: [A-Za-z0-9_]+(?:-[A-Za-z0-9_]+){2,3}"),
+    re.compile(r"release: 1\.99\.0"),
+    re.compile(r"LLVM version: \d+(?:\.\d+){1,3}"),
+)
 
 
 def expected_stages(kind: str) -> tuple[str, ...]:
@@ -91,10 +110,77 @@ def benchmark_command(benchmark: str) -> list[str]:
 
 
 def assert_rust_version(path: Path, command: str) -> None:
-    raw = path.read_bytes().decode("utf-8", errors="replace")
-    first = raw.splitlines()[0] if raw else ""
-    if not re.match(rf"^{re.escape(command)} 1\.99\.0(?:\s|$)", first):
-        raise RuntimeError(f"expected {command} 1.99.0, received: {first!r}")
+    """Accept bounded rustup chatter and complete, consistent pinned-toolchain output."""
+    if command not in ("rustc", "cargo"):
+        raise ValueError(f"unsupported Rust version command: {command}")
+    with path.open("rb", buffering=0) as version_log:
+        chunks = []
+        remaining = 4097
+        while remaining:
+            chunk = version_log.read(remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    raw = b"".join(chunks)
+    failure = f"expected {command} 1.99.0 with only bounded rustup info and known version fields"
+    if len(raw) > 4096:
+        raise RuntimeError(f"{failure}; raw log exceeds 4096 bytes")
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise RuntimeError(f"{failure}; raw log is not UTF-8") from error
+
+    index = 0
+    while index < len(lines) and lines[index].startswith("info: "):
+        if index >= 16 or not any(pattern.fullmatch(lines[index]) for pattern in RUSTUP_INFO):
+            raise RuntimeError(f"{failure}; unexpected rustup prelude: {lines[index]!r}")
+        index += 1
+    version = re.compile(
+        rf"{command} 1\.99\.0 "
+        r"\((?P<hash>[0-9a-f]{7,40}) (?P<date>\d{4}-\d{2}-\d{2})\)"
+    )
+    match = version.fullmatch(lines[index]) if index < len(lines) else None
+    if match is None:
+        observed = lines[index] if index < len(lines) else "<missing>"
+        raise RuntimeError(f"{failure}; received: {observed!r}")
+    try:
+        date.fromisoformat(match.group("date"))
+    except ValueError as error:
+        raise RuntimeError(f"{failure}; invalid banner date: {match.group('date')!r}") from error
+
+    for line in lines[:index]:
+        update = RUSTUP_INFO[1].fullmatch(line)
+        if update:
+            try:
+                date.fromisoformat(update.group("published"))
+                date.fromisoformat(update.group("commit_date"))
+            except ValueError as error:
+                raise RuntimeError(f"{failure}; invalid rustup update date: {line!r}") from error
+
+    tail = lines[index + 1:]
+    if command == "cargo":
+        if tail:
+            raise RuntimeError(f"{failure}; unexpected version output: {tail!r}")
+        return
+    if len(tail) != len(RUSTC_VERBOSE) or not all(
+        pattern.fullmatch(line) for pattern, line in zip(RUSTC_VERBOSE, tail)
+    ):
+        raise RuntimeError(f"{failure}; unexpected version output: {tail!r}")
+    commit_hash, commit_date, host = (
+        tail[1].split(": ", 1)[1], tail[2].split(": ", 1)[1], tail[3].split(": ", 1)[1]
+    )
+    if not commit_hash.startswith(match.group("hash")) or commit_date != match.group("date"):
+        raise RuntimeError(f"{failure}; banner disagrees with verbose commit metadata")
+    for line in lines[:index]:
+        sync = RUSTUP_INFO[0].fullmatch(line)
+        update = RUSTUP_INFO[1].fullmatch(line)
+        if sync and sync.group("host") != host:
+            raise RuntimeError(f"{failure}; rustup channel host disagrees with rustc host")
+        if update and (
+            not commit_hash.startswith(update.group("hash")) or update.group("commit_date") != commit_date
+        ):
+            raise RuntimeError(f"{failure}; rustup release metadata disagrees with rustc commit")
 
 
 def criterion_errors(raw: bytes, target: Path) -> list[dict]:

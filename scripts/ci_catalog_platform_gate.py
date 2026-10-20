@@ -5,10 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
 from pathlib import Path
 
+from ci_catalog_aux_gate import assert_rust_version
 from ci_catalog_evidence import (
     parse_inventory,
     parse_results,
@@ -38,13 +38,6 @@ TAIL_STAGES = (
     "14-full-list", "15-full-ignored-list", "16-full-run",
     "17-storage-slog", "18-storage-boundary",
 )
-
-
-def assert_rust_version(path: Path, command: str) -> None:
-    raw = path.read_bytes().decode("utf-8", errors="replace")
-    first = raw.splitlines()[0] if raw else ""
-    if not re.match(rf"^{re.escape(command)} 1\.99\.0(?:\s|$)", first):
-        raise RuntimeError(f"expected {command} 1.99.0, received: {first!r}")
 
 
 def main() -> None:
