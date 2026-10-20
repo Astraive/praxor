@@ -10,6 +10,13 @@ use crate::core_records::codec::{
     Allocator as RecordAllocator, Decision as RecordDecision, Envelope as RecordEnvelope,
     Key as RecordKey, Kind as RecordKind, Role as RecordRole, Row as RecordRow,
 };
+use crate::core_records::intent::{
+    IntentKind as RecordIntentKind, Mapping as RecordMapping, NewRecord, RecordIntent,
+};
+use crate::core_records::transition::{
+    Context as RecordContext, Rows as RecordRows, Summary as RecordSummary, check_bootstrap_ops,
+    plan as plan_record,
+};
 use crate::segments::format::SEGMENT_FOOTER_MAGIC;
 use crate::transactions::{BatchOp, WriteBatch};
 use crate::wal::record::{CoreRecordPrefix, CoreWalRecord, parse_core_record_prefix};
@@ -1750,6 +1757,660 @@ fn writer_equal_record_state_at_s3_reaches_named_private_gate() {
 #[test]
 fn writer_valid_changed_record_state_at_s3_requires_actual_byte_conflict() {
     writer_record_state_pair_case(true);
+}
+
+fn writer_record_fact_pair_case(conflicting: bool) {
+    let (dir, config, lease) = flushed_create_fixture();
+    let root = lease.root();
+    let layout = DiskLayout::at(root);
+    let manifest_path = layout.manifest_path();
+    let mut manifest =
+        Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    assert_eq!((manifest.flushed_sequence, manifest.last_sequence), (2, 2));
+    assert_eq!(manifest.segments.len(), 1);
+    assert_eq!(manifest.segments[0].entries, 7);
+    let database_id = manifest
+        .record_authority
+        .as_ref()
+        .unwrap()
+        .identity(root)
+        .unwrap();
+    let context = RecordContext {
+        id: database_id,
+        descriptors: 1,
+        source: root,
+    };
+
+    // Establish a real one-index S1 bootstrap. The original fixed fixture has
+    // Binding/Allocator but no Descriptor; retain its five Catalog rows and
+    // replace the record prefix with a transition-validated writer batch.
+    let first_path = layout.segment_path(0, 1);
+    let old_bytes = fs::read(&first_path).unwrap();
+    assert_eq!(
+        manifest.segments[0].file_digest,
+        blake3::hash(&old_bytes).to_hex().to_string()
+    );
+    let old = decode_segment(&old_bytes, &first_path, &CpuAccelerator).unwrap();
+    assert_eq!((old.level, old.id), (0, 1));
+    assert_eq!(old.blocks.iter().map(Vec::len).sum::<usize>(), 7);
+    let _old_offsets = literal_block_offsets(&old_bytes, 0, 1, old.blocks.len());
+    let mut first_rows = old
+        .blocks
+        .into_iter()
+        .flatten()
+        .map(|raw| raw.entry)
+        .collect::<Vec<_>>();
+    let old_binding = first_rows
+        .iter()
+        .find(|row| row.cf.0 == RecordRole::Meta.cf() && row.key.as_ref() == [0])
+        .unwrap();
+    assert_eq!(
+        old_binding.version.value,
+        StoredValue::Put(fixed_copy_oracle(
+            "bootstrap_tag6",
+            "record_binding",
+            RecordRole::Meta.cf(),
+            &[0],
+            1,
+        ))
+    );
+    assert_eq!(
+        first_rows
+            .iter()
+            .filter(|row| row.cf.0 == RecordRole::Meta.cf())
+            .count(),
+        2
+    );
+    first_rows.retain(|row| row.cf.0 != RecordRole::Meta.cf());
+    assert_eq!(first_rows.len(), 5);
+    let mut bootstrap = WriteBatch::new();
+    bootstrap.put(
+        RecordRole::Meta.cf(),
+        RecordKey::Binding.encode().unwrap(),
+        RecordRow::Binding {
+            database_id,
+            descriptor_count: 1,
+        }
+        .encode()
+        .unwrap(),
+    );
+    bootstrap.put(
+        RecordRole::Meta.cf(),
+        RecordKey::Allocator.encode().unwrap(),
+        RecordRow::Allocator(RecordAllocator::default())
+            .encode()
+            .unwrap(),
+    );
+    bootstrap.put(
+        RecordRole::Meta.cf(),
+        RecordKey::Descriptor(1).encode().unwrap(),
+        RecordRow::Descriptor {
+            name: "kv",
+            namespace: "docs",
+        }
+        .encode()
+        .unwrap(),
+    );
+    check_bootstrap_ops(bootstrap.ops(), &context).unwrap();
+    let mut prior = RecordRows::new();
+    for op in bootstrap.ops() {
+        let BatchOp::Put { cf, key, value } = op else {
+            panic!("indexed bootstrap must contain only Put operations")
+        };
+        let role = RecordRole::from_cf(&cf.0).unwrap();
+        assert_eq!(role, RecordRole::Meta);
+        assert!(
+            prior
+                .insert(
+                    (role, key.clone()),
+                    Some(RecordSummary::decode(role, key, value, root).unwrap()),
+                )
+                .is_none()
+        );
+        first_rows.push(SegmentEntry {
+            cf: cf.clone(),
+            key: key.clone().into(),
+            version: VersionedValue {
+                sequence: 1,
+                value: StoredValue::Put(value.clone()),
+            },
+        });
+    }
+    assert_eq!(first_rows.len(), 8);
+    manifest
+        .record_authority
+        .as_mut()
+        .unwrap()
+        .index_descriptor_count = 1;
+    let first_value_path = layout.value_log_path(1);
+    let mut first_value_log = ValueLog::open(&first_value_path).unwrap();
+    let first_meta = SegmentWriter::write(
+        SegmentWriteOptions {
+            path: &first_path,
+            id: 1,
+            level: 0,
+            compression: Compression::None,
+            accelerator: &CpuAccelerator,
+            value_log: &mut first_value_log,
+            large_value_threshold: config.large_value_threshold,
+            block_size: config.block_size,
+            partitioned_bloom: None,
+            direct_io: false,
+        },
+        first_rows,
+    )
+    .unwrap();
+    drop(first_value_log);
+    fs::remove_file(first_value_path).unwrap();
+    assert_eq!(first_meta.entries, 8);
+    assert_eq!(first_meta.path, first_path.to_str().unwrap());
+    let first_bytes = fs::read(&first_path).unwrap();
+    assert_eq!(
+        first_meta.file_digest,
+        blake3::hash(&first_bytes).to_hex().to_string()
+    );
+    let first = decode_segment(&first_bytes, &first_path, &CpuAccelerator).unwrap();
+    assert_eq!(first.blocks.iter().map(Vec::len).sum::<usize>(), 8);
+    let _first_offsets = literal_block_offsets(&first_bytes, 0, 1, first.blocks.len());
+    manifest.segments[0] = first_meta;
+
+    // Use the real record planner rather than inventing an IndexPut batch. A
+    // single CREATE at core S3 allocates RID 1 and then emits the Fact/Head
+    // mapping pair at raw sequence 2 and append ordinal 2.
+    let intent = RecordIntent::new(RecordIntentKind::Create(vec![NewRecord {
+        payload: b"docs".to_vec(),
+        mappings: vec![RecordMapping {
+            index: 1,
+            key: b"k".to_vec(),
+        }],
+    }]))
+    .unwrap();
+    let planned = plan_record(&intent, 3, &context, &mut |role, key| {
+        Ok(prior.get(&(role, key.to_vec())).cloned().flatten())
+    })
+    .unwrap();
+    assert_eq!(planned.receipt.core_sequence, 3);
+    assert_eq!(planned.receipt.compatibility_sequence, 2);
+    let frame = planned.record.try_encode().unwrap();
+    assert_eq!(frame.len(), planned.encoded_len);
+    assert_eq!(&frame[..4], &crate::wal::record::WAL_V2_MAGIC.to_le_bytes());
+    assert_eq!(
+        crc32c(&frame[..12]),
+        u32::from_le_bytes(frame[12..16].try_into().unwrap())
+    );
+    assert_eq!(
+        crc32c(&frame[16..]),
+        u32::from_le_bytes(frame[8..12].try_into().unwrap())
+    );
+    let CoreRecordPrefix::Complete {
+        record,
+        encoded_len,
+    } = parse_core_record_prefix(&frame, root).unwrap()
+    else {
+        panic!("writer-planned mapped Record CREATE frame must be complete")
+    };
+    assert_eq!(encoded_len, frame.len());
+    assert_eq!(record, planned.record);
+    assert_eq!(record.try_encode().unwrap(), frame);
+    let CoreWalRecord::Record {
+        sequence,
+        envelope,
+        batch,
+    } = record
+    else {
+        panic!("S3 must remain a Record CREATE frame")
+    };
+    assert_eq!(sequence, 3);
+    assert_eq!(envelope.kind, RecordKind::Create);
+    assert_eq!(envelope.database_id, database_id);
+    assert_eq!(
+        (
+            envelope.prior_rid,
+            envelope.new_rid,
+            envelope.prior_compatibility_sequence,
+            envelope.new_compatibility_sequence,
+            envelope.prior_append_ordinal,
+            envelope.new_append_ordinal,
+            envelope.record_count,
+            envelope.logical_entry_count,
+        ),
+        (0, 1, 0, 2, 0, 2, 1, 2)
+    );
+    assert_eq!(batch.len(), 5);
+    let fact_key = RecordKey::Fact {
+        index: 1,
+        incarnation: 1,
+        key: b"k",
+        raw_sequence: 2,
+    }
+    .encode()
+    .unwrap();
+    assert_eq!(
+        fact_key,
+        oracle_bytes("01000000010000000000000001010000006b0000000000000002")
+    );
+    assert_eq!(fact_key.len(), 26);
+    assert_eq!(
+        RecordKey::decode(RecordRole::Index, &fact_key, root).unwrap(),
+        RecordKey::Fact {
+            index: 1,
+            incarnation: 1,
+            key: b"k",
+            raw_sequence: 2,
+        }
+    );
+    let canonical = RecordRow::Fact {
+        append_ordinal: 2,
+        decision: RecordDecision::Put(1),
+    }
+    .encode()
+    .unwrap();
+    assert_eq!(
+        canonical,
+        oracle_bytes("5052463101000000020000000000000001000000000000000100000000000000")
+    );
+    assert_eq!(canonical.len(), 32);
+    let fact_in_wal = batch
+        .ops()
+        .iter()
+        .filter_map(|op| match op {
+            BatchOp::Put { cf, key, value }
+                if cf.0 == RecordRole::Index.cf() && key == &fact_key =>
+            {
+                Some(value)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(fact_in_wal.len(), 1);
+    assert_eq!(fact_in_wal[0].as_slice(), canonical.as_slice());
+    assert_eq!(
+        RecordRow::decode(
+            &RecordKey::decode(RecordRole::Index, &fact_key, root).unwrap(),
+            fact_in_wal[0],
+            root,
+        )
+        .unwrap(),
+        RecordRow::Fact {
+            append_ordinal: 2,
+            decision: RecordDecision::Put(1),
+        }
+    );
+    let head_key = RecordKey::Head {
+        index: 1,
+        incarnation: 1,
+        key: b"k",
+    }
+    .encode()
+    .unwrap();
+    assert_eq!(
+        head_key,
+        oracle_bytes("02000000010000000000000001010000006b")
+    );
+    let head_value = RecordRow::Head {
+        raw_sequence: 2,
+        append_ordinal: 2,
+        decision: RecordDecision::Put(1),
+    }
+    .encode()
+    .unwrap();
+    assert_eq!(head_value.len(), 40);
+    let head_in_wal = batch
+        .ops()
+        .iter()
+        .filter_map(|op| match op {
+            BatchOp::Put { cf, key, value }
+                if cf.0 == RecordRole::Index.cf() && key == &head_key =>
+            {
+                Some(value)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(head_in_wal.len(), 1);
+    assert_eq!(head_in_wal[0].as_slice(), head_value.as_slice());
+
+    // The independently frozen Catalog S2 frame matches the four S2 rows in
+    // the rewritten first segment. Retired WAL 2 then carries the mapped
+    // writer-planned S3 frame; active WAL 3 stays header-only.
+    let CoreRecordPrefix::Complete {
+        record:
+            CoreWalRecord::Catalog {
+                sequence: 2,
+                control,
+                batch: catalog_batch,
+            },
+        encoded_len: catalog_len,
+    } = parse_core_record_prefix(CATALOG_CREATE_FRAME, root).unwrap()
+    else {
+        panic!("fixed Catalog CREATE S2 frame must be complete")
+    };
+    assert!(matches!(
+        control,
+        crate::core_catalog::CatalogControl::Create { .. }
+    ));
+    assert_eq!(catalog_len, CATALOG_CREATE_FRAME.len());
+    assert_eq!(catalog_batch.len(), 4);
+    for op in catalog_batch.ops() {
+        let BatchOp::Put { cf, key, value } = op else {
+            panic!("fixed Catalog CREATE frame must contain only Put operations")
+        };
+        assert!(
+            first.blocks.iter().flatten().any(|raw| {
+                let row = &raw.entry;
+                row.cf == *cf
+                    && row.key.as_ref() == key.as_slice()
+                    && row.version.sequence == 2
+                    && matches!(&row.version.value, StoredValue::Put(bytes) if bytes == value)
+            }),
+            "Catalog S2 WAL operation must match one installed source row"
+        );
+    }
+    let mut wal_two = Vec::with_capacity(16 + catalog_len + frame.len());
+    wal_two.extend(0x5457_4146u32.to_le_bytes());
+    wal_two.extend(1u32.to_le_bytes());
+    wal_two.extend(2u64.to_le_bytes());
+    wal_two.extend(CATALOG_CREATE_FRAME);
+    wal_two.extend(&frame);
+    let retired_path = layout.wal_path(2);
+    fs::write(&retired_path, &wal_two).unwrap();
+
+    // Segment 2 is exactly the decoded S3 batch; segment 3 retains a second
+    // physical copy of the same Fact event. The changed peer is another
+    // codec-valid PRF1 decision at the same (CF,key,core sequence).
+    let rows = batch
+        .ops()
+        .iter()
+        .map(|op| match op {
+            BatchOp::Put { cf, key, value } => SegmentEntry {
+                cf: cf.clone(),
+                key: key.clone().into(),
+                version: VersionedValue {
+                    sequence: 3,
+                    value: StoredValue::Put(value.clone()),
+                },
+            },
+            _ => panic!("writer-planned Record CREATE must contain only Puts"),
+        })
+        .collect::<Vec<_>>();
+    let original = rows
+        .iter()
+        .find(|row| row.cf.0 == RecordRole::Index.cf() && row.key.as_ref() == fact_key.as_slice())
+        .unwrap()
+        .clone();
+    assert_eq!(original.version.sequence, 3);
+    assert_eq!(original.version.value, StoredValue::Put(canonical.clone()));
+    let mut peer = original.clone();
+    if conflicting {
+        let changed = RecordRow::Fact {
+            append_ordinal: 2,
+            decision: RecordDecision::Delete,
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(
+            changed,
+            oracle_bytes("5052463101000000020000000000000002000000000000000000000000000000")
+        );
+        assert_eq!(changed.len(), canonical.len());
+        assert_ne!(changed, canonical);
+        assert_eq!(
+            RecordRow::decode(
+                &RecordKey::decode(RecordRole::Index, &fact_key, root).unwrap(),
+                &changed,
+                root,
+            )
+            .unwrap(),
+            RecordRow::Fact {
+                append_ordinal: 2,
+                decision: RecordDecision::Delete,
+            }
+        );
+        peer.version.value = StoredValue::Put(changed);
+    }
+    let mut fact_locations = Vec::new();
+    let mut file_facts = Vec::new();
+    for (level, id, entries, wanted) in [
+        (1, 2, rows, original.clone()),
+        (2, 3, vec![peer.clone()], peer.clone()),
+    ] {
+        let path = layout.segment_path(level, id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let value_path = layout.value_log_path(id);
+        let mut value_log = ValueLog::open(&value_path).unwrap();
+        let meta = SegmentWriter::write(
+            SegmentWriteOptions {
+                path: &path,
+                id,
+                level,
+                compression: Compression::None,
+                accelerator: &CpuAccelerator,
+                value_log: &mut value_log,
+                large_value_threshold: config.large_value_threshold,
+                block_size: config.block_size,
+                partitioned_bloom: None,
+                direct_io: false,
+            },
+            entries,
+        )
+        .unwrap();
+        drop(value_log);
+        fs::remove_file(value_path).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(meta.path, path.to_str().unwrap());
+        assert_eq!(meta.file_digest, blake3::hash(&bytes).to_hex().to_string());
+        assert_eq!(meta.entries, if id == 2 { 5 } else { 1 });
+        let decoded = decode_segment(&bytes, &path, &CpuAccelerator).unwrap();
+        assert_eq!((decoded.level, decoded.id), (level, id));
+        assert_eq!(
+            decoded.blocks.iter().map(Vec::len).sum::<usize>() as u64,
+            meta.entries
+        );
+        let offsets = literal_block_offsets(&bytes, level, id, decoded.blocks.len());
+        fact_locations.push(exact_entry_location(&decoded, &offsets, &wanted));
+        assert!(
+            decoded
+                .blocks
+                .iter()
+                .flatten()
+                .all(|row| row.blob_expiry.is_none())
+        );
+        file_facts.push((path, bytes, meta.entries));
+        manifest.segments.push(meta);
+    }
+    manifest.flushed_sequence = 3;
+    manifest.last_sequence = 3;
+    manifest.next_segment_id = 4;
+    ManifestStore::new(manifest_path.clone())
+        .save(&manifest)
+        .unwrap();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    manifest.validate_v4(root).unwrap();
+    assert_eq!((manifest.flushed_sequence, manifest.last_sequence), (3, 3));
+    assert_eq!((manifest.flushed_wal_id, manifest.active_wal_id), (2, 3));
+    assert_eq!(
+        manifest
+            .record_authority
+            .as_ref()
+            .unwrap()
+            .index_descriptor_count,
+        1
+    );
+    assert_eq!(manifest.segments.len(), 3);
+    assert_eq!(
+        manifest
+            .segments
+            .iter()
+            .map(|meta| meta.entries)
+            .sum::<u64>(),
+        14
+    );
+    assert_eq!(fs::read_dir(layout.value_root()).unwrap().count(), 0);
+    let before = snapshot(dir.path());
+    assert!(matches!(
+        inspect_v4_owner(&lease, &config, &CpuAccelerator),
+        Err(PraxisError::UnsupportedCatalogFeature {
+            feature: "v4 installed cut beyond narrow D0 bootstrap"
+        })
+    ));
+    assert_eq!(snapshot(dir.path()), before);
+
+    let cut = WalCut {
+        flushed_sequence: manifest.flushed_sequence,
+        last_sequence: manifest.last_sequence,
+        flushed_wal_id: manifest.flushed_wal_id,
+        active_wal_id: manifest.active_wal_id,
+        next_wal_id: manifest.next_wal_id,
+    };
+    let mut frames = Vec::new();
+    let (wal_witnesses, mut budget) = scan_v4_wals_with_budget(root, cut, |id, start, end, row| {
+        frames.push((id, start, end, row.sequence()));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        frames,
+        [
+            (2, 16, 16 + catalog_len as u64, 2),
+            (2, 16 + catalog_len as u64, wal_two.len() as u64, 3),
+        ]
+    );
+    assert_eq!(wal_witnesses.len(), 2);
+    assert_eq!(wal_witnesses[0].id, 2);
+    assert_eq!(wal_witnesses[0].path, retired_path);
+    assert_eq!(wal_witnesses[0].full_len, wal_two.len() as u64);
+    assert_eq!(wal_witnesses[0].full_digest, blake3::hash(&wal_two));
+    assert_eq!(wal_witnesses[0].prefix_len, wal_two.len() as u64);
+    assert_eq!(wal_witnesses[0].prefix_digest, blake3::hash(&wal_two));
+    assert_eq!(wal_witnesses[0].record_count, 2);
+    assert_eq!(
+        (
+            wal_witnesses[0].first_sequence,
+            wal_witnesses[0].last_sequence
+        ),
+        (Some(2), Some(3))
+    );
+    assert_eq!(wal_witnesses[0].catalog_creates, 1);
+    assert!(wal_witnesses[0].torn_start.is_none());
+    assert_eq!(wal_witnesses[1].id, 3);
+    assert_eq!(wal_witnesses[1].path, layout.wal_path(3));
+    assert_eq!(wal_witnesses[1].record_count, 0);
+    assert_eq!(wal_witnesses[1].full_len, 16);
+    let active_bytes = fs::read(layout.wal_path(3)).unwrap();
+    assert_eq!(wal_witnesses[1].full_digest, blake3::hash(&active_bytes));
+    crate::wal::catalog_witness::recheck_v4_wals(root, cut, &wal_witnesses).unwrap();
+    assert_eq!(snapshot(dir.path()), before);
+
+    let balance = budget.remaining_bytes();
+    let staged = collect_protected_segment_candidate(root, &manifest, &mut budget)
+        .expect("all three writer-produced segments must be witnessed");
+    assert_eq!((staged.witnesses.len(), staged.rows.len()), (3, 14));
+    for (index, (witness, path, bytes, count)) in [
+        (&staged.witnesses[0], &first_path, &first_bytes, 8),
+        (
+            &staged.witnesses[1],
+            &file_facts[0].0,
+            &file_facts[0].1,
+            file_facts[0].2,
+        ),
+        (
+            &staged.witnesses[2],
+            &file_facts[1].0,
+            &file_facts[1].1,
+            file_facts[1].2,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(
+            witness.source,
+            SegmentSource {
+                level: index as u32,
+                id: index as u64 + 1,
+                manifest_ordinal: index,
+            }
+        );
+        assert_eq!(witness.path.as_path(), path.as_path());
+        assert_eq!(witness.len, bytes.len() as u64);
+        assert_eq!(witness.digest, blake3::hash(bytes));
+        assert_eq!(witness.observed_rows, count);
+        assert_eq!(
+            witness.identity,
+            physical_id(&File::open(path).unwrap(), path).unwrap()
+        );
+    }
+    assert_ne!(staged.witnesses[1].identity, staged.witnesses[2].identity);
+    let copies = staged
+        .rows
+        .iter()
+        .filter(|row| row.cf == RecordRole::Index.cf() && row.key == fact_key && row.sequence == 3)
+        .collect::<Vec<_>>();
+    assert_eq!(copies.len(), 2);
+    for (index, (row, expected)) in copies.iter().zip([&original, &peer]).enumerate() {
+        assert_eq!(row.source, staged.witnesses[index + 1].source);
+        assert_eq!((row.block_offset, row.row_ordinal), fact_locations[index]);
+        assert_eq!(
+            row.classification,
+            PhysicalRowClass::BoundProtected(ProtectedRole::Index)
+        );
+        let StoredValue::Put(expected_bytes) = &expected.version.value else {
+            panic!("both writer-produced Fact copies must be literal Puts")
+        };
+        assert_eq!(row.value, ObservedSegmentValue::Put(expected_bytes.clone()));
+    }
+    drop(copies);
+    staged.discard(root, &mut budget).unwrap();
+    assert_eq!(budget.remaining_bytes(), balance, "staged witness refund");
+    assert_eq!(snapshot(dir.path()), before);
+
+    let error = match collect_protected_copy_ledger(root, &manifest, &mut budget) {
+        Ok(candidate) => {
+            candidate.discard(root, &mut budget).unwrap();
+            panic!("Fact copies unexpectedly passed the private pending gate")
+        }
+        Err(error) => error,
+    };
+    if conflicting {
+        match error {
+            PraxisError::Corrupt { reason, .. } => {
+                assert_eq!(reason, "protected physical-copy actual bytes conflict")
+            }
+            other => panic!(
+                "RED: codec-valid changed Fact@3 needs authenticated byte conflict: {other:?}"
+            ),
+        }
+    } else {
+        assert!(matches!(
+            error,
+            PraxisError::UnsupportedCatalogFeature {
+                feature: "protected physical-copy bytes await authenticated replay"
+            }
+        ));
+    }
+    assert_eq!(
+        budget.remaining_bytes(),
+        balance,
+        "copy-ledger exact refund"
+    );
+    assert_eq!(snapshot(dir.path()), before);
+    assert!(matches!(
+        inspect_v4_owner(&lease, &config, &CpuAccelerator),
+        Err(PraxisError::UnsupportedCatalogFeature {
+            feature: "v4 installed cut beyond narrow D0 bootstrap"
+        })
+    ));
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn writer_equal_record_fact_at_s3_reaches_named_private_gate() {
+    writer_record_fact_pair_case(false);
+}
+
+#[test]
+fn writer_valid_changed_record_fact_at_s3_requires_actual_byte_conflict() {
+    writer_record_fact_pair_case(true);
 }
 
 fn compressed_head_copy_fixture(conflicting: bool) -> NextCopyFixture {
