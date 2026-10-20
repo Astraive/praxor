@@ -50,6 +50,9 @@ mod value_file_witness_red;
 // Private same-(CF,key,S) copy ledger tests; no public owner is granted.
 mod physical_copy_ledger_red;
 
+// #93 writer-produced private admission edges; no public owner proof.
+mod admission_edge_tests;
+
 // #92 test-first guard for malformed variable record operation sequences.
 mod variable_shape_guard_red;
 
