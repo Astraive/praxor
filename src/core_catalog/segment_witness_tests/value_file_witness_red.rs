@@ -816,6 +816,94 @@ fn private_value_inventory_rejects_second_file_symlink_leaf() {
     });
 }
 
+#[cfg(windows)]
+#[test]
+fn private_value_inventory_rejects_junctioned_values_directory_before_any_scan() {
+    use std::os::windows::fs::MetadataExt;
+
+    let (dir, lease, manifest, schema_key, _, second_pointer, config) =
+        writer_two_file_catalog_external_fixture();
+    let root = lease.root();
+    let layout = DiskLayout::at(root);
+    let first_path = layout.value_log_path(1);
+    let second_path = layout.value_log_path(2);
+    let values_dir = second_path.parent().unwrap();
+    let parked = root.join("parked-values");
+    let first_bytes = fs::read(&first_path).unwrap();
+    let second_bytes = fs::read(&second_path).unwrap();
+    let intact_tree = snapshot(dir.path());
+
+    fs::rename(values_dir, &parked).unwrap();
+    let output = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(values_dir)
+        .arg(&parked)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "junction creation failed: {output:?}"
+    );
+    assert_ne!(
+        fs::symlink_metadata(values_dir).unwrap().file_attributes() & 0x400,
+        0
+    );
+    assert_eq!(fs::read(&first_path).unwrap(), first_bytes);
+    assert_eq!(fs::read(&second_path).unwrap(), second_bytes);
+    let junctioned_tree = snapshot(dir.path());
+    assert_ne!(junctioned_tree, intact_tree);
+
+    let owner_result = inspect_v4_owner(&lease, &config, &CpuAccelerator);
+    assert!(
+        matches!(
+            &owner_result,
+            Err(PraxisError::UnsupportedCatalogFeature {
+                feature: "v4 installed cut beyond narrow D0 bootstrap"
+            }) | Err(PraxisError::Corrupt { .. })
+        ),
+        "the public owner admitted a junctioned value fixture: {owner_result:?}"
+    );
+    assert_eq!(snapshot(dir.path()), junctioned_tree);
+
+    with_wal_budget(root, &manifest, |budget| {
+        let wal_balance = budget.remaining_bytes();
+        let segments = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+        let segment_balance = budget.remaining_bytes();
+        assert!(segment_balance < wal_balance);
+        assert_eq!(
+            catalog_pointer(&segments.rows, &[0]).path,
+            first_path.to_str().unwrap()
+        );
+        assert_eq!(
+            catalog_pointer(&segments.rows, &schema_key),
+            &second_pointer
+        );
+
+        let mut probe = ValueFileScanProbeRed::default();
+        let error = collect_value_witness_red(root, &manifest, &segments.rows, budget, &mut probe)
+            .unwrap_err();
+        assert!(
+            matches!(&error, PraxisError::Corrupt { path, reason }
+                if path.as_path() == values_dir
+                    && (reason == "external value path crosses a reparse point"
+                        || reason == "external value path crosses a symbolic link")),
+            "the private witness did not reject the junction ancestor: {error}"
+        );
+        assert_eq!(probe.proof_full_file_hashes, 0);
+        assert_eq!(probe.recheck_full_file_hashes, 0);
+        assert_eq!(budget.remaining_bytes(), segment_balance);
+        segments.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), wal_balance);
+        assert_eq!(snapshot(dir.path()), junctioned_tree);
+    });
+    assert_eq!(snapshot(dir.path()), junctioned_tree);
+
+    // Remove the junction itself before TempDir removes the parked writer files.
+    fs::remove_dir(values_dir).unwrap();
+    fs::rename(&parked, values_dir).unwrap();
+    assert_eq!(snapshot(dir.path()), intact_tree);
+}
+
 #[test]
 fn private_value_recheck_rejects_second_file_replacement_or_referenced_mutation() {
     #[derive(Clone, Copy, Debug)]
