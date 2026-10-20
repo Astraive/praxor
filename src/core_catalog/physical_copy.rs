@@ -1,7 +1,7 @@
 //! Private physical-copy admission seam for protected installed rows.
 //!
-//! The bounded segment visitor and its witnesses precede this ledger. Until
-//! equality proof exists, this entrypoint never grants copy admission.
+//! The bounded segment visitor and its witnesses precede this ledger. The
+//! current narrow byte comparisons do not grant copy admission.
 
 use super::authority::CATALOG_CF;
 use super::codec::{CatalogKey, CatalogValue};
@@ -25,6 +25,7 @@ const MAX_COPY_LEDGER_RETAINED_BYTES: usize = 32 * 1024 * 1024;
 const COPY_COMPARE_CHUNK_BYTES: usize = 64 * 1024;
 const CATALOG_HEAD_LITERAL_BYTES: usize = 48;
 const RECORD_ALLOCATOR_LITERAL_BYTES: usize = 56;
+const RECORD_INDEX_HEAD_LITERAL_BYTES: usize = 40;
 
 #[derive(Clone, Copy)]
 struct CopyProofLimits {
@@ -67,6 +68,18 @@ fn unproven_copy_group() -> PraxisError {
 fn unproven_index_head_group() -> PraxisError {
     PraxisError::UnsupportedCatalogFeature {
         feature: "record-index Head physical group provenance awaits compaction proof",
+    }
+}
+
+fn unproven_index_head_cardinality() -> PraxisError {
+    PraxisError::UnsupportedCatalogFeature {
+        feature: "record-index Head unequal source-group cardinality awaits provenance proof",
+    }
+}
+
+fn unproven_index_head_external() -> PraxisError {
+    PraxisError::UnsupportedCatalogFeature {
+        feature: "external record-index Head physical group awaits value replay",
     }
 }
 
@@ -486,6 +499,179 @@ fn exact_literal_bytes_equal(canonical: &[u8], other: &[u8]) -> bool {
             .all(|(left, right)| left == right)
 }
 
+fn is_record_index_head(root: &Path, descriptor: &CopyDescriptor) -> Result<bool> {
+    if RecordRole::from_cf(&descriptor.cf) != Some(RecordRole::Index) {
+        return Ok(false);
+    }
+    Ok(matches!(
+        RecordKey::decode(RecordRole::Index, &descriptor.key, root)?,
+        RecordKey::Head { .. }
+    ))
+}
+
+/// Each callback receives the actual decoded Put from the authenticated file,
+/// not the earlier visitor's retained wire bytes. The record key is the exact
+/// triple's Head identity; the row codec verifies the Head schema and value.
+#[allow(clippy::too_many_arguments)] // Each input is a separate replay proof boundary.
+fn with_authenticated_index_head<F>(
+    root: &Path,
+    manifest: &Manifest,
+    witnesses: &[SegmentFileWitness],
+    descriptor: &CopyDescriptor,
+    work: &mut CopyReplayWork,
+    budget: &mut PhysicalWitnessBudget,
+    on_value: F,
+) -> Result<()>
+where
+    F: FnOnce(&[u8]) -> Result<()>,
+{
+    let key = RecordKey::decode(RecordRole::Index, &descriptor.key, root)?;
+    if !matches!(&key, RecordKey::Head { .. }) {
+        return Err(corrupt(root, "ordered record copy is not an index Head"));
+    }
+    let witness = witnessed_source(root, witnesses, descriptor)?;
+    with_authenticated_literal_put(
+        root,
+        manifest,
+        witness,
+        PhysicalRowLocator {
+            source: descriptor.source,
+            block_offset: descriptor.block_offset,
+            row_ordinal: descriptor.row_ordinal,
+        },
+        ExpectedLiteralPut {
+            cf: &descriptor.cf,
+            key: &descriptor.key,
+            sequence: descriptor.sequence,
+        },
+        work,
+        budget,
+        |actual| {
+            if actual.len() != RECORD_INDEX_HEAD_LITERAL_BYTES
+                || !matches!(
+                    RecordRow::decode(&key, actual, root)?,
+                    RecordRow::Head { .. }
+                )
+            {
+                return Err(corrupt(
+                    root,
+                    "ordered record Head has invalid replay value",
+                ));
+            }
+            on_value(actual)
+        },
+    )
+}
+
+fn source_run_end(copies: &[CopyDescriptor], start: usize) -> usize {
+    let mut end = start + 1;
+    while end < copies.len()
+        && source_order(copies[start].source, copies[end].source) == Ordering::Equal
+    {
+        end += 1;
+    }
+    end
+}
+
+/// This proves only equality of complete co-resident source groups. A
+/// compacted group can lose an earlier same-sequence Head, so a shorter peer
+/// is ambiguous rather than corrupt. Physical locator order is preserved.
+#[allow(clippy::too_many_arguments)] // Work and receipts are independent bounded proof inputs.
+fn replay_ordered_index_head_group(
+    root: &Path,
+    manifest: &Manifest,
+    witnesses: &[SegmentFileWitness],
+    copies: &[CopyDescriptor],
+    budget: &mut PhysicalWitnessBudget,
+    work: &mut CopyReplayWork,
+) -> Result<()> {
+    if copies
+        .iter()
+        .any(|copy| matches!(copy.operation, CopyWireOperation::Pointer { .. }))
+    {
+        return Err(unproven_index_head_external());
+    }
+    if copies.iter().any(|copy| {
+        !matches!(copy.operation, CopyWireOperation::Put { len } if len == RECORD_INDEX_HEAD_LITERAL_BYTES as u64)
+    }) {
+        return Err(corrupt(
+            root,
+            "ordered record Head copy has conflicting wire operation or length",
+        ));
+    }
+
+    let first_end = source_run_end(copies, 0);
+    let mut next = first_end;
+    while next < copies.len() {
+        let end = source_run_end(copies, next);
+        if end - next != first_end {
+            return Err(unproven_index_head_cardinality());
+        }
+        next = end;
+    }
+
+    if first_end == copies.len() {
+        // One source contains ordered events, not duplicate copies of each
+        // other. Authenticate every event without selecting its last member.
+        for member in copies {
+            with_authenticated_index_head(root, manifest, witnesses, member, work, budget, |_| {
+                Ok(())
+            })?;
+        }
+        return Ok(());
+    }
+
+    let mut peer_start = first_end;
+    while peer_start < copies.len() {
+        for position in 0..first_end {
+            let mut canonical =
+                LiteralComparisonBuffer::new(root, budget, work, RECORD_INDEX_HEAD_LITERAL_BYTES)?;
+            let charge = canonical.charge;
+            let bytes = &mut canonical.bytes;
+            let replay_budget = &mut *canonical.budget;
+            with_authenticated_index_head(
+                root,
+                manifest,
+                witnesses,
+                &copies[position],
+                work,
+                replay_budget,
+                |actual| {
+                    bytes
+                        .try_reserve_exact(RECORD_INDEX_HEAD_LITERAL_BYTES)
+                        .map_err(|_| literal_buffer_limit())?;
+                    if bytes.capacity() > charge {
+                        return Err(literal_buffer_limit());
+                    }
+                    bytes.extend_from_slice(actual);
+                    Ok(())
+                },
+            )?;
+            let expected = &canonical.bytes;
+            let replay_budget = &mut *canonical.budget;
+            with_authenticated_index_head(
+                root,
+                manifest,
+                witnesses,
+                &copies[peer_start + position],
+                work,
+                replay_budget,
+                |actual| {
+                    if !exact_literal_bytes_equal(expected, actual) {
+                        return Err(corrupt(
+                            root,
+                            "ordered record Head physical-copy bytes conflict",
+                        ));
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        peer_start = source_run_end(copies, peer_start);
+    }
+    Ok(())
+}
+
 fn replay_literal_copy_groups(
     root: &Path,
     manifest: &Manifest,
@@ -498,6 +684,17 @@ fn replay_literal_copy_groups(
     for group in groups {
         let copies = &descriptors[group.start..group.end];
         if copies.len() < 2 {
+            continue;
+        }
+        if is_record_index_head(root, &copies[0])? {
+            replay_ordered_index_head_group(
+                root,
+                manifest,
+                &segment.witnesses,
+                copies,
+                budget,
+                work,
+            )?;
             continue;
         }
         let width = singleton_literal_width(root, &copies[0])?;
@@ -790,9 +987,10 @@ pub(crate) fn collect_protected_copy_ledger(
     if let Err(error) = replay {
         return attempt.fail(error);
     }
-    // This slice validates only fixed singleton literal copies. No private
-    // candidate can be returned until all other groups and logical value
-    // forms have a complete proof and consumption-boundary recheck.
+    // This slice validates fixed singleton literal copies and complete
+    // ordered record-index Head literal groups. No private candidate can be
+    // returned until all other groups and logical value forms have a complete
+    // proof and consumption-boundary recheck.
     attempt.fail(pending_replay())
 }
 
@@ -988,7 +1186,7 @@ mod literal_comparison_tests {
     }
 
     #[test]
-    fn record_index_head_group_waits_for_compaction_provenance() {
+    fn singleton_literal_width_excludes_ordered_index_head() {
         let key = RecordKey::Head {
             index: 1,
             incarnation: 1,

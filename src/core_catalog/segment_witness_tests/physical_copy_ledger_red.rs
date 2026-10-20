@@ -911,6 +911,7 @@ enum OrderedHeadGroupCase {
     Identical,
     Reordered,
     ChangedLastMember,
+    ShorterPeer,
 }
 
 fn fixed_record_head_bytes(append_ordinal: u64, rid: u64) -> Vec<u8> {
@@ -969,20 +970,23 @@ fn ordered_record_head_group_case(case: OrderedHeadGroupCase) {
     assert_eq!(changed_last, fixed_record_head_bytes(2, 3));
     assert_eq!(last_value.len(), changed_last.len());
     assert_ne!(last_value, changed_last);
-    let first_group = [
+    let first_group = vec![
         row_in(head_cf, &head_key, 2, StoredValue::Put(first_value.clone())),
         row_in(head_cf, &head_key, 2, StoredValue::Put(last_value.clone())),
     ];
     let second_group = match case {
         OrderedHeadGroupCase::Identical => first_group.clone(),
-        OrderedHeadGroupCase::Reordered => [first_group[1].clone(), first_group[0].clone()],
-        OrderedHeadGroupCase::ChangedLastMember => [
+        OrderedHeadGroupCase::Reordered => vec![first_group[1].clone(), first_group[0].clone()],
+        OrderedHeadGroupCase::ChangedLastMember => vec![
             first_group[0].clone(),
             row_in(head_cf, &head_key, 2, StoredValue::Put(changed_last)),
         ],
+        // Synthetic co-residency only. Real ordinary compaction retires the
+        // input source and supplies no authenticated row-level provenance.
+        OrderedHeadGroupCase::ShorterPeer => vec![first_group[1].clone()],
     };
 
-    let write_group = |level: u32, id: u64, rows: &[SegmentEntry; 2]| {
+    let write_group = |level: u32, id: u64, rows: &[SegmentEntry]| {
         let path = layout.segment_path(level, id);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let value_path = layout.value_log_path(id);
@@ -1023,14 +1027,14 @@ fn ordered_record_head_group_case(case: OrderedHeadGroupCase) {
         let level = u32::try_from(index).unwrap();
         let id = u64::try_from(index + 2).unwrap();
         let bytes = fs::read(path).unwrap();
-        assert_eq!(meta.entries, 2);
+        assert_eq!(meta.entries, expected.len() as u64);
         assert_eq!(meta.path, path.to_str().unwrap());
         assert_eq!(meta.file_digest, blake3::hash(&bytes).to_hex().to_string());
         let decoded = decode_segment(&bytes, path, &CpuAccelerator).unwrap();
         assert_eq!((decoded.level, decoded.id), (level, id));
         assert_eq!(
             decoded.blocks.len(),
-            2,
+            expected.len(),
             "one same-key row per literal block"
         );
         assert!(decoded.blocks.iter().all(|block| block.len() == 1));
@@ -1105,12 +1109,15 @@ fn ordered_record_head_group_case(case: OrderedHeadGroupCase) {
         })
         .expect("bounded visitor must retain both complete Head groups");
         assert_eq!(witnesses.len(), 3);
-        assert_eq!(observed.len(), 11);
+        assert_eq!(
+            observed.len(),
+            7 + groups.iter().map(Vec::len).sum::<usize>()
+        );
         let head_rows = observed
             .iter()
             .filter(|row| row.cf == head_cf && row.key == head_key && row.sequence == 2)
             .collect::<Vec<_>>();
-        assert_eq!(head_rows.len(), 4);
+        assert_eq!(head_rows.len(), groups.iter().map(Vec::len).sum::<usize>());
         for (index, ((witness, expected), offsets)) in witnesses[1..]
             .iter()
             .zip(groups.iter())
@@ -1121,7 +1128,7 @@ fn ordered_record_head_group_case(case: OrderedHeadGroupCase) {
             assert_eq!(witness.path, *path);
             assert_eq!(witness.len, file_bytes[index].len() as u64);
             assert_eq!(witness.digest, blake3::hash(&file_bytes[index]));
-            assert_eq!(witness.observed_rows, 2);
+            assert_eq!(witness.observed_rows, expected.len() as u64);
             assert_eq!(
                 witness.identity,
                 physical_id(&File::open(path).unwrap(), path).unwrap()
@@ -1136,7 +1143,7 @@ fn ordered_record_head_group_case(case: OrderedHeadGroupCase) {
                 .iter()
                 .filter(|row| row.source == source)
                 .collect::<Vec<_>>();
-            assert_eq!(group.len(), 2);
+            assert_eq!(group.len(), expected.len());
             for (position, (row, entry)) in group.iter().zip(expected).enumerate() {
                 assert_eq!((row.block_offset, row.row_ordinal), (offsets[position], 0));
                 let StoredValue::Put(value) = &entry.version.value else {
@@ -1170,6 +1177,12 @@ fn ordered_record_head_group_case(case: OrderedHeadGroupCase) {
                     other => panic!("conflicting full Head groups must be Corrupt: {other:?}"),
                 }
             }
+            OrderedHeadGroupCase::ShorterPeer => assert!(matches!(
+                result,
+                Err(PraxisError::UnsupportedCatalogFeature {
+                    feature: "record-index Head unequal source-group cardinality awaits provenance proof"
+                })
+            )),
         }
         assert_eq!(budget.remaining_bytes(), balance);
         assert_eq!(snapshot(dir.path()), before);
@@ -1190,4 +1203,9 @@ fn reordered_record_head_group_requires_private_copy_corrupt() {
 #[test]
 fn rechecksummed_record_head_group_byte_conflict_requires_private_copy_corrupt() {
     ordered_record_head_group_case(OrderedHeadGroupCase::ChangedLastMember);
+}
+
+#[test]
+fn shorter_co_resident_record_head_group_refuses_without_provenance() {
+    ordered_record_head_group_case(OrderedHeadGroupCase::ShorterPeer);
 }
