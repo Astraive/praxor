@@ -572,6 +572,255 @@ fn private_value_inventory_refunds_after_second_file_corruption() {
     }
 }
 
+fn assert_two_file_owner_remains_fenced(
+    dir: &tempfile::TempDir,
+    lease: &WriterLease,
+    config: &PraxisConfig,
+) {
+    let before = snapshot(dir.path());
+    let owner_result = inspect_v4_owner(lease, config, &CpuAccelerator);
+    assert!(
+        matches!(
+            &owner_result,
+            Err(PraxisError::UnsupportedCatalogFeature {
+                feature: "v4 installed cut beyond narrow D0 bootstrap"
+            })
+        ),
+        "the public owner admitted a private two-file fixture: {owner_result:?}"
+    );
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn private_value_inventory_rejects_second_file_lexical_alias_before_any_scan() {
+    let (dir, lease, manifest, schema_key, _, second_pointer, config) =
+        writer_two_file_catalog_external_fixture();
+    let root = lease.root();
+    let second_path = DiskLayout::at(root).value_log_path(2);
+    let parent = second_path.parent().unwrap().to_str().unwrap();
+    let name = second_path.file_name().unwrap().to_str().unwrap();
+    let sep = std::path::MAIN_SEPARATOR;
+    let alias = format!("{parent}{sep}.{sep}{name}");
+    assert_ne!(alias, second_pointer.path);
+    assert_eq!(fs::read(&alias).unwrap(), fs::read(&second_path).unwrap());
+    let before = snapshot(dir.path());
+    assert_two_file_owner_remains_fenced(&dir, &lease, &config);
+
+    with_wal_budget(root, &manifest, |budget| {
+        let wal_balance = budget.remaining_bytes();
+        let segments = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+        let segment_balance = budget.remaining_bytes();
+        assert!(segment_balance < wal_balance);
+        assert_eq!(
+            catalog_pointer(&segments.rows, &schema_key),
+            &second_pointer
+        );
+        let mut aliased = segments.rows.clone();
+        let schema = aliased
+            .iter_mut()
+            .find(|row| row.cf == CATALOG_CF && row.key == schema_key)
+            .unwrap();
+        let ObservedSegmentValue::Pointer { pointer, .. } = &mut schema.value else {
+            panic!("writer-produced Schema must retain a pointer")
+        };
+        pointer.path = alias.clone();
+
+        let mut probe = ValueFileScanProbeRed::default();
+        let error =
+            collect_value_witness_red(root, &manifest, &aliased, budget, &mut probe).unwrap_err();
+        assert!(matches!(&error, PraxisError::Corrupt { .. }), "{error}");
+        assert_eq!(probe.proof_full_file_hashes, 0);
+        assert_eq!(probe.recheck_full_file_hashes, 0);
+        drop(aliased);
+        assert_eq!(budget.remaining_bytes(), segment_balance);
+        segments.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), wal_balance);
+        assert_eq!(snapshot(dir.path()), before);
+    });
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+fn assert_second_file_physical_alias_refused(mutate: impl FnOnce(&Path)) {
+    let (dir, lease, manifest, schema_key, _, second_pointer, config) =
+        writer_two_file_catalog_external_fixture();
+    let root = lease.root();
+    let layout = DiskLayout::at(root);
+    let first_path = layout.value_log_path(1);
+    let second_path = layout.value_log_path(2);
+    let intact_tree = snapshot(dir.path());
+    mutate(&second_path);
+    let aliased_tree = snapshot(dir.path());
+    assert_ne!(aliased_tree, intact_tree);
+    assert_two_file_owner_remains_fenced(&dir, &lease, &config);
+
+    with_wal_budget(root, &manifest, |budget| {
+        let wal_balance = budget.remaining_bytes();
+        let segments = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+        let segment_balance = budget.remaining_bytes();
+        assert!(segment_balance < wal_balance);
+        assert_eq!(
+            catalog_pointer(&segments.rows, &[0]).path,
+            first_path.to_str().unwrap()
+        );
+        assert_eq!(
+            catalog_pointer(&segments.rows, &schema_key),
+            &second_pointer
+        );
+
+        let mut probe = ValueFileScanProbeRed::default();
+        let error = collect_value_witness_red(root, &manifest, &segments.rows, budget, &mut probe)
+            .unwrap_err();
+        let PraxisError::Corrupt { path, .. } = &error else {
+            panic!("the second-file alias escaped the private witness: {error}")
+        };
+        assert_eq!(path, &second_path);
+        assert_eq!(probe.proof_full_file_hashes, 1);
+        assert_eq!(probe.recheck_full_file_hashes, 0);
+        assert_eq!(budget.remaining_bytes(), segment_balance);
+        segments.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), wal_balance);
+        assert_eq!(snapshot(dir.path()), aliased_tree);
+    });
+    assert_eq!(snapshot(dir.path()), aliased_tree);
+}
+
+#[test]
+fn private_value_inventory_rejects_second_file_hardlink_alias() {
+    assert_second_file_physical_alias_refused(|second_path| {
+        let alias_path = second_path.with_extension("hardlink");
+        fs::hard_link(second_path, alias_path).unwrap();
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn private_value_inventory_rejects_second_file_symlink_leaf() {
+    use std::os::unix::fs::symlink;
+
+    assert_second_file_physical_alias_refused(|second_path| {
+        let parked = second_path.with_extension("parked");
+        fs::rename(second_path, &parked).unwrap();
+        symlink(parked, second_path).unwrap();
+    });
+}
+
+#[test]
+fn private_value_recheck_rejects_second_file_replacement_or_referenced_mutation() {
+    #[derive(Clone, Copy, Debug)]
+    enum Change {
+        ByteIdenticalReplacement,
+        ReferencedPayloadMutation,
+    }
+
+    for change in [
+        Change::ByteIdenticalReplacement,
+        Change::ReferencedPayloadMutation,
+    ] {
+        let (dir, lease, manifest, schema_key, schema_bytes, second_pointer, config) =
+            writer_two_file_catalog_external_fixture();
+        let root = lease.root();
+        let second_path = DiskLayout::at(root).value_log_path(2);
+        let original = fs::read(&second_path).unwrap();
+        let intact_tree = snapshot(dir.path());
+        assert_two_file_owner_remains_fenced(&dir, &lease, &config);
+
+        with_wal_budget(root, &manifest, |budget| {
+            let wal_balance = budget.remaining_bytes();
+            let segments = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+            let segment_balance = budget.remaining_bytes();
+            assert!(segment_balance < wal_balance);
+            assert_eq!(
+                catalog_pointer(&segments.rows, &schema_key),
+                &second_pointer
+            );
+            let mut probe = ValueFileScanProbeRed::default();
+            let values =
+                collect_value_witness_red(root, &manifest, &segments.rows, budget, &mut probe)
+                    .unwrap();
+            assert_eq!(probe.proof_full_file_hashes, 2);
+            assert_eq!(values.files.len(), 2);
+            assert_eq!(values.files[1].id, 2);
+            assert_eq!(values.files[1].path, second_path);
+            assert_eq!(values.files[1].len, original.len() as u64);
+            assert_eq!(values.files[1].digest, blake3::hash(&original));
+            assert_eq!(
+                values.retained_bytes,
+                segment_balance - budget.remaining_bytes()
+            );
+
+            match change {
+                Change::ByteIdenticalReplacement => {
+                    let replacement = second_path.with_extension("replacement");
+                    fs::copy(&second_path, &replacement).unwrap();
+                    let opened = File::open(&replacement).unwrap();
+                    assert_ne!(
+                        physical_id(&opened, &replacement).unwrap(),
+                        values.files[1].identity
+                    );
+                    drop(opened);
+                    fs::remove_file(&second_path).unwrap();
+                    fs::rename(replacement, &second_path).unwrap();
+                }
+                Change::ReferencedPayloadMutation => {
+                    assert_eq!(second_pointer.len, schema_bytes.len() as u64);
+                    let offset = second_pointer.offset + 12 + 16_384;
+                    let at = usize::try_from(offset).unwrap();
+                    assert!(at < original.len());
+                    let mut opened = OpenOptions::new().write(true).open(&second_path).unwrap();
+                    opened.seek(SeekFrom::Start(offset)).unwrap();
+                    opened.write_all(&[original[at] ^ 1]).unwrap();
+                    opened.flush().unwrap();
+                }
+            }
+            let changed = fs::read(&second_path).unwrap();
+            assert_eq!(changed.len(), original.len());
+            let opened = File::open(&second_path).unwrap();
+            let changed_id = physical_id(&opened, &second_path).unwrap();
+            drop(opened);
+            match change {
+                Change::ByteIdenticalReplacement => {
+                    assert_eq!(changed, original);
+                    assert_eq!(blake3::hash(&changed), values.files[1].digest);
+                    assert_ne!(changed_id, values.files[1].identity);
+                }
+                Change::ReferencedPayloadMutation => {
+                    assert_ne!(changed, original);
+                    assert_ne!(blake3::hash(&changed), values.files[1].digest);
+                    assert_eq!(changed_id, values.files[1].identity);
+                }
+            }
+            let changed_tree = snapshot(dir.path());
+            assert_ne!(changed_tree, intact_tree);
+
+            let error =
+                recheck_value_witness_red(root, &manifest, &values, &mut probe).unwrap_err();
+            let PraxisError::Corrupt { path, .. } = &error else {
+                panic!("{change:?} escaped the private recheck: {error}")
+            };
+            assert_eq!(path, &second_path);
+            assert_eq!(
+                probe.recheck_full_file_hashes,
+                if matches!(change, Change::ByteIdenticalReplacement) {
+                    1
+                } else {
+                    2
+                }
+            );
+            assert_eq!(
+                budget.remaining_bytes(),
+                segment_balance - values.retained_bytes
+            );
+            assert_eq!(snapshot(dir.path()), changed_tree);
+            values.discard(root, budget).unwrap();
+            assert_eq!(budget.remaining_bytes(), segment_balance);
+            segments.discard(root, budget).unwrap();
+            assert_eq!(budget.remaining_bytes(), wal_balance);
+            assert_eq!(snapshot(dir.path()), changed_tree);
+        });
+        assert_ne!(snapshot(dir.path()), intact_tree);
+    }
+}
+
 #[test]
 fn private_value_file_rejects_normalized_path_aliases_before_scanning() {
     let (dir, lease, manifest, _, _) =
