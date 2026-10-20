@@ -1621,6 +1621,7 @@ mod direct_replay_tests {
     use crate::accel::cpu::scalar::CpuAccelerator;
     use crate::config::Compression;
     use crate::core_catalog::codec::{CatalogKey, CatalogValue};
+    use crate::core_catalog::physical_copy::collect_protected_copy_ledger;
     use crate::core_catalog::physical_tests::flushed_create_fixture;
     use crate::core_catalog::segment_witness::{
         CopyReplayLimits, PRODUCTION_COPY_REPLAY_LIMITS, collect_protected_segment_candidate,
@@ -1635,7 +1636,8 @@ mod direct_replay_tests {
     use crate::types::{ColumnFamily, StoredValue, ValuePointer, VersionedValue};
     use crate::values::ValueLog;
     use crate::wal::catalog_witness::{WalCut, scan_v4_wals_with_budget};
-    use crate::writer_lease::WriterLease;
+    use crate::writer_lease::{LOCK_FILE_NAME, WriterLease};
+    use std::collections::BTreeMap;
     use std::io::{Seek, SeekFrom, Write};
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -1862,6 +1864,117 @@ mod direct_replay_tests {
         assert_eq!(heads.len(), 2);
         assert_ne!(heads[0], heads[1]);
         heads
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    enum WriterTreeEntry {
+        Directory,
+        LockFile,
+        File {
+            bytes: Vec<u8>,
+            identity: SegmentPhysicalId,
+        },
+    }
+
+    fn writer_tree_snapshot(root: &Path) -> BTreeMap<PathBuf, WriterTreeEntry> {
+        fn walk(root: &Path, at: &Path, entries: &mut BTreeMap<PathBuf, WriterTreeEntry>) {
+            for entry in fs::read_dir(at).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                let kind = entry.file_type().unwrap();
+                assert!(!kind.is_symlink(), "writer fixture must contain no aliases");
+                if kind.is_dir() {
+                    assert!(
+                        entries
+                            .insert(relative, WriterTreeEntry::Directory)
+                            .is_none()
+                    );
+                    walk(root, &path, entries);
+                } else {
+                    assert!(kind.is_file(), "writer fixture has an unexpected file type");
+                    let observed = if path.file_name() == Some(std::ffi::OsStr::new(LOCK_FILE_NAME))
+                    {
+                        // The live writer lock cannot be reopened on Windows.
+                        assert_eq!(entry.metadata().unwrap().len(), 0);
+                        WriterTreeEntry::LockFile
+                    } else {
+                        let file = File::open(&path).unwrap();
+                        WriterTreeEntry::File {
+                            bytes: fs::read(&path).unwrap(),
+                            identity: physical_id(&file, &path).unwrap(),
+                        }
+                    };
+                    assert!(entries.insert(relative, observed).is_none());
+                }
+            }
+        }
+
+        let mut entries = BTreeMap::new();
+        walk(root, root, &mut entries);
+        entries
+    }
+
+    fn exercise_writer_external_copy_ledger(conflicting_head: bool) {
+        let fixture = writer_external_replay_fixture(conflicting_head);
+        assert_eq!(fixture.first_head.len(), fixture.second_head.len());
+        if conflicting_head {
+            assert_ne!(fixture.first_head, fixture.second_head);
+        } else {
+            assert_eq!(fixture.first_head, fixture.second_head);
+        }
+        let root = fixture.lease.root();
+        let manifest = &fixture.manifest;
+        let cut = WalCut {
+            flushed_sequence: manifest.flushed_sequence,
+            last_sequence: manifest.last_sequence,
+            flushed_wal_id: manifest.flushed_wal_id,
+            active_wal_id: manifest.active_wal_id,
+            next_wal_id: manifest.next_wal_id,
+        };
+        let (_wals, mut budget) = scan_v4_wals_with_budget(root, cut, |_, _, _, _| Ok(())).unwrap();
+        let retained = budget.remaining_bytes();
+        let before = writer_tree_snapshot(root);
+
+        let error = match collect_protected_copy_ledger(root, manifest, &mut budget) {
+            Ok(candidate) => {
+                candidate.discard(root, &mut budget).unwrap();
+                panic!("external copy ledger must stay private until owner composition");
+            }
+            Err(error) => error,
+        };
+        assert_eq!(budget.remaining_bytes(), retained, "exact witness refund");
+        assert_eq!(
+            writer_tree_snapshot(root),
+            before,
+            "collector changed writer tree"
+        );
+        if conflicting_head {
+            match error {
+                PraxisError::Corrupt { reason, .. } => assert!(
+                    reason.contains("actual bytes conflict"),
+                    "expected authenticated byte conflict, got {reason}"
+                ),
+                other => panic!("expected authenticated byte conflict, got {other:?}"),
+            }
+        } else {
+            match error {
+                PraxisError::UnsupportedCatalogFeature {
+                    feature: "protected physical-copy bytes await authenticated replay",
+                } => {}
+                other => panic!("equal external copies must reach private admission: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn writer_equal_external_head_copies_reach_pending_private_admission() {
+        exercise_writer_external_copy_ledger(false);
+    }
+
+    #[test]
+    fn writer_rechecksummed_external_head_conflict_refunds_without_writes() {
+        exercise_writer_external_copy_ledger(true);
     }
 
     #[test]
