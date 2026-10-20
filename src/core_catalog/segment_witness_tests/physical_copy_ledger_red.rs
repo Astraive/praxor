@@ -2041,7 +2041,7 @@ fn writer_schema_pair_case(conflicting: bool) {
             assert_eq!(snapshot(dir.path()), before, "refusal must not edit files");
             match error {
                 PraxisError::Corrupt { reason, .. }
-                    if reason.contains("physical-copy actual bytes conflict") => {}
+                    if reason == "protected physical-copy actual bytes conflict" => {}
                 other => panic!(
                     "RED: valid, equal-length Schema@2 copies with different bytes must be Corrupt: {other:?}"
                 ),
@@ -2049,11 +2049,8 @@ fn writer_schema_pair_case(conflicting: bool) {
         } else {
             match result {
                 Err(PraxisError::UnsupportedCatalogFeature {
-                    feature:
-                        "protected physical-copy role group provenance awaits proof"
-                        | "protected physical-copy bytes await authenticated replay",
+                    feature: "protected physical-copy bytes await authenticated replay",
                 }) => {}
-                Ok(candidate) => candidate.discard(root, budget).unwrap(),
                 other => {
                     panic!("identical Schema@2 copies must reach the next private gate: {other:?}")
                 }
@@ -2489,8 +2486,7 @@ fn writer_schema_pair_topology_case(topology: SchemaPairTopology, change: Schema
             SchemaPeerChange::Equal => assert!(matches!(
                 error,
                 PraxisError::UnsupportedCatalogFeature {
-                    feature: "protected physical-copy role group provenance awaits proof"
-                        | "protected physical-copy bytes await authenticated replay"
+                    feature: "protected physical-copy bytes await authenticated replay"
                 }
             )),
             SchemaPeerChange::DifferentNullable | SchemaPeerChange::LongerName => match error {

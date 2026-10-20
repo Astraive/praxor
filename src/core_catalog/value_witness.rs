@@ -23,7 +23,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 const HEADER_BYTES: u64 = 12;
-const CATALOG_MAX_BYTES: usize = 33_947;
+pub(super) const CATALOG_MAX_BYTES: usize = 33_947;
 const MAX_SCHEMA_FIELDS: usize = 128;
 const HASH_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_REFERENCED_VALUE_FILES: usize = 4_096;
@@ -837,6 +837,52 @@ impl Drop for SchemaDecodeCharge<'_> {
     }
 }
 
+fn validate_schema_payload(
+    key: &CatalogKey,
+    bytes: &[u8],
+    path: &Path,
+    budget: &mut PhysicalWitnessBudget,
+) -> Result<()> {
+    if bytes.len() > CATALOG_MAX_BYTES {
+        return Err(corrupt(
+            path,
+            "Schema payload exceeds the catalog value limit",
+        ));
+    }
+    let allowance = vector_charge::<Field<'static>>(path, MAX_SCHEMA_FIELDS * 2)?;
+    budget.charge(path, allowance)?;
+    let charge = SchemaDecodeCharge {
+        budget,
+        path,
+        bytes: allowance,
+    };
+    let value = CatalogValue::decode(key, bytes, path)?;
+    let CatalogValue::Schema(schema) = value else {
+        return Err(corrupt(path, "external Schema has the wrong value tag"));
+    };
+    if schema.fields.capacity() > MAX_SCHEMA_FIELDS * 2 {
+        return Err(budget_error(path));
+    }
+    drop(schema);
+    drop(charge);
+    Ok(())
+}
+
+/// Decode the bytes returned by a selected physical row, after its callback
+/// has completed. Earlier visitor bytes are not an equivalence witness.
+pub(super) fn validate_replayed_catalog_schema_put(
+    root: &Path,
+    key_bytes: &[u8],
+    bytes: &[u8],
+    budget: &mut PhysicalWitnessBudget,
+) -> Result<()> {
+    let key = CatalogKey::decode(key_bytes, root)?;
+    if !matches!(&key, CatalogKey::Schema(_)) {
+        return Err(corrupt(root, "replayed Schema lacks a Schema key"));
+    }
+    validate_schema_payload(&key, bytes, root, budget)
+}
+
 fn validate_catalog_payload(
     row: &ObservedSegmentRow,
     bytes: &[u8],
@@ -852,22 +898,7 @@ fn validate_catalog_payload(
     }
     let key = CatalogKey::decode(&row.key, path)?;
     if matches!(&key, CatalogKey::Schema(_)) {
-        let allowance = vector_charge::<Field<'static>>(path, MAX_SCHEMA_FIELDS * 2)?;
-        budget.charge(path, allowance)?;
-        let charge = SchemaDecodeCharge {
-            budget,
-            path,
-            bytes: allowance,
-        };
-        let value = CatalogValue::decode(&key, bytes, path)?;
-        let CatalogValue::Schema(schema) = value else {
-            return Err(corrupt(path, "external Schema has the wrong value tag"));
-        };
-        if schema.fields.capacity() > MAX_SCHEMA_FIELDS * 2 {
-            return Err(budget_error(path));
-        }
-        drop(schema);
-        drop(charge);
+        validate_schema_payload(&key, bytes, path, budget)?;
     } else if !matches!(
         (&key, CatalogValue::decode(&key, bytes, path)?),
         (CatalogKey::Head, CatalogValue::Head(_))

@@ -12,8 +12,9 @@ use super::segment_witness::{
     with_authenticated_literal_put,
 };
 use super::value_witness::{
-    ValueFileScanProbe, ValueReplayContext, ValueRowLocator, ValueWitnessCandidate,
-    collect_value_witness, recheck_value_witness_for_copy, validate_inline_catalog_schema_put,
+    CATALOG_MAX_BYTES, ValueFileScanProbe, ValueReplayContext, ValueRowLocator,
+    ValueWitnessCandidate, collect_value_witness, recheck_value_witness_for_copy,
+    validate_inline_catalog_schema_put, validate_replayed_catalog_schema_put,
     with_authenticated_value_payload,
 };
 use crate::core_records::codec::{Key as RecordKey, Role as RecordRole, Row as RecordRow};
@@ -31,6 +32,12 @@ const CATALOG_HEAD_LITERAL_BYTES: usize = 48;
 const CATALOG_ANCHOR_BYTES: usize = 72;
 const RECORD_ALLOCATOR_LITERAL_BYTES: usize = 56;
 const RECORD_INDEX_HEAD_LITERAL_BYTES: usize = 40;
+// Vec capacity can exceed logical length; debit both buffers before replay.
+const SCHEMA_COMPARISON_BUFFER_CAPACITY: usize = CATALOG_MAX_BYTES * 2 + 64;
+const SCHEMA_COMPARISON_BUDGET_BYTES: usize = SCHEMA_COMPARISON_BUFFER_CAPACITY * 2;
+// Covers the two buffers together with the literal file capture (2,097,216),
+// value replay scratch (99,496), and the charged Schema decoder workspace.
+const SCHEMA_PAIR_TRANSIENT_PEAK_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 struct CopyProofLimits {
@@ -91,6 +98,12 @@ fn unproven_index_head_external() -> PraxisError {
 fn literal_buffer_limit() -> PraxisError {
     PraxisError::UnsupportedCatalogFeature {
         feature: "literal physical-copy comparison buffer exceeds proof profile",
+    }
+}
+
+fn schema_buffer_limit() -> PraxisError {
+    PraxisError::UnsupportedCatalogFeature {
+        feature: "Schema physical-copy comparison buffer exceeds proof profile",
     }
 }
 
@@ -490,6 +503,85 @@ impl Drop for LiteralComparisonBuffer<'_> {
     }
 }
 
+/// Retain only two bounded Schema values; each selected-row callback may
+/// allocate a separate literal capture or value replay scratch at the same
+/// time. Release both allocations before refunding the shared budget debit.
+struct SchemaComparisonBuffer<'a> {
+    canonical: Vec<u8>,
+    peer: Vec<u8>,
+    budget: &'a mut PhysicalWitnessBudget,
+    root: &'a Path,
+}
+
+impl<'a> SchemaComparisonBuffer<'a> {
+    fn new(
+        root: &'a Path,
+        budget: &'a mut PhysicalWitnessBudget,
+        work: &mut CopyReplayWork,
+    ) -> Result<Self> {
+        work.reserve(0, 0, SCHEMA_PAIR_TRANSIENT_PEAK_BYTES)?;
+        if SCHEMA_COMPARISON_BUDGET_BYTES > budget.remaining_bytes() {
+            return Err(schema_buffer_limit());
+        }
+        budget.charge(root, SCHEMA_COMPARISON_BUDGET_BYTES)?;
+        Ok(Self {
+            canonical: Vec::new(),
+            peer: Vec::new(),
+            budget,
+            root,
+        })
+    }
+}
+
+impl Drop for SchemaComparisonBuffer<'_> {
+    fn drop(&mut self) {
+        drop(std::mem::take(&mut self.canonical));
+        drop(std::mem::take(&mut self.peer));
+        if self
+            .budget
+            .release(self.root, SCHEMA_COMPARISON_BUDGET_BYTES)
+            .is_err()
+        {
+            std::process::abort();
+        }
+    }
+}
+
+fn append_schema_chunk(
+    root: &Path,
+    bytes: &mut Vec<u8>,
+    chunk: &[u8],
+    expected_len: usize,
+) -> Result<()> {
+    let next_len = bytes
+        .len()
+        .checked_add(chunk.len())
+        .filter(|len| *len <= expected_len)
+        .ok_or_else(|| corrupt(root, "replayed Schema exceeds its witnessed wire length"))?;
+    bytes
+        .try_reserve_exact(chunk.len())
+        .map_err(|_| schema_buffer_limit())?;
+    if bytes.capacity() > SCHEMA_COMPARISON_BUFFER_CAPACITY {
+        return Err(schema_buffer_limit());
+    }
+    bytes.extend_from_slice(chunk);
+    debug_assert_eq!(bytes.len(), next_len);
+    Ok(())
+}
+
+fn schema_copy_width(root: &Path, copy: &CopyDescriptor) -> Result<usize> {
+    let len = match copy.operation {
+        CopyWireOperation::Put { len } | CopyWireOperation::Pointer { len } => len,
+        CopyWireOperation::Delete => {
+            return Err(corrupt(root, "Schema physical copy has a Delete operation"));
+        }
+    };
+    usize::try_from(len)
+        .ok()
+        .filter(|width| *width <= CATALOG_MAX_BYTES)
+        .ok_or_else(|| corrupt(root, "Schema physical copy exceeds the catalog value limit"))
+}
+
 fn exact_literal_bytes_equal(canonical: &[u8], other: &[u8]) -> bool {
     canonical.len() == other.len()
         && canonical
@@ -669,7 +761,7 @@ fn replay_ordered_index_head_group(
     Ok(())
 }
 
-/// Read one fixed-width logical value through its exact physical witness.
+/// Read one bounded logical value through its exact physical witness.
 /// The callback's chunks remain provisional until the selected-file replay
 /// and both complete witness fences have succeeded.
 #[allow(clippy::too_many_arguments)] // Segment and value witnesses have separate physical identities.
@@ -736,6 +828,85 @@ fn with_authenticated_singleton_copy(
     }
 }
 
+/// Compare every physical Schema row after selected-file authentication. A
+/// peer's wire length may differ, so authenticate and decode it before
+/// recording a conflict; the caller reports conflicts only after both full
+/// witness fences have succeeded.
+#[allow(clippy::too_many_arguments)] // Segment/value receipts and replay limits are distinct proof inputs.
+fn replay_schema_copy_group(
+    root: &Path,
+    manifest: &Manifest,
+    segment: &ProtectedSegmentCandidate,
+    value: Option<&ValueWitnessCandidate>,
+    copies: &[CopyDescriptor],
+    budget: &mut PhysicalWitnessBudget,
+    work: &mut CopyReplayWork,
+    actual_bytes_conflict: &mut bool,
+) -> Result<()> {
+    let mut retained = SchemaComparisonBuffer::new(root, budget, work)?;
+    let first = &copies[0];
+    let canonical_width = schema_copy_width(root, first)?;
+    let canonical_bytes = &mut retained.canonical;
+    let replay_budget = &mut *retained.budget;
+    with_authenticated_singleton_copy(
+        root,
+        manifest,
+        segment,
+        value,
+        first,
+        canonical_width,
+        replay_budget,
+        work,
+        |chunk| append_schema_chunk(root, canonical_bytes, chunk, canonical_width),
+    )?;
+    if retained.canonical.len() != canonical_width {
+        return Err(corrupt(
+            root,
+            "replayed Schema is shorter than its witnessed wire length",
+        ));
+    }
+    validate_replayed_catalog_schema_put(
+        root,
+        &first.key,
+        &retained.canonical,
+        &mut *retained.budget,
+    )?;
+
+    for copy in &copies[1..] {
+        retained.peer.clear();
+        let peer_width = schema_copy_width(root, copy)?;
+        let peer_bytes = &mut retained.peer;
+        let replay_budget = &mut *retained.budget;
+        with_authenticated_singleton_copy(
+            root,
+            manifest,
+            segment,
+            value,
+            copy,
+            peer_width,
+            replay_budget,
+            work,
+            |chunk| append_schema_chunk(root, peer_bytes, chunk, peer_width),
+        )?;
+        if retained.peer.len() != peer_width {
+            return Err(corrupt(
+                root,
+                "replayed Schema is shorter than its witnessed wire length",
+            ));
+        }
+        validate_replayed_catalog_schema_put(
+            root,
+            &copy.key,
+            &retained.peer,
+            &mut *retained.budget,
+        )?;
+        if retained.canonical != retained.peer {
+            *actual_bytes_conflict = true;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // Segment/value receipts and replay limits are distinct proof inputs.
 fn replay_fixed_copy_groups(
     root: &Path,
@@ -763,6 +934,24 @@ fn replay_fixed_copy_groups(
                 budget,
                 work,
                 &mut ordered_head_conflict,
+            )?;
+            continue;
+        }
+        if copies[0].cf == CATALOG_CF
+            && matches!(
+                CatalogKey::decode(&copies[0].key, root)?,
+                CatalogKey::Schema(_)
+            )
+        {
+            replay_schema_copy_group(
+                root,
+                manifest,
+                segment,
+                value,
+                copies,
+                budget,
+                work,
+                &mut actual_bytes_conflict,
             )?;
             continue;
         }
@@ -1163,9 +1352,9 @@ pub(crate) fn collect_protected_copy_ledger(
     if let Err(error) = replay {
         return attempt.fail(error);
     }
-    // This slice validates fixed singleton inline/external copies and complete
-    // ordered record-index Head literal groups. Variable/compressed groups and
-    // consumption-boundary admission remain separate private proof steps.
+    // This slice compares bounded fixed and Schema inline/external copy groups
+    // and complete ordered record-index Head literal groups. Other variable or
+    // compressed groups and consumption-boundary admission remain separate.
     attempt.fail(pending_replay())
 }
 
