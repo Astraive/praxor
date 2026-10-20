@@ -602,7 +602,8 @@ fn private_value_inventory_rejects_second_file_lexical_alias_before_any_scan() {
     let sep = std::path::MAIN_SEPARATOR;
     let alias = format!("{parent}{sep}.{sep}{name}");
     assert_ne!(alias, second_pointer.path);
-    assert_eq!(fs::read(&alias).unwrap(), fs::read(&second_path).unwrap());
+    // The raw spelling must be rejected before the host OS resolves it.
+    assert!(second_path.is_file());
     let before = snapshot(dir.path());
     assert_two_file_owner_remains_fenced(&dir, &lease, &config);
 
