@@ -50,6 +50,9 @@ mod value_file_witness_red;
 // Private same-(CF,key,S) copy ledger RED; no public owner is granted.
 mod physical_copy_ledger_red;
 
+// Adversarial selected-row replay coverage for the narrow LZ4 Catalog Head.
+mod lz4_head_replay_adversarial;
+
 fn row(key: u8, value: StoredValue) -> SegmentEntry {
     SegmentEntry {
         cf: ColumnFamily(CATALOG_CF.into()),

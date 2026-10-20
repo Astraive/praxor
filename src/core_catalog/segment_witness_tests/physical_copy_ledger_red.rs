@@ -941,6 +941,253 @@ fn rechecksummed_equal_length_head_at_s2_conflict_requires_private_copy_corrupt(
     exercise_next_copy_case(NextCopyCase::ConflictingHead);
 }
 
+fn compressed_head_copy_fixture(conflicting: bool) -> NextCopyFixture {
+    // The original fixture pins Head@2 to the independent WAL oracle and
+    // produces a valid, equal-length rechecksummed conflict when requested.
+    let mut fixture = next_copy_fixture(NextCopyCase::ConflictingHead);
+    if !conflicting {
+        fixture.written = fixture.original.clone();
+    }
+    let root = fixture.lease.root();
+    let layout = DiskLayout::at(root);
+    let value_path = layout.value_log_path(2);
+    let mut value_log = ValueLog::open(&value_path).unwrap();
+    let second_meta = SegmentWriter::write(
+        SegmentWriteOptions {
+            path: &fixture.second_path,
+            id: 2,
+            level: 1,
+            compression: Compression::Lz4,
+            accelerator: &CpuAccelerator,
+            value_log: &mut value_log,
+            large_value_threshold: fixture.config.large_value_threshold,
+            block_size: fixture.config.block_size,
+            partitioned_bloom: None,
+            direct_io: false,
+        },
+        vec![fixture.written.clone()],
+    )
+    .unwrap();
+    drop(value_log);
+    fs::remove_file(value_path).unwrap();
+
+    let bytes = fs::read(&fixture.second_path).unwrap();
+    assert_eq!(
+        &bytes[..4],
+        &crate::segments::format::SEGMENT_MAGIC.to_le_bytes()
+    );
+    assert_eq!(
+        &bytes[4..8],
+        &crate::segments::format::SEGMENT_VERSION.to_le_bytes()
+    );
+    assert_eq!(bytes[8], 1, "writer must emit an LZ4 segment");
+    assert_eq!(u32::from_le_bytes(bytes[9..13].try_into().unwrap()), 1);
+    assert_eq!(u64::from_le_bytes(bytes[13..21].try_into().unwrap()), 2);
+    let (encoded, decoded_len, block_crc) = writer_block_frame(&bytes, 21);
+    assert_eq!(crc32c(encoded), block_crc);
+    let decoded_block = decode_block(Compression::Lz4, encoded).unwrap();
+    assert_eq!(decoded_block.len() as u64, decoded_len);
+    let decoded_rows = decode_entries(&decoded_block, &fixture.second_path).unwrap();
+    assert_eq!(decoded_rows.len(), 1);
+    assert_eq!(decoded_rows[0].entry, fixture.written);
+    assert!(decoded_rows[0].blob_expiry.is_none());
+    let trailer = bytes.len() - 12;
+    let footer_len = u32::from_le_bytes(bytes[trailer..trailer + 4].try_into().unwrap()) as usize;
+    let footer = trailer.checked_sub(footer_len).unwrap();
+    assert_eq!(21 + 12 + encoded.len(), footer, "one complete LZ4 block");
+    assert_eq!(
+        crc32c(&bytes[footer..trailer]),
+        u32::from_le_bytes(bytes[trailer + 4..trailer + 8].try_into().unwrap())
+    );
+    assert_eq!(
+        u32::from_le_bytes(bytes[trailer + 8..].try_into().unwrap()),
+        SEGMENT_FOOTER_MAGIC
+    );
+    assert_eq!(second_meta.entries, 1);
+    assert_eq!(second_meta.min_key.as_slice(), fixture.written.key.as_ref());
+    assert_eq!(second_meta.max_key.as_slice(), fixture.written.key.as_ref());
+    assert_eq!(second_meta.path, fixture.second_path.to_str().unwrap());
+    assert_eq!(
+        second_meta.file_digest,
+        blake3::hash(&bytes).to_hex().to_string()
+    );
+    let parsed = decode_segment(&bytes, &fixture.second_path, &CpuAccelerator).unwrap();
+    assert_eq!((parsed.level, parsed.id), (1, 2));
+    assert_eq!(parsed.blocks.len(), 1);
+    assert_eq!(parsed.blocks[0].len(), 1);
+    fixture.second_location = exact_entry_location(&parsed, &[21], &fixture.written);
+    assert_eq!(fixture.second_location, (21, 0));
+
+    let manifest_path = layout.manifest_path();
+    fixture.manifest.segments[1] = second_meta;
+    ManifestStore::new(manifest_path.clone())
+        .save(&fixture.manifest)
+        .unwrap();
+    fixture.manifest =
+        Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    fixture.manifest.validate_v4(&manifest_path).unwrap();
+    assert_eq!(fixture.manifest.segments.len(), 2);
+    assert_eq!(fixture.manifest.next_segment_id, 3);
+    fixture.second_bytes = bytes;
+    fixture.before = snapshot(fixture.dir.path());
+    assert_ne!(
+        physical_id(
+            &File::open(&fixture.first_path).unwrap(),
+            &fixture.first_path
+        )
+        .unwrap(),
+        physical_id(
+            &File::open(&fixture.second_path).unwrap(),
+            &fixture.second_path
+        )
+        .unwrap()
+    );
+    fixture
+}
+
+fn exercise_compressed_head_copy_ledger(conflicting: bool) {
+    let fixture = compressed_head_copy_fixture(conflicting);
+    let root = fixture.lease.root();
+    let head_key = CatalogKey::Head.encode().unwrap();
+    assert_eq!(fixture.original.cf.0, CATALOG_CF);
+    assert_eq!(fixture.original.key.as_ref(), head_key.as_slice());
+    assert_eq!(fixture.original.version.sequence, 2);
+    let (StoredValue::Put(first), StoredValue::Put(second)) = (
+        &fixture.original.version.value,
+        &fixture.written.version.value,
+    ) else {
+        panic!("both writer-produced Head@2 copies must be logical Puts")
+    };
+    assert_eq!(first.len(), second.len());
+    assert_eq!(first == second, !conflicting);
+    assert!(matches!(
+        inspect_v4_owner(&fixture.lease, &fixture.config, &CpuAccelerator),
+        Err(PraxisError::UnsupportedCatalogFeature {
+            feature: "v4 installed cut beyond narrow D0 bootstrap"
+        })
+    ));
+    assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+
+    with_wal_budget(root, &fixture.manifest, |budget| {
+        let mut observed = Vec::new();
+        let witnesses = visit_v4_segments(root, &fixture.manifest, budget, |row| {
+            observed.push(row);
+            Ok(())
+        })
+        .expect("bounded visitor must authenticate both installed writer segments");
+        assert_eq!(witnesses.len(), 2);
+        assert_eq!(observed.len(), 8);
+        let sources = [
+            SegmentSource {
+                level: 0,
+                id: 1,
+                manifest_ordinal: 0,
+            },
+            SegmentSource {
+                level: 1,
+                id: 2,
+                manifest_ordinal: 1,
+            },
+        ];
+        for (witness, source, path, bytes, count) in [
+            (
+                &witnesses[0],
+                sources[0],
+                &fixture.first_path,
+                &fixture.first_bytes,
+                7,
+            ),
+            (
+                &witnesses[1],
+                sources[1],
+                &fixture.second_path,
+                &fixture.second_bytes,
+                1,
+            ),
+        ] {
+            assert_eq!(witness.source, source);
+            assert_eq!(witness.path.as_path(), path.as_path());
+            assert_eq!(witness.len, bytes.len() as u64);
+            assert_eq!(witness.digest, blake3::hash(bytes));
+            assert_eq!(witness.observed_rows, count);
+            assert_eq!(
+                witness.identity,
+                physical_id(&File::open(path).unwrap(), path).unwrap()
+            );
+        }
+        assert_ne!(witnesses[0].identity, witnesses[1].identity);
+        let copies = observed
+            .iter()
+            .filter(|row| row.cf == CATALOG_CF && row.key == head_key && row.sequence == 2)
+            .collect::<Vec<_>>();
+        assert_eq!(copies.len(), 2);
+        for (index, (copy, expected)) in copies
+            .iter()
+            .zip([&fixture.original, &fixture.written])
+            .enumerate()
+        {
+            assert_eq!(copy.source, sources[index]);
+            assert_eq!(
+                (copy.block_offset, copy.row_ordinal),
+                if index == 0 {
+                    fixture.first_location
+                } else {
+                    fixture.second_location
+                }
+            );
+            assert_eq!(
+                copy.classification,
+                PhysicalRowClass::BoundProtected(ProtectedRole::Catalog)
+            );
+            assert_eq!(
+                copy.value,
+                ObservedSegmentValue::Put(match &expected.version.value {
+                    StoredValue::Put(bytes) => bytes.clone(),
+                    _ => unreachable!(),
+                })
+            );
+        }
+        assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+
+        let balance = budget.remaining_bytes();
+        let error = match collect_protected_copy_ledger(root, &fixture.manifest, budget) {
+            Ok(candidate) => {
+                candidate.discard(root, budget).unwrap();
+                panic!("compressed Head copies must remain private until owner composition")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(budget.remaining_bytes(), balance, "exact witness refund");
+        assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+        match error {
+            PraxisError::UnsupportedCatalogFeature {
+                feature: "compressed physical-copy replay not implemented",
+            } => panic!("RED: authenticated LZ4 Head copy replay is missing"),
+            PraxisError::UnsupportedCatalogFeature {
+                feature: "protected physical-copy bytes await authenticated replay",
+            } if !conflicting => {}
+            PraxisError::Corrupt { reason, .. } if conflicting => {
+                assert!(
+                    reason.contains("actual bytes conflict"),
+                    "expected authenticated decoded Head conflict, got {reason}"
+                );
+            }
+            other => panic!("unexpected compressed Head copy outcome: {other:?}"),
+        }
+    });
+    assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+}
+
+#[test]
+fn writer_equal_lz4_head_copies_reach_pending_private_admission() {
+    exercise_compressed_head_copy_ledger(false);
+}
+
+#[test]
+fn writer_rechecksummed_lz4_head_conflict_refunds_without_writes() {
+    exercise_compressed_head_copy_ledger(true);
+}
+
 #[test]
 fn duplicate_allocator_metadata_reaches_pending_replay_and_refunds() {
     let fixture = next_copy_fixture(NextCopyCase::IdenticalAllocator);
