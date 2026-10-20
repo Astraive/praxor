@@ -1,6 +1,6 @@
 use super::*;
 use crate::core_catalog::value_witness::{
-    ValueFileScanProbe as ValueFileScanProbeRed,
+    ValueExtentWitness, ValueFileRacePoint, ValueFileScanProbe as ValueFileScanProbeRed,
     collect_value_witness as collect_value_witness_red,
     recheck_value_witness as recheck_value_witness_red,
 };
@@ -572,6 +572,117 @@ fn private_value_inventory_refunds_after_second_file_corruption() {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum InFlightSecondFileRace {
+    DisappearBeforeOpen,
+    TruncateAfterObservedLength,
+}
+
+fn assert_inflight_second_file_race(race: InFlightSecondFileRace) {
+    let (dir, lease, manifest, schema_key, schema_bytes, second_pointer, config) =
+        writer_two_file_catalog_external_fixture();
+    let root = lease.root();
+    let layout = DiskLayout::at(root);
+    let first_path = layout.value_log_path(1);
+    let second_path = layout.value_log_path(2);
+    let intact_tree = snapshot(dir.path());
+    assert_two_file_owner_remains_fenced(&dir, &lease, &config);
+    assert_eq!(Path::new(&second_pointer.path), second_path);
+    assert_eq!(second_pointer.len, schema_bytes.len() as u64);
+
+    with_wal_budget(root, &manifest, |budget| {
+        let wal_balance = budget.remaining_bytes();
+        let segments = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+        let segment_balance = budget.remaining_bytes();
+        assert!(segment_balance < wal_balance);
+        assert_eq!(
+            catalog_pointer(&segments.rows, &[0]).path,
+            first_path.to_str().unwrap()
+        );
+        assert_eq!(
+            catalog_pointer(&segments.rows, &schema_key),
+            &second_pointer
+        );
+
+        let expected_point = match race {
+            InFlightSecondFileRace::DisappearBeforeOpen => ValueFileRacePoint::AfterPathPreflight,
+            InFlightSecondFileRace::TruncateAfterObservedLength => {
+                ValueFileRacePoint::AfterObservedLength
+            }
+        };
+        let after_mutation = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let captured = std::rc::Rc::clone(&after_mutation);
+        let watched_path = second_path.clone();
+        let snapshot_root = dir.path().to_path_buf();
+        let shortened_len = second_pointer.offset + 12 + second_pointer.len - 1;
+        let mut probe = ValueFileScanProbeRed::default();
+        probe.race_hook = Some(Box::new(move |point, path| {
+            if point != expected_point || path != watched_path.as_path() {
+                return;
+            }
+            assert!(captured.borrow().is_none(), "file-2 race fired twice");
+            match race {
+                InFlightSecondFileRace::DisappearBeforeOpen => {
+                    fs::remove_file(&watched_path).unwrap();
+                }
+                InFlightSecondFileRace::TruncateAfterObservedLength => {
+                    let writer = OpenOptions::new().write(true).open(&watched_path).unwrap();
+                    writer.set_len(shortened_len).unwrap();
+                    drop(writer);
+                }
+            }
+            *captured.borrow_mut() = Some(snapshot(&snapshot_root));
+        }));
+
+        let error = collect_value_witness_red(root, &manifest, &segments.rows, budget, &mut probe)
+            .unwrap_err();
+        let PraxisError::Corrupt { path, reason } = &error else {
+            panic!("{race:?} returned an unclassified in-flight I/O failure: {error}")
+        };
+        assert_eq!(path, &second_path);
+        let (expected_reason, expected_proofs) = match race {
+            InFlightSecondFileRace::DisappearBeforeOpen => {
+                ("external value path disappeared during open", 1)
+            }
+            InFlightSecondFileRace::TruncateAfterObservedLength => {
+                ("external value file truncated during scan", 2)
+            }
+        };
+        assert_eq!(reason, expected_reason);
+        assert_eq!(probe.proof_full_file_hashes, expected_proofs);
+        assert_eq!(probe.recheck_full_file_hashes, 0);
+        assert_eq!(budget.remaining_bytes(), segment_balance);
+        segments.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), wal_balance);
+
+        let changed_tree = after_mutation.borrow();
+        let changed_tree = changed_tree.as_ref().expect("file-2 race hook did not run");
+        assert_ne!(changed_tree, &intact_tree);
+        assert_eq!(&snapshot(dir.path()), changed_tree);
+        let owner_result = inspect_v4_owner(&lease, &config, &CpuAccelerator);
+        assert!(
+            matches!(
+                &owner_result,
+                Err(PraxisError::UnsupportedCatalogFeature {
+                    feature: "v4 installed cut beyond narrow D0 bootstrap"
+                }) | Err(PraxisError::Corrupt { .. })
+            ),
+            "the public owner admitted an in-flight-damaged fixture: {owner_result:?}"
+        );
+        assert_eq!(&snapshot(dir.path()), changed_tree);
+    });
+}
+
+#[test]
+fn private_value_inventory_classifies_second_file_disappearance_between_preflight_and_open() {
+    assert_inflight_second_file_race(InFlightSecondFileRace::DisappearBeforeOpen);
+}
+
+#[test]
+fn private_value_inventory_classifies_second_file_truncation_after_observed_length() {
+    assert_inflight_second_file_race(InFlightSecondFileRace::TruncateAfterObservedLength);
+}
+
 fn assert_two_file_owner_remains_fenced(
     dir: &tempfile::TempDir,
     lease: &WriterLease,
@@ -1116,4 +1227,117 @@ fn private_value_file_recheck_rejects_same_length_change_in_unreferenced_tail() 
         assert_eq!(budget.remaining_bytes(), balance);
     });
     assert_ne!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn private_value_extent_precharge_refuses_one_byte_short_shared_budget() {
+    let (dir, lease, manifest, schema_key, _, second_pointer, config) =
+        writer_two_file_catalog_external_fixture();
+    let root = lease.root();
+    let before = snapshot(dir.path());
+    assert_two_file_owner_remains_fenced(&dir, &lease, &config);
+
+    with_wal_budget(root, &manifest, |budget| {
+        let wal_balance = budget.remaining_bytes();
+        let segments = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+        let segment_balance = budget.remaining_bytes();
+        assert!(segment_balance < wal_balance);
+        assert_eq!(
+            catalog_pointer(&segments.rows, &schema_key),
+            &second_pointer
+        );
+        let pointer_count = segments
+            .rows
+            .iter()
+            .filter(|row| matches!(&row.value, ObservedSegmentValue::Pointer { .. }))
+            .count();
+        assert!(pointer_count >= 2);
+        assert!(segments.rows.iter().all(|row| {
+            !matches!(&row.value, ObservedSegmentValue::Pointer { .. })
+                || row.classification != PhysicalRowClass::Other
+        }));
+        assert!(segments.rows.iter().all(|row| !matches!(
+            &row.value,
+            ObservedSegmentValue::Pointer {
+                expires_at_ms: Some(_),
+                ..
+            }
+        )));
+        // The collector's first reservation doubles the observed extent count
+        // before calling vector_charge; no allocator-dependent capacity is used.
+        let prospective = pointer_count.checked_mul(2).unwrap();
+        let extent_allowance = vector_charge::<ValueExtentWitness>(root, prospective).unwrap();
+        assert!(extent_allowance > 1 && segment_balance > extent_allowance);
+        let held = segment_balance - (extent_allowance - 1);
+        budget.charge(root, held).unwrap();
+        assert_eq!(budget.remaining_bytes(), extent_allowance - 1);
+
+        let mut probe = ValueFileScanProbeRed::default();
+        let error = collect_value_witness_red(root, &manifest, &segments.rows, budget, &mut probe)
+            .unwrap_err();
+        assert!(
+            matches!(&error, PraxisError::Corrupt { path, reason }
+                if path.as_path() == root && reason == "v4 WAL physical witness metadata budget exceeded"),
+            "the one-byte-short extent precharge failed elsewhere: {error}"
+        );
+        assert_eq!(probe.proof_full_file_hashes, 0);
+        assert_eq!(probe.recheck_full_file_hashes, 0);
+        assert_eq!(budget.remaining_bytes(), extent_allowance - 1);
+        budget.release(root, held).unwrap();
+        assert_eq!(budget.remaining_bytes(), segment_balance);
+        segments.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), wal_balance);
+        assert_eq!(snapshot(dir.path()), before);
+    });
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn private_value_inventory_rejects_two_canonical_labels_for_one_physical_file() {
+    let (dir, lease, manifest, schema_key, _, second_pointer, config) =
+        writer_two_file_catalog_external_fixture();
+    let root = lease.root();
+    let layout = DiskLayout::at(root);
+    let first_path = layout.value_log_path(1);
+    let second_path = layout.value_log_path(2);
+    assert_ne!(file_id(&first_path), file_id(&second_path));
+    let intact_tree = snapshot(dir.path());
+    fs::remove_file(&second_path).unwrap();
+    fs::hard_link(&first_path, &second_path).unwrap();
+    assert_eq!(file_id(&first_path), file_id(&second_path));
+    let aliased_tree = snapshot(dir.path());
+    assert_ne!(aliased_tree, intact_tree);
+    assert_two_file_owner_remains_fenced(&dir, &lease, &config);
+
+    with_wal_budget(root, &manifest, |budget| {
+        let wal_balance = budget.remaining_bytes();
+        let segments = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+        let segment_balance = budget.remaining_bytes();
+        assert!(segment_balance < wal_balance);
+        assert_eq!(
+            catalog_pointer(&segments.rows, &[0]).path,
+            first_path.to_str().unwrap()
+        );
+        assert_eq!(
+            catalog_pointer(&segments.rows, &schema_key),
+            &second_pointer
+        );
+        let mut probe = ValueFileScanProbeRed::default();
+        let error = collect_value_witness_red(root, &manifest, &segments.rows, budget, &mut probe)
+            .unwrap_err();
+        assert!(
+            matches!(&error, PraxisError::Corrupt { path, reason }
+                if (path == &first_path || path == &second_path)
+                    && (reason == "v4 segment has an external hardlink alias"
+                        || reason == "external value files share a physical identity")),
+            "two canonical labels for one physical file escaped identity admission: {error}"
+        );
+        assert!(probe.proof_full_file_hashes <= 1);
+        assert_eq!(probe.recheck_full_file_hashes, 0);
+        assert_eq!(budget.remaining_bytes(), segment_balance);
+        segments.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), wal_balance);
+        assert_eq!(snapshot(dir.path()), aliased_tree);
+    });
+    assert_eq!(snapshot(dir.path()), aliased_tree);
 }

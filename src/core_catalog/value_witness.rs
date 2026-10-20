@@ -89,6 +89,24 @@ impl ValueWitnessCandidate {
 pub(super) struct ValueFileScanProbe {
     pub(super) proof_full_file_hashes: usize,
     pub(super) recheck_full_file_hashes: usize,
+    #[cfg(test)]
+    pub(super) race_hook: Option<Box<dyn FnMut(ValueFileRacePoint, &Path)>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ValueFileRacePoint {
+    AfterPathPreflight,
+    AfterObservedLength,
+}
+
+#[cfg(test)]
+impl ValueFileScanProbe {
+    fn inject_race(&mut self, point: ValueFileRacePoint, path: &Path) {
+        if let Some(hook) = &mut self.race_hook {
+            hook(point, path);
+        }
+    }
 }
 
 fn corrupt(path: &Path, reason: &'static str) -> PraxisError {
@@ -396,8 +414,15 @@ fn check_real_value_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn open_checked(path: &Path) -> Result<(File, SegmentPhysicalId, u64)> {
+fn open_checked(
+    path: &Path,
+    probe: &mut ValueFileScanProbe,
+) -> Result<(File, SegmentPhysicalId, u64)> {
     check_real_value_path(path)?;
+    #[cfg(test)]
+    probe.inject_race(ValueFileRacePoint::AfterPathPreflight, path);
+    #[cfg(not(test))]
+    let _ = probe;
     let file = File::open(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             corrupt(path, "external value path disappeared during open")
@@ -429,11 +454,12 @@ fn recheck_opened_path(
     file: &File,
     expected_id: SegmentPhysicalId,
     expected_len: u64,
+    probe: &mut ValueFileScanProbe,
 ) -> Result<()> {
     if file.metadata()?.len() != expected_len || physical_id(file, path)? != expected_id {
         return Err(corrupt(path, "opened external value changed during scan"));
     }
-    let (reopened, id, len) = open_checked(path)?;
+    let (reopened, id, len) = open_checked(path, probe)?;
     if id != expected_id || len != expected_len {
         return Err(corrupt(path, "external value path changed during scan"));
     }
@@ -844,12 +870,14 @@ pub(super) fn collect_value_witness(
             extent_start,
             extent_end,
         } = plan;
-        let (mut opened, identity, len) = open_checked(&path)?;
+        let (mut opened, identity, len) = open_checked(&path, probe)?;
         register_physical_identity(&path, &mut physical_ids, identity)?;
         probe.proof_full_file_hashes = probe
             .proof_full_file_hashes
             .checked_add(1)
             .ok_or_else(|| corrupt(&path, "external value proof scan counter overflows"))?;
+        #[cfg(test)]
+        probe.inject_race(ValueFileRacePoint::AfterObservedLength, &path);
         let digest = {
             let mut sink = BuildExtents {
                 extents: &mut extents[extent_start..extent_end],
@@ -863,7 +891,7 @@ pub(super) fn collect_value_witness(
                 validate_catalog_payload(row, bytes, &path, attempt.budget)
             })?
         };
-        recheck_opened_path(&path, &opened, identity, len)?;
+        recheck_opened_path(&path, &opened, identity, len, probe)?;
         drop(opened);
         if files.len() == files.capacity() {
             return Err(budget_error(&path));
@@ -974,7 +1002,7 @@ pub(super) fn recheck_value_witness(
                 "external value candidate has no extents for file",
             ));
         }
-        let (mut opened, identity, len) = open_checked(&witness.path)?;
+        let (mut opened, identity, len) = open_checked(&witness.path, probe)?;
         if identity != witness.identity || len != witness.len {
             return Err(corrupt(
                 &witness.path,
@@ -993,7 +1021,7 @@ pub(super) fn recheck_value_witness(
                 })?;
         let mut sink = CheckExtents(&candidate.extents[extent_start..extent_end]);
         let digest = scan_file(&mut opened, &witness.path, len, &mut sink, |_, _| Ok(()))?;
-        recheck_opened_path(&witness.path, &opened, identity, len)?;
+        recheck_opened_path(&witness.path, &opened, identity, len, probe)?;
         if digest != witness.digest {
             return Err(corrupt(
                 &witness.path,
