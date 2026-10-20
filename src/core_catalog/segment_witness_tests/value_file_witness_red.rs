@@ -615,24 +615,26 @@ fn assert_inflight_second_file_race(race: InFlightSecondFileRace) {
         let watched_path = second_path.clone();
         let snapshot_root = dir.path().to_path_buf();
         let shortened_len = second_pointer.offset + 12 + second_pointer.len - 1;
-        let mut probe = ValueFileScanProbeRed::default();
-        probe.race_hook = Some(Box::new(move |point, path| {
-            if point != expected_point || path != watched_path.as_path() {
-                return;
-            }
-            assert!(captured.borrow().is_none(), "file-2 race fired twice");
-            match race {
-                InFlightSecondFileRace::DisappearBeforeOpen => {
-                    fs::remove_file(&watched_path).unwrap();
+        let mut probe = ValueFileScanProbeRed {
+            race_hook: Some(Box::new(move |point, path| {
+                if point != expected_point || path != watched_path.as_path() {
+                    return;
                 }
-                InFlightSecondFileRace::TruncateAfterObservedLength => {
-                    let writer = OpenOptions::new().write(true).open(&watched_path).unwrap();
-                    writer.set_len(shortened_len).unwrap();
-                    drop(writer);
+                assert!(captured.borrow().is_none(), "file-2 race fired twice");
+                match race {
+                    InFlightSecondFileRace::DisappearBeforeOpen => {
+                        fs::remove_file(&watched_path).unwrap();
+                    }
+                    InFlightSecondFileRace::TruncateAfterObservedLength => {
+                        let writer = OpenOptions::new().write(true).open(&watched_path).unwrap();
+                        writer.set_len(shortened_len).unwrap();
+                        drop(writer);
+                    }
                 }
-            }
-            *captured.borrow_mut() = Some(snapshot(&snapshot_root));
-        }));
+                *captured.borrow_mut() = Some(snapshot(&snapshot_root));
+            })),
+            ..Default::default()
+        };
 
         let error = collect_value_witness_red(root, &manifest, &segments.rows, budget, &mut probe)
             .unwrap_err();

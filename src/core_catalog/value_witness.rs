@@ -85,12 +85,15 @@ impl ValueWitnessCandidate {
     }
 }
 
+#[cfg(test)]
+pub(super) type ValueFileRaceHook = Box<dyn FnMut(ValueFileRacePoint, &Path)>;
+
 #[derive(Default)]
 pub(super) struct ValueFileScanProbe {
     pub(super) proof_full_file_hashes: usize,
     pub(super) recheck_full_file_hashes: usize,
     #[cfg(test)]
-    pub(super) race_hook: Option<Box<dyn FnMut(ValueFileRacePoint, &Path)>>,
+    pub(super) race_hook: Option<ValueFileRaceHook>,
 }
 
 #[cfg(test)]
