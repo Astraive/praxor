@@ -1885,3 +1885,190 @@ fn writer_external_anchor_matching_manifest_identity_reaches_next_private_gate()
 fn rechecksummed_external_anchor_foreign_manifest_identity_requires_corrupt() {
     exercise_external_anchor_manifest_identity(true);
 }
+
+fn writer_schema_pair_case(conflicting: bool) {
+    let (dir, config, lease) = flushed_create_fixture();
+    let root = lease.root();
+    let layout = DiskLayout::at(root);
+    let manifest_path = layout.manifest_path();
+    let mut manifest =
+        Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    assert_eq!(manifest.segments.len(), 1);
+    let first_path = layout.segment_path(0, 1);
+    let first_bytes = fs::read(&first_path).unwrap();
+    assert_eq!(
+        manifest.segments[0].file_digest,
+        blake3::hash(&first_bytes).to_hex().to_string()
+    );
+    let first = decode_segment(&first_bytes, &first_path, &CpuAccelerator).unwrap();
+    let schema_key = CatalogKey::Schema(CollectionId::new(2).unwrap())
+        .encode()
+        .unwrap();
+    let mut copy = first
+        .blocks
+        .iter()
+        .flatten()
+        .find(|raw| {
+            raw.entry.cf.0 == CATALOG_CF
+                && raw.entry.key.as_ref() == schema_key.as_slice()
+                && raw.entry.version.sequence == 2
+        })
+        .expect("flushed CREATE has Schema@2")
+        .entry
+        .clone();
+    let StoredValue::Put(original_bytes) = &copy.version.value else {
+        panic!("writer Schema@2 must be a literal Put")
+    };
+    let original_bytes = original_bytes.clone();
+    assert_eq!(
+        original_bytes,
+        fixed_copy_oracle(
+            "create_tag7",
+            "catalog_schema_id_2",
+            CATALOG_CF,
+            &schema_key,
+            2,
+        )
+    );
+    assert_eq!(original_bytes.len(), 65);
+    let mut expected_peer = original_bytes.clone();
+    if conflicting {
+        let CatalogValue::Schema(mut schema) = CatalogValue::decode(
+            &CatalogKey::Schema(CollectionId::new(2).unwrap()),
+            &original_bytes,
+            &first_path,
+        )
+        .unwrap() else {
+            panic!("writer Schema@2 must decode as Schema")
+        };
+        schema.fields[0].nullable = !schema.fields[0].nullable;
+        expected_peer = CatalogValue::Schema(schema).encode().unwrap();
+        assert_eq!(expected_peer.len(), original_bytes.len());
+        assert_ne!(expected_peer, original_bytes);
+        assert!(matches!(
+            CatalogValue::decode(
+                &CatalogKey::Schema(CollectionId::new(2).unwrap()),
+                &expected_peer,
+                &first_path,
+            ),
+            Ok(CatalogValue::Schema(_))
+        ));
+        copy.version.value = StoredValue::Put(expected_peer.clone());
+    }
+
+    let second_path = layout.segment_path(1, 2);
+    fs::create_dir_all(second_path.parent().unwrap()).unwrap();
+    let value_path = layout.value_log_path(2);
+    let mut value_log = ValueLog::open(&value_path).unwrap();
+    let second_meta = SegmentWriter::write(
+        SegmentWriteOptions {
+            path: &second_path,
+            id: 2,
+            level: 1,
+            compression: Compression::None,
+            accelerator: &CpuAccelerator,
+            value_log: &mut value_log,
+            large_value_threshold: config.large_value_threshold,
+            block_size: config.block_size,
+            partitioned_bloom: None,
+            direct_io: false,
+        },
+        vec![copy.clone()],
+    )
+    .unwrap();
+    drop(value_log);
+    fs::remove_file(value_path).unwrap();
+    let second_bytes = fs::read(&second_path).unwrap();
+    assert_eq!(
+        second_meta.file_digest,
+        blake3::hash(&second_bytes).to_hex().to_string()
+    );
+    let second = decode_segment(&second_bytes, &second_path, &CpuAccelerator).unwrap();
+    assert_eq!(second.blocks.len(), 1);
+    assert_eq!(second.blocks[0].len(), 1);
+    assert_eq!(second.blocks[0][0].entry, copy);
+    assert_eq!(copy.version.value, StoredValue::Put(expected_peer.clone()));
+    assert_ne!(
+        physical_id(&File::open(&first_path).unwrap(), &first_path).unwrap(),
+        physical_id(&File::open(&second_path).unwrap(), &second_path).unwrap()
+    );
+    manifest.segments.push(second_meta);
+    manifest.next_segment_id = 3;
+    ManifestStore::new(manifest_path.clone())
+        .save(&manifest)
+        .unwrap();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    manifest.validate_v4(root).unwrap();
+    let before = snapshot(dir.path());
+
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let candidate = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+        let schemas = candidate
+            .rows
+            .iter()
+            .filter(|row| row.cf == CATALOG_CF && row.key == schema_key && row.sequence == 2)
+            .collect::<Vec<_>>();
+        assert_eq!(schemas.len(), 2);
+        assert_eq!(
+            schemas[0].value,
+            ObservedSegmentValue::Put(original_bytes.clone())
+        );
+        assert_eq!(
+            schemas[1].value,
+            ObservedSegmentValue::Put(expected_peer.clone())
+        );
+        assert_ne!(schemas[0].source, schemas[1].source);
+        candidate.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), balance);
+
+        let result = collect_protected_copy_ledger(root, &manifest, budget);
+        if conflicting {
+            let error = match result {
+                Err(error) => error,
+                Ok(candidate) => {
+                    candidate.discard(root, budget).unwrap();
+                    panic!("conflicting Schema@2 copies reached a private candidate")
+                }
+            };
+            assert_eq!(
+                budget.remaining_bytes(),
+                balance,
+                "refusal must refund exactly"
+            );
+            assert_eq!(snapshot(dir.path()), before, "refusal must not edit files");
+            match error {
+                PraxisError::Corrupt { reason, .. }
+                    if reason.contains("physical-copy actual bytes conflict") => {}
+                other => panic!(
+                    "RED: valid, equal-length Schema@2 copies with different bytes must be Corrupt: {other:?}"
+                ),
+            }
+        } else {
+            match result {
+                Err(PraxisError::UnsupportedCatalogFeature {
+                    feature:
+                        "protected physical-copy role group provenance awaits proof"
+                        | "protected physical-copy bytes await authenticated replay",
+                }) => {}
+                Ok(candidate) => candidate.discard(root, budget).unwrap(),
+                other => {
+                    panic!("identical Schema@2 copies must reach the next private gate: {other:?}")
+                }
+            }
+            assert_eq!(budget.remaining_bytes(), balance);
+            assert_eq!(snapshot(dir.path()), before);
+        }
+    });
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn writer_identical_schema_pair_reaches_next_private_gate() {
+    writer_schema_pair_case(false);
+}
+
+#[test]
+fn writer_equal_length_schema_byte_conflict_requires_private_corrupt() {
+    writer_schema_pair_case(true);
+}
