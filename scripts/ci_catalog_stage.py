@@ -799,12 +799,50 @@ class StageRecorder:
     def _windows_job_member_diagnostics(pids: list[int], job: int | None = None) -> list[dict]:
         """Native image paths are evidence; a lookup failure never clears a live PID."""
         kernel = ctypes.windll.kernel32
-        kernel.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+        kernel.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
         kernel.OpenProcess.restype = ctypes.c_void_p
+        kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel.CloseHandle.restype = ctypes.c_int
+        members: list[dict] = []
+        for pid in pids:
+            handle = kernel.OpenProcess(0x1000, 0, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                detail = {
+                    "pid": pid, "image_name": None, "image_path": None,
+                    "name_lookup_error": str(ctypes.WinError(kernel.GetLastError())),
+                    "in_job": None, "creation_time_100ns": None,
+                    "identity_lookup_error": None,
+                }
+            else:
+                try:
+                    detail = StageRecorder._windows_job_member_from_handle(handle, pid, job)
+                finally:
+                    kernel.CloseHandle(ctypes.c_void_p(handle))
+            members.append(detail)
+        return members
+
+    @staticmethod
+    def _windows_job_member_from_handle(handle: int, pid: int, job: int | None) -> dict:
+        """Read image and identity from one retained process handle."""
+        kernel = ctypes.windll.kernel32
         kernel.QueryFullProcessImageNameW.argtypes = [
-            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_ulong),
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_uint32),
         ]
         kernel.QueryFullProcessImageNameW.restype = ctypes.c_int
+        detail = {
+            "pid": pid, "image_name": None, "image_path": None,
+            "name_lookup_error": None, "in_job": None,
+            "creation_time_100ns": None, "identity_lookup_error": None,
+        }
+        image = ctypes.create_unicode_buffer(32768)
+        length = ctypes.c_uint32(len(image))
+        if not kernel.QueryFullProcessImageNameW(
+            ctypes.c_void_p(handle), 0, image, ctypes.byref(length),
+        ):
+            detail["name_lookup_error"] = str(ctypes.WinError(kernel.GetLastError()))
+        else:
+            detail["image_path"] = image.value
+            detail["image_name"] = ntpath.basename(image.value)
         if job is not None:
             kernel.IsProcessInJob.argtypes = [
                 ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
@@ -814,49 +852,147 @@ class StageRecorder:
                 ctypes.c_void_p, *([ctypes.POINTER(WinFileTime)] * 4),
             ]
             kernel.GetProcessTimes.restype = ctypes.c_int
+            in_job = ctypes.c_int()
+            if not kernel.IsProcessInJob(
+                ctypes.c_void_p(handle), ctypes.c_void_p(job), ctypes.byref(in_job),
+            ):
+                detail["identity_lookup_error"] = str(ctypes.WinError(kernel.GetLastError()))
+            else:
+                detail["in_job"] = bool(in_job.value)
+            created, exited, kernel_time, user_time = (WinFileTime() for _ in range(4))
+            if not kernel.GetProcessTimes(
+                ctypes.c_void_p(handle), ctypes.byref(created), ctypes.byref(exited),
+                ctypes.byref(kernel_time), ctypes.byref(user_time),
+            ):
+                detail["identity_lookup_error"] = str(ctypes.WinError(kernel.GetLastError()))
+            else:
+                detail["creation_time_100ns"] = (created.high << 32) | created.low
+        return detail
+
+    @staticmethod
+    def _windows_dispose_verified_vctip(
+        job: int, baseline: list[dict], actions: list[dict], check_limits,
+        disposal_deadline: float,
+    ) -> None:
+        """Terminate only baseline-verified telemetry, after all handles pass fresh checks."""
+        if not StageRecorder._windows_vctip_members_verified(baseline):
+            raise RuntimeError("VCTIP disposal baseline is not fully verified")
+        expected = sorted(item["pid"] for item in baseline)
+        baseline_pids = set(expected)
+        if sorted(StageRecorder._windows_job_pids(job)) != expected:
+            raise RuntimeError("Job PID set changed before VCTIP disposal")
+        kernel = ctypes.windll.kernel32
+        kernel.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        kernel.OpenProcess.restype = ctypes.c_void_p
+        kernel.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel.TerminateProcess.restype = ctypes.c_int
+        kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel.WaitForSingleObject.restype = ctypes.c_uint32
         kernel.CloseHandle.argtypes = [ctypes.c_void_p]
         kernel.CloseHandle.restype = ctypes.c_int
-        members: list[dict] = []
-        for pid in pids:
-            detail = {
-                "pid": pid, "image_name": None, "image_path": None,
-                "name_lookup_error": None, "in_job": None,
-                "creation_time_100ns": None, "identity_lookup_error": None,
-            }
-            handle = kernel.OpenProcess(0x1000, 0, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
-            if not handle:
-                detail["name_lookup_error"] = str(ctypes.WinError(kernel.GetLastError()))
-            else:
-                try:
-                    image = ctypes.create_unicode_buffer(32768)
-                    length = ctypes.c_ulong(len(image))
-                    if not kernel.QueryFullProcessImageNameW(
-                        ctypes.c_void_p(handle), 0, image, ctypes.byref(length),
-                    ):
-                        detail["name_lookup_error"] = str(ctypes.WinError(kernel.GetLastError()))
-                    else:
-                        detail["image_path"] = image.value
-                        detail["image_name"] = ntpath.basename(image.value)
-                    if job is not None:
-                        in_job = ctypes.c_int()
-                        if not kernel.IsProcessInJob(
-                            ctypes.c_void_p(handle), ctypes.c_void_p(job), ctypes.byref(in_job),
-                        ):
-                            detail["identity_lookup_error"] = str(ctypes.WinError(kernel.GetLastError()))
-                        else:
-                            detail["in_job"] = bool(in_job.value)
-                        created, exited, kernel_time, user_time = (WinFileTime() for _ in range(4))
-                        if not kernel.GetProcessTimes(
-                            ctypes.c_void_p(handle), ctypes.byref(created), ctypes.byref(exited),
-                            ctypes.byref(kernel_time), ctypes.byref(user_time),
-                        ):
-                            detail["identity_lookup_error"] = str(ctypes.WinError(kernel.GetLastError()))
-                        else:
-                            detail["creation_time_100ns"] = (created.high << 32) | created.low
-                finally:
-                    kernel.CloseHandle(ctypes.c_void_p(handle))
-            members.append(detail)
-        return members
+        retained: list[tuple[int, dict]] = []
+        try:
+            for member in baseline:
+                check_limits()
+                action = {
+                    "pid": member["pid"], "baseline_member": member,
+                    "revalidated_member": None, "pre_termination_wait_result": None,
+                    "termination_requested": False, "handle_signaled": False,
+                    "termination_request_utc": None, "handle_signaled_utc": None,
+                    "post_termination_wait_result": None, "wait_elapsed_seconds": None,
+                    "handle_closed": False, "error": None,
+                }
+                actions.append(action)
+                handle = kernel.OpenProcess(0x00101001, 0, member["pid"])
+                if not handle:
+                    action["error"] = f"OpenProcess failed: {ctypes.WinError(kernel.GetLastError())}"
+                    raise RuntimeError(action["error"])
+                retained.append((handle, action))
+                fresh = StageRecorder._windows_job_member_from_handle(handle, member["pid"], job)
+                action["revalidated_member"] = fresh
+                if not StageRecorder._windows_vctip_members_verified([fresh], [member]):
+                    action["error"] = "same-handle VCTIP identity or Job membership changed"
+                    raise RuntimeError(action["error"])
+                signal_state = kernel.WaitForSingleObject(ctypes.c_void_p(handle), 0)
+                action["pre_termination_wait_result"] = signal_state
+                if signal_state != 258:  # WAIT_TIMEOUT: process is still live.
+                    action["error"] = f"VCTIP was not confirmed live (wait result {signal_state})"
+                    raise RuntimeError(action["error"])
+            # All candidates are validated before the first destructive action.
+            if sorted(StageRecorder._windows_job_pids(job)) != expected:
+                raise RuntimeError("Job PID set changed after VCTIP handle validation")
+            for handle, action in retained:
+                check_limits()
+                current = sorted(StageRecorder._windows_job_pids(job))
+                if current != expected:
+                    action["error"] = f"Job PID set changed before selective termination: {current}"
+                    raise RuntimeError(action["error"])
+                signal_state = kernel.WaitForSingleObject(ctypes.c_void_p(handle), 0)
+                action["pre_termination_wait_result"] = signal_state
+                if signal_state != 258:
+                    action["error"] = f"VCTIP exited before selective termination (wait result {signal_state})"
+                    raise RuntimeError(action["error"])
+                if not kernel.TerminateProcess(ctypes.c_void_p(handle), 0):
+                    action["error"] = f"TerminateProcess failed: {ctypes.WinError(kernel.GetLastError())}"
+                    raise RuntimeError(action["error"])
+                action["termination_requested"] = True
+                action["termination_request_utc"] = utc_now()
+                wait_started = time.monotonic()
+                while True:
+                    check_limits()
+                    if time.monotonic() >= disposal_deadline:
+                        action["error"] = "VCTIP termination wait exceeded disposal budget"
+                        raise RuntimeError(action["error"])
+                    result = kernel.WaitForSingleObject(ctypes.c_void_p(handle), 100)
+                    action["post_termination_wait_result"] = result
+                    if result == 0:  # WAIT_OBJECT_0: process exited.
+                        action["handle_signaled"] = True
+                        action["handle_signaled_utc"] = utc_now()
+                        action["wait_elapsed_seconds"] = time.monotonic() - wait_started
+                        break
+                    if result != 258:
+                        action["error"] = f"VCTIP termination wait failed ({result})"
+                        raise RuntimeError(action["error"])
+                expected.remove(action["pid"])
+                while True:
+                    check_limits()
+                    current = sorted(StageRecorder._windows_job_pids(job))
+                    if current == expected:
+                        break
+                    if any(pid not in expected and pid != action["pid"] for pid in current):
+                        raise RuntimeError(f"new Job member after selective termination: {current}")
+                    if time.monotonic() >= disposal_deadline:
+                        raise RuntimeError(f"Job PID list did not settle after selective termination: {current}")
+                    time.sleep(0.1)
+            # Retain the process handles until the Job PID list is empty. This
+            # prevents a terminated process ID from being reused during the
+            # final membership check.
+            while True:
+                check_limits()
+                remaining = StageRecorder._windows_job_pids(job)
+                if not remaining:
+                    break
+                if any(pid not in baseline_pids for pid in remaining):
+                    raise RuntimeError(f"new Job member during VCTIP disposal: {remaining}")
+                if time.monotonic() >= disposal_deadline:
+                    raise RuntimeError(f"Job PID list did not empty after VCTIP disposal: {remaining}")
+                time.sleep(0.1)
+        finally:
+            primary_error = sys.exc_info()[1]
+            close_errors: list[str] = []
+            for handle, action in reversed(retained):
+                if not kernel.CloseHandle(ctypes.c_void_p(handle)):
+                    close_error = f"CloseHandle failed: {ctypes.WinError(kernel.GetLastError())}"
+                    action["error"] = "; ".join(filter(None, (action["error"], close_error)))
+                    close_errors.append(close_error)
+                else:
+                    action["handle_closed"] = True
+            if close_errors:
+                if primary_error is not None:
+                    raise RuntimeError(
+                        f"{primary_error}; process handle close errors: {'; '.join(close_errors)}"
+                    ) from primary_error
+                raise RuntimeError("; ".join(close_errors))
 
     @staticmethod
     def _windows_vctip_members_verified(
@@ -1049,6 +1185,11 @@ class StageRecorder:
         vctip_verified_members: list[dict] | None = None
         vctip_first_seen_seconds: float | None = None
         vctip_last_seen_seconds: float | None = None
+        vctip_disposal_actions: list[dict] = []
+        vctip_disposal_deadline: float | None = None
+        vctip_pre_disposal_pids: list[int] | None = None
+        vctip_post_disposal_pids: list[int] | None = None
+        vctip_post_disposal_pipe_drained: bool | None = None
         quiescence_terminal_reason: str | None = None
         survivor_pids: list[int] | None = None
         survivor_members: list[dict] | None = None
@@ -1076,6 +1217,16 @@ class StageRecorder:
                 reader_errors.append(f"raw pipe reader failed: {exc}")
             finally:
                 reader_done.set()
+
+        def check_disposal_limits() -> None:
+            if guard["violation"]:
+                raise RuntimeError(guard["violation"])
+            if reader_errors:
+                raise RuntimeError(reader_errors[0])
+            if time.monotonic() >= self.soft_job_deadline:
+                raise RuntimeError(f"soft overall job deadline after {self.soft_job_minutes} minutes")
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"wall-clock timeout after {timeout_seconds} seconds")
 
         try:
             if time.monotonic() >= self.soft_job_deadline:
@@ -1134,14 +1285,44 @@ class StageRecorder:
                                 raise RuntimeError(guard["violation"])
                         alive = self._owned_tree_alive(process, job)
                         if not alive and reader_done.is_set():
+                            if vctip_disposal_deadline is not None and now >= vctip_disposal_deadline:
+                                vctip_post_disposal_pids = self._windows_job_pids(job)
+                                vctip_post_disposal_pipe_drained = True
+                                quiescence_terminal_reason = "vctip_disposal_settle_timeout"
+                                raise RuntimeError("verified VCTIP disposal exceeded its settle budget")
                             if vctip_verified_members is not None:
                                 remaining = self._windows_job_pids(job)
                                 if remaining:
                                     survivor_pids = remaining
                                     quiescence_terminal_reason = "job_accounting_pid_disagreement"
                                     raise RuntimeError("Job Object PID list remained nonempty after accounting reached zero")
-                            quiescence_terminal_reason = "job_empty_and_pipe_drained"
+                            if vctip_disposal_deadline is not None:
+                                vctip_post_disposal_pids = self._windows_job_pids(job)
+                                vctip_post_disposal_pipe_drained = True
+                                if vctip_post_disposal_pids:
+                                    quiescence_terminal_reason = "job_accounting_pid_disagreement"
+                                    raise RuntimeError("Job Object PID list remained nonempty after VCTIP disposal")
+                                quiescence_terminal_reason = "verified_vctip_disposed_job_empty_and_pipe_drained"
+                            else:
+                                quiescence_terminal_reason = "job_empty_and_pipe_drained"
                             break
+                        if vctip_disposal_deadline is not None:
+                            vctip_post_disposal_pids = self._windows_job_pids(job)
+                            vctip_post_disposal_pipe_drained = reader_done.is_set()
+                            if any(pid not in {item["pid"] for item in vctip_verified_members or []}
+                                   for pid in vctip_post_disposal_pids):
+                                survivor_pids = vctip_post_disposal_pids
+                                survivor_members = self._windows_job_member_diagnostics(survivor_pids, job)
+                                quiescence_terminal_reason = "new_job_member_after_vctip_disposal"
+                                raise RuntimeError("new Job Object member after verified VCTIP disposal")
+                            if now >= vctip_disposal_deadline:
+                                survivor_pids = vctip_post_disposal_pids
+                                if survivor_pids:
+                                    survivor_members = self._windows_job_member_diagnostics(survivor_pids, job)
+                                quiescence_terminal_reason = "vctip_disposal_settle_timeout"
+                                raise RuntimeError("Job Object or raw pipe did not settle after VCTIP disposal")
+                            time.sleep(0.1)
+                            continue
                         if now - leader_exit_at >= WINDOWS_JOB_QUIESCENCE_SECONDS:
                             if alive:
                                 try:
@@ -1170,7 +1351,34 @@ class StageRecorder:
                                             if quiescence_seconds < quiescence_budget:
                                                 time.sleep(0.1)
                                                 continue
-                                            quiescence_terminal_reason = "vctip_quiescence_cap_reached"
+                                            vctip_pre_disposal_pids = active_pids
+                                            vctip_disposal_deadline = time.monotonic() + 3
+                                            try:
+                                                self._windows_dispose_verified_vctip(
+                                                    job, vctip_verified_members,
+                                                    vctip_disposal_actions, check_disposal_limits,
+                                                    vctip_disposal_deadline,
+                                                )
+                                            except Exception as exc:
+                                                quiescence_terminal_reason = "vctip_disposal_failed"
+                                                try:
+                                                    survivor_pids = self._windows_job_pids(job)
+                                                    survivor_members = self._windows_job_member_diagnostics(
+                                                        survivor_pids, job,
+                                                    )
+                                                except Exception:
+                                                    survivor_pids = active_pids
+                                                    survivor_members = active_members
+                                                vctip_post_disposal_pids = survivor_pids
+                                                vctip_post_disposal_pipe_drained = reader_done.is_set()
+                                                raise RuntimeError(
+                                                    "owned process group has a surviving descendant after "
+                                                    f"{quiescence_seconds:.3f}s; verified VCTIP disposal failed: {exc}"
+                                                ) from exc
+                                            vctip_post_disposal_pids = self._windows_job_pids(job)
+                                            vctip_post_disposal_pipe_drained = reader_done.is_set()
+                                            time.sleep(0.1)
+                                            continue
                                         else:
                                             quiescence_terminal_reason = "unverified_or_changed_job_member"
                                         survivor_pids = active_pids
@@ -1211,7 +1419,9 @@ class StageRecorder:
             if watcher.is_alive():
                 raise RuntimeError("resource watcher did not stop before receipt")
         except BaseException as exc:
-            if leader_exit_at is not None and quiescence_terminal_reason != "job_empty_and_pipe_drained":
+            if leader_exit_at is not None and quiescence_terminal_reason not in (
+                "job_empty_and_pipe_drained", "verified_vctip_disposed_job_empty_and_pipe_drained",
+            ):
                 quiescence_seconds = time.monotonic() - leader_exit_at
             if vctip_verified_members is not None and quiescence_terminal_reason is None:
                 quiescence_terminal_reason = "interrupted_during_vctip_quiescence"
@@ -1298,6 +1508,11 @@ class StageRecorder:
             "post_leader_quiescence_budget_seconds": (
                 quiescence_budget if self.platform == "windows" else None
             ),
+            "post_leader_effective_budget_seconds": (
+                vctip_disposal_deadline - leader_exit_at
+                if vctip_disposal_deadline is not None and leader_exit_at is not None
+                else (quiescence_budget if self.platform == "windows" else None)
+            ),
             "post_leader_quiescence_seconds": quiescence_seconds,
             "post_leader_quiescence_terminal_reason": quiescence_terminal_reason,
             "post_leader_vctip_first_seen_seconds": vctip_first_seen_seconds,
@@ -1307,6 +1522,11 @@ class StageRecorder:
                 if vctip_verified_members is not None and quiescence_seconds is not None else None
             ),
             "post_leader_vctip_verified_members": vctip_verified_members,
+            "post_leader_vctip_disposal_budget_seconds": 3 if vctip_disposal_deadline is not None else None,
+            "post_leader_vctip_disposal_actions": vctip_disposal_actions,
+            "post_leader_vctip_pre_disposal_pids": vctip_pre_disposal_pids,
+            "post_leader_vctip_post_disposal_pids": vctip_post_disposal_pids,
+            "post_leader_vctip_post_disposal_pipe_drained": vctip_post_disposal_pipe_drained,
             "surviving_job_pids": survivor_pids,
             "surviving_job_members": survivor_members,
             "raw_log_complete": process is None or (

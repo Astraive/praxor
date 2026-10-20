@@ -1277,6 +1277,214 @@ class StageReceiptTests(unittest.TestCase):
             [valid, {**valid, "pid": 9081}], [valid],
         ))
 
+    def test_windows_vctip_disposal_prevalidates_every_same_handle_before_termination(self) -> None:
+        image_path = (
+            r"C:\Program Files\Microsoft Visual Studio\18\Enterprise"
+            r"\VC\Tools\MSVC\14.51\bin\Hostx64\x64\vctip.exe"
+        )
+        baseline = [
+            {"pid": pid, "image_name": "vctip.exe", "image_path": image_path,
+             "name_lookup_error": None, "identity_lookup_error": None,
+             "in_job": True, "creation_time_100ns": pid * 1000}
+            for pid in (101, 102)
+        ]
+        opened: list[tuple[int, int, int]] = []
+        terminated: list[int] = []
+        closed: list[int] = []
+        validated: list[int] = []
+        def open_process(access, inherit, pid):
+            opened.append((access, inherit, pid))
+            return pid + 1000
+        def terminate(handle, _code):
+            self.assertEqual(validated, [101, 102], "all handles must validate before first termination")
+            terminated.append(handle.value)
+            return 1
+        def wait(handle, _milliseconds):
+            return 0 if handle.value in terminated else 258
+        def close(handle):
+            closed.append(handle.value)
+            return 1
+        kernel = SimpleNamespace(
+            OpenProcess=open_process, TerminateProcess=terminate,
+            WaitForSingleObject=wait, CloseHandle=close,
+        )
+        def validate(_handle, pid, _job):
+            validated.append(pid)
+            return baseline[pid - 101]
+        actions: list[dict] = []
+        with patch("ci_catalog_stage.ctypes.windll", SimpleNamespace(kernel32=kernel), create=True), patch.object(
+            StageRecorder, "_windows_job_pids",
+            side_effect=lambda _job: [pid for pid in (101, 102) if pid + 1000 not in terminated],
+        ), patch.object(
+            StageRecorder, "_windows_job_member_from_handle",
+            side_effect=validate,
+        ):
+            StageRecorder._windows_dispose_verified_vctip(
+                77, baseline, actions, lambda: None, time.monotonic() + 1,
+            )
+        self.assertEqual(opened, [(0x00101001, 0, 101), (0x00101001, 0, 102)])
+        self.assertEqual(terminated, [1101, 1102])
+        self.assertEqual(sorted(closed), [1101, 1102])
+        self.assertTrue(all(item["revalidated_member"] is not None for item in actions))
+
+        for changed in (
+            {**baseline[1], "creation_time_100ns": baseline[1]["creation_time_100ns"] + 1},
+            {**baseline[1], "in_job": False},
+            {**baseline[1], "image_path": r"C:\temp\vctip.exe"},
+            {**baseline[1], "name_lookup_error": "access denied"},
+        ):
+            with self.subTest(changed=changed):
+                terminated.clear()
+                opened.clear()
+                closed.clear()
+                validated.clear()
+                actions = []
+                with patch("ci_catalog_stage.ctypes.windll", SimpleNamespace(kernel32=kernel), create=True), patch.object(
+                    StageRecorder, "_windows_job_pids", return_value=[101, 102],
+                ), patch.object(
+                    StageRecorder, "_windows_job_member_from_handle",
+                    side_effect=lambda _handle, pid, _job: baseline[0] if pid == 101 else changed,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "same-handle VCTIP identity"):
+                        StageRecorder._windows_dispose_verified_vctip(
+                            77, baseline, actions, lambda: None, time.monotonic() + 1,
+                        )
+                self.assertEqual(terminated, [], "second candidate mismatch must prevent every selective kill")
+                self.assertEqual(sorted(closed), [1101, 1102])
+                self.assertTrue(all(not item["termination_requested"] for item in actions))
+
+    def test_windows_vctip_disposal_new_member_or_wait_timeout_fails_closed(self) -> None:
+        baseline = {
+            "pid": 101, "image_name": "vctip.exe",
+            "image_path": (
+                r"C:\Program Files\Microsoft Visual Studio\18\Enterprise"
+                r"\VC\Tools\MSVC\14.51\bin\Hostx64\x64\vctip.exe"
+            ),
+            "name_lookup_error": None, "identity_lookup_error": None,
+            "in_job": True, "creation_time_100ns": 123456,
+        }
+        terminated: list[int] = []
+        closed: list[int] = []
+        kernel = SimpleNamespace(
+            OpenProcess=lambda *_args: 1101,
+            TerminateProcess=lambda handle, _code: terminated.append(handle.value) or 1,
+            WaitForSingleObject=lambda *_args: 258,
+            CloseHandle=lambda handle: closed.append(handle.value) or 1,
+        )
+        actions: list[dict] = []
+        with patch("ci_catalog_stage.ctypes.windll", SimpleNamespace(kernel32=kernel), create=True), patch.object(
+            StageRecorder, "_windows_job_pids", side_effect=[[101], [101, 999]],
+        ), patch.object(StageRecorder, "_windows_job_member_from_handle", return_value=baseline):
+            with self.assertRaisesRegex(RuntimeError, "Job PID set changed"):
+                StageRecorder._windows_dispose_verified_vctip(
+                    77, [baseline], actions, lambda: None, time.monotonic() + 1,
+                )
+        self.assertEqual(terminated, [])
+        self.assertEqual(closed, [1101])
+        self.assertFalse(actions[0]["termination_requested"])
+
+        terminated.clear()
+        closed.clear()
+        actions = []
+        with patch("ci_catalog_stage.ctypes.windll", SimpleNamespace(kernel32=kernel), create=True), patch.object(
+            StageRecorder, "_windows_job_pids", return_value=[101],
+        ), patch.object(StageRecorder, "_windows_job_member_from_handle", return_value=baseline):
+            with self.assertRaisesRegex(RuntimeError, "termination wait exceeded disposal budget"):
+                StageRecorder._windows_dispose_verified_vctip(
+                    77, [baseline], actions, lambda: None, time.monotonic() + 0.2,
+                )
+        self.assertEqual(terminated, [1101])
+        self.assertEqual(closed, [1101])
+        self.assertTrue(actions[0]["termination_requested"])
+        self.assertFalse(actions[0]["handle_signaled"])
+
+    def test_windows_vctip_disposal_api_failures_never_report_success(self) -> None:
+        if os.name != "nt":
+            self.skipTest("Windows API error formatting required")
+        baseline = {
+            "pid": 101, "image_name": "vctip.exe",
+            "image_path": (
+                r"C:\Program Files\Microsoft Visual Studio\18\Enterprise"
+                r"\VC\Tools\MSVC\14.51\bin\Hostx64\x64\vctip.exe"
+            ),
+            "name_lookup_error": None, "identity_lookup_error": None,
+            "in_job": True, "creation_time_100ns": 123456,
+        }
+        for fault, expected_message, attempted in (
+            ("open", "OpenProcess failed", 0),
+            ("terminate", "TerminateProcess failed", 1),
+            ("wait", "termination wait failed", 1),
+            ("limit", "synthetic resource guard", 0),
+        ):
+            with self.subTest(fault=fault):
+                terminated: list[int] = []
+                closed: list[int] = []
+                checks = 0
+                def limits():
+                    nonlocal checks
+                    checks += 1
+                    if fault == "limit" and checks >= 2:
+                        raise RuntimeError("synthetic resource guard")
+                def terminate(handle, _code):
+                    terminated.append(handle.value)
+                    return 0 if fault == "terminate" else 1
+                def wait(handle, _milliseconds):
+                    if fault == "wait" and terminated:
+                        return 0xFFFFFFFF
+                    return 258
+                kernel = SimpleNamespace(
+                    OpenProcess=lambda *_args: 0 if fault == "open" else 1101,
+                    TerminateProcess=terminate, WaitForSingleObject=wait,
+                    CloseHandle=lambda handle: closed.append(handle.value) or 1,
+                    GetLastError=lambda: 5,
+                )
+                actions: list[dict] = []
+                with patch("ci_catalog_stage.ctypes.windll", SimpleNamespace(kernel32=kernel), create=True), patch.object(
+                    StageRecorder, "_windows_job_pids", return_value=[101],
+                ), patch.object(StageRecorder, "_windows_job_member_from_handle", return_value=baseline):
+                    with self.assertRaisesRegex(RuntimeError, expected_message):
+                        StageRecorder._windows_dispose_verified_vctip(
+                            77, [baseline], actions, limits, time.monotonic() + 1,
+                        )
+                self.assertEqual(len(terminated), attempted)
+                self.assertEqual(closed, [] if fault == "open" else [1101])
+                self.assertTrue(all(not item["handle_signaled"] for item in actions))
+
+    def test_windows_vctip_disposal_retains_primary_error_if_handle_close_fails(self) -> None:
+        if os.name != "nt":
+            self.skipTest("Windows API error formatting required")
+        baseline = {
+            "pid": 101, "image_name": "vctip.exe",
+            "image_path": (
+                r"C:\Program Files\Microsoft Visual Studio\18\Enterprise"
+                r"\VC\Tools\MSVC\14.51\bin\Hostx64\x64\vctip.exe"
+            ),
+            "name_lookup_error": None, "identity_lookup_error": None,
+            "in_job": True, "creation_time_100ns": 123456,
+        }
+        kernel = SimpleNamespace(
+            OpenProcess=lambda *_args: 1101,
+            TerminateProcess=lambda *_args: self.fail("must not terminate mismatched member"),
+            WaitForSingleObject=lambda *_args: 258,
+            CloseHandle=lambda *_args: 0,
+            GetLastError=lambda: 5,
+        )
+        actions: list[dict] = []
+        with patch("ci_catalog_stage.ctypes.windll", SimpleNamespace(kernel32=kernel), create=True), patch.object(
+            StageRecorder, "_windows_job_pids", return_value=[101],
+        ), patch.object(
+            StageRecorder, "_windows_job_member_from_handle",
+            return_value={**baseline, "creation_time_100ns": 123457},
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                StageRecorder._windows_dispose_verified_vctip(
+                    77, [baseline], actions, lambda: None, time.monotonic() + 1,
+                )
+        self.assertIn("same-handle VCTIP identity", str(caught.exception))
+        self.assertIn("CloseHandle failed", str(caught.exception))
+        self.assertIn("CloseHandle failed", actions[0]["error"])
+        self.assertFalse(actions[0]["termination_requested"])
+
     def test_windows_verified_vctip_grace_waits_for_empty_job_and_pipe(self) -> None:
         if os.name != "nt":
             self.skipTest("native Windows Job Object required")
@@ -1318,7 +1526,65 @@ class StageReceiptTests(unittest.TestCase):
             self.assertTrue(receipt["raw_log_complete"])
             self.assertIsNone(receipt["surviving_job_pids"])
 
-    def test_windows_verified_vctip_still_fails_at_bounded_cap(self) -> None:
+    def test_windows_verified_vctip_cap_disposes_exact_native_job_member(self) -> None:
+        if os.name != "nt":
+            self.skipTest("native Windows Job Object required")
+        image_path = (
+            r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
+            r"\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\vctip.exe"
+        )
+        child = (
+            "import subprocess,sys,pathlib; "
+            "member=subprocess.Popen([sys.executable,'-c','import time; time.sleep(20)'], "
+            "stdin=subprocess.DEVNULL,stdout=sys.stdout,stderr=sys.stderr); "
+            "pathlib.Path('telemetry.pid').write_text(str(member.pid)); "
+            "print('leader exited', flush=True)"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            repo.mkdir()
+            environment = os.environ.copy()
+            environment.update(CARGO_TARGET_DIR=str(root / "target"), PRAXOR_TEST_TMP_ROOT=str(root / "fixtures"), TEMP=str(root / "tmp"))
+            with patch("ci_catalog_stage.tracked_manifest", return_value=synthetic_manifest()), patch.object(
+                StageRecorder, "_sample", synthetic_resource_sample
+            ), patch.object(
+                StageRecorder, "_windows_job_member_diagnostics",
+                side_effect=lambda pids, _job: [
+                    {"pid": pid, "image_name": "vctip.exe", "image_path": image_path,
+                     "name_lookup_error": None, "in_job": True, "creation_time_100ns": pid * 1000}
+                    for pid in pids
+                ],
+            ), patch.object(
+                StageRecorder, "_windows_job_member_from_handle",
+                side_effect=lambda _handle, pid, _job: {
+                    "pid": pid, "image_name": "vctip.exe", "image_path": image_path,
+                    "name_lookup_error": None, "in_job": True, "creation_time_100ns": pid * 1000,
+                    "identity_lookup_error": None,
+                },
+            ), patch("ci_catalog_stage.WINDOWS_VCTIP_QUIESCENCE_SECONDS", 5.5):
+                gate = StageRecorder(repo, root / "artifacts", "a" * 40, environment, "windows")
+                started = time.monotonic()
+                gate.run("telemetry-persistent", [sys.executable, "-c", child], timeout_seconds=12)
+                self.assertLess(time.monotonic() - started, 10)
+            pid = int((repo / "telemetry.pid").read_text(encoding="utf-8"))
+            receipt = json.loads((gate.logs / "telemetry-persistent.receipt.json").read_text(encoding="utf-8"))
+            self.assertIsNone(receipt["error"])
+            self.assertEqual(receipt["post_leader_quiescence_budget_seconds"], 5.5)
+            self.assertGreaterEqual(receipt["post_leader_effective_budget_seconds"], 8.5)
+            self.assertLess(receipt["post_leader_quiescence_seconds"], receipt["post_leader_effective_budget_seconds"])
+            self.assertGreaterEqual(receipt["post_leader_quiescence_seconds"], 5.5)
+            self.assertGreater(receipt["post_leader_vctip_extension_seconds"], 0)
+            self.assertIsNone(receipt["surviving_job_pids"])
+            self.assertEqual(receipt["post_leader_quiescence_terminal_reason"], "verified_vctip_disposed_job_empty_and_pipe_drained")
+            self.assertEqual(receipt["post_leader_vctip_disposal_actions"][0]["pid"], pid)
+            self.assertTrue(receipt["post_leader_vctip_disposal_actions"][0]["termination_requested"])
+            self.assertTrue(receipt["post_leader_vctip_disposal_actions"][0]["handle_signaled"])
+            self.assertEqual(receipt["post_leader_vctip_post_disposal_pids"], [])
+            self.assertTrue(receipt["raw_log_complete"])
+            self.assert_pid_exited(pid)
+
+    def test_windows_vctip_cap_rejects_same_handle_image_mismatch(self) -> None:
         if os.name != "nt":
             self.skipTest("native Windows Job Object required")
         image_path = (
@@ -1349,19 +1615,58 @@ class StageReceiptTests(unittest.TestCase):
                 ],
             ), patch("ci_catalog_stage.WINDOWS_VCTIP_QUIESCENCE_SECONDS", 5.5):
                 gate = StageRecorder(repo, root / "artifacts", "a" * 40, environment, "windows")
-                started = time.monotonic()
                 with self.assertRaisesRegex(RuntimeError, "surviving descendant"):
-                    gate.run("telemetry-persistent", [sys.executable, "-c", child], timeout_seconds=12)
-                self.assertLess(time.monotonic() - started, 10)
+                    gate.run("telemetry-mismatch", [sys.executable, "-c", child], timeout_seconds=12)
             pid = int((repo / "telemetry.pid").read_text(encoding="utf-8"))
-            receipt = json.loads((gate.logs / "telemetry-persistent.receipt.json").read_text(encoding="utf-8"))
-            self.assertEqual(receipt["post_leader_quiescence_budget_seconds"], 5.5)
-            self.assertGreaterEqual(receipt["post_leader_quiescence_seconds"], 5.5)
-            self.assertGreater(receipt["post_leader_vctip_extension_seconds"], 0)
+            receipt = json.loads((gate.logs / "telemetry-mismatch.receipt.json").read_text(encoding="utf-8"))
+            self.assertEqual(receipt["post_leader_quiescence_terminal_reason"], "vctip_disposal_failed")
+            self.assertGreaterEqual(receipt["post_leader_effective_budget_seconds"], 8.5)
+            self.assertFalse(receipt["post_leader_vctip_disposal_actions"][0]["termination_requested"])
             self.assertEqual(receipt["surviving_job_pids"], [pid])
-            self.assertEqual(receipt["surviving_job_members"][0]["image_path"], image_path)
-            self.assertEqual(receipt["post_leader_quiescence_terminal_reason"], "vctip_quiescence_cap_reached")
-            self.assertTrue(receipt["raw_log_complete"])
+            self.assert_pid_exited(pid)
+
+    def test_windows_vctip_disposal_does_not_accept_live_job_or_open_pipe(self) -> None:
+        if os.name != "nt":
+            self.skipTest("native Windows Job Object required")
+        image_path = (
+            r"C:\Program Files\Microsoft Visual Studio\18\Enterprise"
+            r"\VC\Tools\MSVC\14.51\bin\Hostx64\x64\vctip.exe"
+        )
+        child = (
+            "import subprocess,sys,pathlib; "
+            "member=subprocess.Popen([sys.executable,'-c','import time; time.sleep(20)'], "
+            "stdin=subprocess.DEVNULL,stdout=sys.stdout,stderr=sys.stderr); "
+            "pathlib.Path('telemetry.pid').write_text(str(member.pid)); "
+            "print('leader exited', flush=True)"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            repo.mkdir()
+            environment = os.environ.copy()
+            environment.update(CARGO_TARGET_DIR=str(root / "target"), PRAXOR_TEST_TMP_ROOT=str(root / "fixtures"), TEMP=str(root / "tmp"))
+            with patch("ci_catalog_stage.tracked_manifest", return_value=synthetic_manifest()), patch.object(
+                StageRecorder, "_sample", synthetic_resource_sample
+            ), patch.object(
+                StageRecorder, "_windows_job_member_diagnostics",
+                side_effect=lambda pids, _job: [
+                    {"pid": pid, "image_name": "vctip.exe", "image_path": image_path,
+                     "name_lookup_error": None, "identity_lookup_error": None,
+                     "in_job": True, "creation_time_100ns": pid * 1000}
+                    for pid in pids
+                ],
+            ), patch.object(
+                StageRecorder, "_windows_dispose_verified_vctip", return_value=None,
+            ), patch("ci_catalog_stage.WINDOWS_VCTIP_QUIESCENCE_SECONDS", 5.5):
+                gate = StageRecorder(repo, root / "artifacts", "a" * 40, environment, "windows")
+                with self.assertRaisesRegex(RuntimeError, "did not settle after VCTIP disposal"):
+                    gate.run("telemetry-unsettled", [sys.executable, "-c", child], timeout_seconds=12)
+            pid = int((repo / "telemetry.pid").read_text(encoding="utf-8"))
+            receipt = json.loads((gate.logs / "telemetry-unsettled.receipt.json").read_text(encoding="utf-8"))
+            self.assertEqual(receipt["post_leader_quiescence_terminal_reason"], "vctip_disposal_settle_timeout")
+            self.assertGreaterEqual(receipt["post_leader_quiescence_seconds"], receipt["post_leader_effective_budget_seconds"])
+            self.assertEqual(receipt["post_leader_vctip_post_disposal_pids"], [pid])
+            self.assertTrue(receipt["raw_log_complete"], "failure cleanup must drain the raw output pipe")
             self.assert_pid_exited(pid)
 
     def test_windows_vctip_identity_change_during_grace_fails_and_kills_member(self) -> None:
