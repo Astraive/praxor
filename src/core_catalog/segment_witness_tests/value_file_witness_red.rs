@@ -171,12 +171,12 @@ fn private_value_file_witnesses_head_and_near_cap_schema_as_distinct_extents_in_
     config.large_value_threshold = 11;
     config.validate().unwrap();
     assert_eq!(manifest.effective_config, config.persisted());
-    assert!(matches!(
-        inspect_v4_owner(&lease, &config, &CpuAccelerator),
-        Err(PraxisError::UnsupportedCatalogFeature {
-            feature: "v4 installed cut beyond narrow D0 bootstrap"
-        })
-    ));
+    let owner_result = inspect_v4_owner(&lease, &config, &CpuAccelerator);
+    assert!(
+        matches!(&owner_result, Err(PraxisError::Corrupt { .. })),
+        "external value fixture unexpectedly admitted or changed owner fence: {owner_result:?}"
+    );
+    assert_eq!(snapshot(dir.path()), before);
 
     with_wal_budget(root, &manifest, |budget| {
         let balance = budget.remaining_bytes();
