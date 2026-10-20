@@ -3,7 +3,9 @@ use crate::core_catalog::codec::{Anchor, anchor_digest};
 use crate::core_catalog::physical_copy::{
     admit_protected_physical_copies, collect_protected_copy_ledger,
 };
-use crate::core_catalog::value_witness::validate_inline_catalog_schema_put;
+use crate::core_catalog::value_witness::{
+    ValueFileScanProbe, ValueRowLocator, collect_value_witness, validate_inline_catalog_schema_put,
+};
 use crate::core_records::codec::{
     Decision as RecordDecision, Key as RecordKey, Role as RecordRole, Row as RecordRow,
 };
@@ -2071,4 +2073,495 @@ fn writer_identical_schema_pair_reaches_next_private_gate() {
 #[test]
 fn writer_equal_length_schema_byte_conflict_requires_private_corrupt() {
     writer_schema_pair_case(true);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SchemaPairTopology {
+    SharedValueFile,
+    SeparateValueFiles,
+    InlineThenExternal,
+    ExternalThenInline,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SchemaPeerChange {
+    Equal,
+    DifferentNullable,
+    LongerName,
+}
+
+fn schema_peer_bytes(
+    original: &[u8],
+    key: &CatalogKey<'_>,
+    root: &Path,
+    change: SchemaPeerChange,
+) -> Vec<u8> {
+    if matches!(change, SchemaPeerChange::Equal) {
+        return original.to_vec();
+    }
+    let CatalogValue::Schema(mut schema) = CatalogValue::decode(key, original, root).unwrap()
+    else {
+        panic!("fixed WAL oracle Schema must decode")
+    };
+    match change {
+        SchemaPeerChange::Equal => unreachable!(),
+        SchemaPeerChange::DifferentNullable => {
+            schema.fields[0].nullable = !schema.fields[0].nullable;
+        }
+        SchemaPeerChange::LongerName => {
+            schema.name = "schema_copy_longer_name";
+        }
+    }
+    let encoded = CatalogValue::Schema(schema).encode().unwrap();
+    assert_ne!(encoded, original);
+    assert_eq!(
+        encoded.len() == original.len(),
+        matches!(change, SchemaPeerChange::DifferentNullable)
+    );
+    assert!(matches!(
+        CatalogValue::decode(key, &encoded, root),
+        Ok(CatalogValue::Schema(_))
+    ));
+    encoded
+}
+
+/// Check writer framing independently of the selected-value replay API.
+fn assert_schema_value_frame(pointer: &ValuePointer, expected: &[u8]) {
+    let path = Path::new(&pointer.path);
+    let file = fs::read(path).unwrap();
+    let offset = usize::try_from(pointer.offset).unwrap();
+    let end = offset.checked_add(12 + expected.len()).unwrap();
+    assert!(end <= file.len());
+    assert_eq!(pointer.len, expected.len() as u64);
+    assert_eq!(pointer.checksum, crc32c(expected));
+    assert_eq!(
+        u64::from_le_bytes(file[offset..offset + 8].try_into().unwrap()),
+        pointer.len
+    );
+    assert_eq!(
+        u32::from_le_bytes(file[offset + 8..offset + 12].try_into().unwrap()),
+        pointer.checksum
+    );
+    assert_eq!(&file[offset + 12..end], expected);
+}
+
+fn append_schema_value_frame(path: &Path, bytes: &[u8]) -> ValuePointer {
+    let mut writer = ValueLog::open(path).unwrap();
+    writer.append(bytes).unwrap()
+}
+
+fn expected_schema_observation(value: &StoredValue) -> ObservedSegmentValue {
+    match value {
+        StoredValue::Put(bytes) => ObservedSegmentValue::Put(bytes.clone()),
+        StoredValue::BlobPointer(pointer) => ObservedSegmentValue::Pointer {
+            pointer: pointer.clone(),
+            expires_at_ms: None,
+        },
+        other => panic!("Schema test has an unexpected wire operation: {other:?}"),
+    }
+}
+
+fn writer_schema_pair_topology_case(topology: SchemaPairTopology, change: SchemaPeerChange) {
+    let (dir, config, lease) = flushed_create_fixture();
+    let root = lease.root();
+    let layout = DiskLayout::at(root);
+    let manifest_path = layout.manifest_path();
+    let mut manifest =
+        Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    assert_eq!(manifest.segments.len(), 1);
+    let first_path = layout.segment_path(0, 1);
+    let first_original = fs::read(&first_path).unwrap();
+    assert_eq!(
+        manifest.segments[0].file_digest,
+        blake3::hash(&first_original).to_hex().to_string()
+    );
+    let original = decode_segment(&first_original, &first_path, &CpuAccelerator).unwrap();
+    let mut first_rows = original
+        .blocks
+        .into_iter()
+        .flatten()
+        .map(|row| row.entry)
+        .collect::<Vec<_>>();
+    assert_eq!(first_rows.len(), 7);
+    let schema_key = CatalogKey::Schema(CollectionId::new(2).unwrap());
+    let key_bytes = schema_key.encode().unwrap();
+    let first_position = first_rows
+        .iter()
+        .position(|row| {
+            row.cf.0 == CATALOG_CF
+                && row.key.as_ref() == key_bytes.as_slice()
+                && row.version.sequence == 2
+        })
+        .expect("flushed CREATE must have Schema@2");
+    let StoredValue::Put(original_bytes) = &first_rows[first_position].version.value else {
+        panic!("writer Schema@2 must begin as an inline Put")
+    };
+    let original_bytes = original_bytes.clone();
+    assert_eq!(
+        original_bytes,
+        fixed_copy_oracle(
+            "create_tag7",
+            "catalog_schema_id_2",
+            CATALOG_CF,
+            &key_bytes,
+            2
+        )
+    );
+    let peer_bytes = schema_peer_bytes(&original_bytes, &schema_key, root, change);
+    let (first_external, second_external) = match topology {
+        SchemaPairTopology::SharedValueFile | SchemaPairTopology::SeparateValueFiles => {
+            (true, true)
+        }
+        SchemaPairTopology::InlineThenExternal => (false, true),
+        SchemaPairTopology::ExternalThenInline => (true, false),
+    };
+    let first_value_path = match topology {
+        SchemaPairTopology::SharedValueFile => layout.value_log_path(2),
+        _ => layout.value_log_path(1),
+    };
+    let second_value_path = layout.value_log_path(2);
+    let first_pointer =
+        first_external.then(|| append_schema_value_frame(&first_value_path, &original_bytes));
+    let second_pointer =
+        second_external.then(|| append_schema_value_frame(&second_value_path, &peer_bytes));
+    if let Some(pointer) = &first_pointer {
+        assert_schema_value_frame(pointer, &original_bytes);
+        first_rows[first_position].version.value = StoredValue::BlobPointer(pointer.clone());
+    }
+    let first_entry = first_rows[first_position].clone();
+    let mut second_entry = first_entry.clone();
+    second_entry.version.value = match &second_pointer {
+        Some(pointer) => StoredValue::BlobPointer(pointer.clone()),
+        None => StoredValue::Put(peer_bytes.clone()),
+    };
+    if let Some(pointer) = &second_pointer {
+        assert_schema_value_frame(pointer, &peer_bytes);
+    }
+    if let (Some(first), Some(second)) = (&first_pointer, &second_pointer) {
+        let first_file = Path::new(&first.path);
+        let second_file = Path::new(&second.path);
+        if matches!(topology, SchemaPairTopology::SharedValueFile) {
+            assert_eq!(first_file, second_file);
+            assert_eq!(first.offset, 0);
+            assert_eq!(second.offset, 12 + first.len);
+            assert_eq!(
+                fs::metadata(first_file).unwrap().len(),
+                second.offset + 12 + second.len
+            );
+        } else {
+            assert_ne!(first_file, second_file);
+            assert_eq!((first.offset, second.offset), (0, 0));
+            assert_ne!(
+                physical_id(&File::open(first_file).unwrap(), first_file).unwrap(),
+                physical_id(&File::open(second_file).unwrap(), second_file).unwrap()
+            );
+        }
+    }
+
+    // Both segment files and every referenced value frame come from writers.
+    let mut first_value_log = ValueLog::open(layout.value_log_path(1)).unwrap();
+    let first_meta = SegmentWriter::write(
+        SegmentWriteOptions {
+            path: &first_path,
+            id: 1,
+            level: 0,
+            compression: Compression::None,
+            accelerator: &CpuAccelerator,
+            value_log: &mut first_value_log,
+            large_value_threshold: config.large_value_threshold,
+            block_size: config.block_size,
+            partitioned_bloom: None,
+            direct_io: false,
+        },
+        first_rows,
+    )
+    .unwrap();
+    drop(first_value_log);
+    if !first_external || matches!(topology, SchemaPairTopology::SharedValueFile) {
+        fs::remove_file(layout.value_log_path(1)).unwrap();
+    }
+    let second_path = layout.segment_path(1, 2);
+    fs::create_dir_all(second_path.parent().unwrap()).unwrap();
+    let mut second_value_log = ValueLog::open(&second_value_path).unwrap();
+    let second_meta = SegmentWriter::write(
+        SegmentWriteOptions {
+            path: &second_path,
+            id: 2,
+            level: 1,
+            compression: Compression::None,
+            accelerator: &CpuAccelerator,
+            value_log: &mut second_value_log,
+            large_value_threshold: config.large_value_threshold,
+            block_size: config.block_size,
+            partitioned_bloom: None,
+            direct_io: false,
+        },
+        vec![second_entry.clone()],
+    )
+    .unwrap();
+    drop(second_value_log);
+    if !second_external && !matches!(topology, SchemaPairTopology::SharedValueFile) {
+        fs::remove_file(&second_value_path).unwrap();
+    }
+    // The final writer calls must not have appended hidden frames or tail
+    // bytes after the earlier pointer checks. Recheck raw bytes and EOF now.
+    if let Some(pointer) = &first_pointer {
+        assert_schema_value_frame(pointer, &original_bytes);
+    }
+    if let Some(pointer) = &second_pointer {
+        assert_schema_value_frame(pointer, &peer_bytes);
+    }
+    match topology {
+        SchemaPairTopology::SharedValueFile => {
+            let first = first_pointer.as_ref().unwrap();
+            let second = second_pointer.as_ref().unwrap();
+            assert_eq!(first.path, second.path);
+            assert_eq!(first.offset, 0);
+            assert_eq!(second.offset, 12 + first.len);
+            assert_eq!(
+                fs::metadata(&first.path).unwrap().len(),
+                second.offset + 12 + second.len
+            );
+        }
+        SchemaPairTopology::SeparateValueFiles => {
+            let first = first_pointer.as_ref().unwrap();
+            let second = second_pointer.as_ref().unwrap();
+            assert_ne!(first.path, second.path);
+            for pointer in [first, second] {
+                assert_eq!(pointer.offset, 0);
+                assert_eq!(fs::metadata(&pointer.path).unwrap().len(), 12 + pointer.len);
+            }
+            assert_ne!(
+                physical_id(&File::open(&first.path).unwrap(), Path::new(&first.path)).unwrap(),
+                physical_id(&File::open(&second.path).unwrap(), Path::new(&second.path)).unwrap()
+            );
+        }
+        SchemaPairTopology::InlineThenExternal => {
+            let pointer = second_pointer.as_ref().unwrap();
+            assert!(first_pointer.is_none());
+            assert_eq!(pointer.offset, 0);
+            assert_eq!(fs::metadata(&pointer.path).unwrap().len(), 12 + pointer.len);
+        }
+        SchemaPairTopology::ExternalThenInline => {
+            let pointer = first_pointer.as_ref().unwrap();
+            assert!(second_pointer.is_none());
+            assert_eq!(pointer.offset, 0);
+            assert_eq!(fs::metadata(&pointer.path).unwrap().len(), 12 + pointer.len);
+        }
+    }
+    let first_written = fs::read(&first_path).unwrap();
+    let second_written = fs::read(&second_path).unwrap();
+    assert_eq!(
+        first_meta.file_digest,
+        blake3::hash(&first_written).to_hex().to_string()
+    );
+    assert_eq!(
+        second_meta.file_digest,
+        blake3::hash(&second_written).to_hex().to_string()
+    );
+    let first_decoded = decode_segment(&first_written, &first_path, &CpuAccelerator).unwrap();
+    let second_decoded = decode_segment(&second_written, &second_path, &CpuAccelerator).unwrap();
+    let first_offsets = literal_block_offsets(&first_written, 0, 1, first_decoded.blocks.len());
+    let second_offsets = literal_block_offsets(&second_written, 1, 2, second_decoded.blocks.len());
+    let locations = [
+        exact_entry_location(&first_decoded, &first_offsets, &first_entry),
+        exact_entry_location(&second_decoded, &second_offsets, &second_entry),
+    ];
+    assert_eq!(second_decoded.blocks.iter().flatten().count(), 1);
+    assert_ne!(
+        physical_id(&File::open(&first_path).unwrap(), &first_path).unwrap(),
+        physical_id(&File::open(&second_path).unwrap(), &second_path).unwrap()
+    );
+    manifest.segments[0] = first_meta;
+    manifest.segments.push(second_meta);
+    manifest.next_segment_id = 3;
+    ManifestStore::new(manifest_path.clone())
+        .save(&manifest)
+        .unwrap();
+    let manifest = Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    manifest.validate_v4(root).unwrap();
+    let before = snapshot(dir.path());
+
+    with_wal_budget(root, &manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let segment = collect_protected_segment_candidate(root, &manifest, budget).unwrap();
+        let schema_rows = segment
+            .rows
+            .iter()
+            .filter(|row| row.cf == CATALOG_CF && row.key == key_bytes && row.sequence == 2)
+            .collect::<Vec<_>>();
+        assert_eq!(schema_rows.len(), 2);
+        for (index, (row, expected)) in schema_rows
+            .iter()
+            .zip([&first_entry, &second_entry])
+            .enumerate()
+        {
+            assert_eq!(
+                row.source,
+                SegmentSource {
+                    level: index as u32,
+                    id: index as u64 + 1,
+                    manifest_ordinal: index,
+                }
+            );
+            assert_eq!((row.block_offset, row.row_ordinal), locations[index]);
+            assert_eq!(
+                row.classification,
+                PhysicalRowClass::BoundProtected(ProtectedRole::Catalog)
+            );
+            assert_eq!(
+                row.value,
+                expected_schema_observation(&expected.version.value)
+            );
+        }
+        let mut probe = ValueFileScanProbe::default();
+        let value = collect_value_witness(root, &manifest, &segment.rows, budget, &mut probe)
+            .expect("writer-framed Schema pointer(s) must authenticate");
+        let expected_files = if matches!(topology, SchemaPairTopology::SeparateValueFiles) {
+            2
+        } else {
+            1
+        };
+        assert_eq!(value.files.len(), expected_files);
+        assert_eq!(
+            value.extents.len(),
+            first_external as usize + second_external as usize
+        );
+        assert_eq!(probe.proof_full_file_hashes, expected_files);
+        for row in &schema_rows {
+            let ObservedSegmentValue::Pointer { pointer, .. } = &row.value else {
+                continue;
+            };
+            let locator = ValueRowLocator {
+                source: row.source,
+                block_offset: row.block_offset,
+                row_ordinal: row.row_ordinal,
+            };
+            let extents = value
+                .extents
+                .iter()
+                .filter(|extent| extent.locator == locator)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                extents.len(),
+                1,
+                "each pointer needs its exact physical locator"
+            );
+            let extent = extents[0];
+            assert_eq!(
+                (extent.offset, extent.len, extent.checksum),
+                (pointer.offset, pointer.len, pointer.checksum)
+            );
+            let file = value
+                .files
+                .iter()
+                .find(|file| file.id == extent.file_id)
+                .unwrap();
+            assert_eq!(file.path.as_path(), Path::new(&pointer.path));
+            let bytes = fs::read(&file.path).unwrap();
+            assert_eq!(file.len, bytes.len() as u64);
+            assert_eq!(file.digest, blake3::hash(&bytes));
+            assert_eq!(
+                file.identity,
+                physical_id(&File::open(&file.path).unwrap(), &file.path).unwrap()
+            );
+        }
+        value.discard(root, budget).unwrap();
+        segment.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!(snapshot(dir.path()), before);
+
+        let result = collect_protected_copy_ledger(root, &manifest, budget);
+        let error = match result {
+            Err(error) => error,
+            Ok(candidate) => {
+                candidate.discard(root, budget).unwrap();
+                panic!("Schema pair unexpectedly reached a private candidate")
+            }
+        };
+        assert_eq!(
+            budget.remaining_bytes(),
+            balance,
+            "refusal must refund exactly"
+        );
+        assert_eq!(snapshot(dir.path()), before, "refusal must not edit files");
+        match change {
+            SchemaPeerChange::Equal => assert!(matches!(
+                error,
+                PraxisError::UnsupportedCatalogFeature {
+                    feature: "protected physical-copy role group provenance awaits proof"
+                        | "protected physical-copy bytes await authenticated replay"
+                }
+            )),
+            SchemaPeerChange::DifferentNullable | SchemaPeerChange::LongerName => match error {
+                PraxisError::Corrupt { reason, .. }
+                    if reason == "protected physical-copy actual bytes conflict" => {}
+                other => panic!(
+                    "RED: valid Schema pair {topology:?}/{change:?} must conflict after complete fences: {other:?}"
+                ),
+            },
+        }
+    });
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn writer_schema_shared_value_file_equal_control() {
+    writer_schema_pair_topology_case(SchemaPairTopology::SharedValueFile, SchemaPeerChange::Equal);
+}
+
+#[test]
+fn writer_schema_shared_value_file_unequal_length_conflict() {
+    writer_schema_pair_topology_case(
+        SchemaPairTopology::SharedValueFile,
+        SchemaPeerChange::LongerName,
+    );
+}
+
+#[test]
+fn writer_schema_separate_value_files_equal_control() {
+    writer_schema_pair_topology_case(
+        SchemaPairTopology::SeparateValueFiles,
+        SchemaPeerChange::Equal,
+    );
+}
+
+#[test]
+fn writer_schema_separate_value_files_valid_byte_conflict() {
+    writer_schema_pair_topology_case(
+        SchemaPairTopology::SeparateValueFiles,
+        SchemaPeerChange::DifferentNullable,
+    );
+}
+
+#[test]
+fn writer_schema_inline_then_external_equal_control() {
+    writer_schema_pair_topology_case(
+        SchemaPairTopology::InlineThenExternal,
+        SchemaPeerChange::Equal,
+    );
+}
+
+#[test]
+fn writer_schema_inline_then_external_valid_byte_conflict() {
+    writer_schema_pair_topology_case(
+        SchemaPairTopology::InlineThenExternal,
+        SchemaPeerChange::DifferentNullable,
+    );
+}
+
+#[test]
+fn writer_schema_external_then_inline_equal_control() {
+    writer_schema_pair_topology_case(
+        SchemaPairTopology::ExternalThenInline,
+        SchemaPeerChange::Equal,
+    );
+}
+
+#[test]
+fn writer_schema_external_then_inline_unequal_length_conflict() {
+    writer_schema_pair_topology_case(
+        SchemaPairTopology::ExternalThenInline,
+        SchemaPeerChange::LongerName,
+    );
 }
