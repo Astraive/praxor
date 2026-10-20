@@ -35,24 +35,104 @@ pub(crate) enum H80Error {
     Unsupported,
 }
 
+const H80_LEN: usize = 80;
+const H80_DIGEST_DOMAIN: &[u8] = b"praxor/wal-header/v5\0";
+
+// This is the Castagnoli polynomial, not the historical IEEE checksum
+// exported by crate::io::crc32c.
+fn castagnoli_crc32c(bytes: &[u8]) -> u32 {
+    let mut crc = !0_u32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0_u32.wrapping_sub(crc & 1) & 0x82f6_3b78);
+        }
+    }
+    !crc
+}
+
+fn header_digest(bytes: &[u8; H80_LEN]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(H80_DIGEST_DOMAIN);
+    hasher.update(bytes);
+    *hasher.finalize().as_bytes()
+}
+
+// The pending descriptor has enough identity material to derive one and only
+// one permitted H80, including its checksum. Validate it before considering
+// the file state, so even an absent reserved path cannot hide a bad descriptor.
+fn expected_header(expected: &H80Descriptor<'_>) -> Result<[u8; H80_LEN], H80Error> {
+    if expected.database_id.iter().all(|&byte| byte == 0)
+        || expected.writer_incarnation.iter().all(|&byte| byte == 0)
+        || expected.wal_id == 0
+        || expected.wal_id == u64::MAX
+        || expected.creation_nonce[..8] != expected.wal_id.to_le_bytes()
+        || expected.relative_path != format!("wal/{:020}.wal", expected.wal_id)
+    {
+        return Err(H80Error::Corrupt);
+    }
+
+    let mut header = [0_u8; H80_LEN];
+    header[..4].copy_from_slice(b"PWH5");
+    header[4..6].copy_from_slice(&5_u16.to_le_bytes());
+    header[6..8].copy_from_slice(&(H80_LEN as u16).to_le_bytes());
+    // [8,12) flags and reserved bytes are exactly zero.
+    header[12..28].copy_from_slice(&expected.database_id);
+    header[28..44].copy_from_slice(&expected.writer_incarnation);
+    header[44..52].copy_from_slice(&expected.wal_id.to_le_bytes());
+    header[52..68].copy_from_slice(&expected.creation_nonce);
+    header[68..76].copy_from_slice(&expected.start_after_sequence.to_le_bytes());
+    let crc = castagnoli_crc32c(&header[..76]);
+    header[76..80].copy_from_slice(&crc.to_le_bytes());
+    if header_digest(&header) != expected.header_digest {
+        return Err(H80Error::Corrupt);
+    }
+    Ok(header)
+}
+
+fn decoded(expected: &H80Descriptor<'_>) -> UntrustedH80 {
+    UntrustedH80 {
+        database_id: expected.database_id,
+        writer_incarnation: expected.writer_incarnation,
+        wal_id: expected.wal_id,
+        creation_nonce: expected.creation_nonce,
+        start_after_sequence: expected.start_after_sequence,
+        header_digest: expected.header_digest,
+    }
+}
+
 /// Decode exactly one 80-byte header window against a MANIFEST descriptor.
 /// For an installed WAL, the caller must separately validate any frames after
 /// this window; those bytes are not passed to this function.
 pub(crate) fn decode_h80(
-    _bytes: &[u8],
-    _expected: &H80Descriptor<'_>,
+    bytes: &[u8],
+    expected: &H80Descriptor<'_>,
 ) -> Result<UntrustedH80, H80Error> {
-    Err(H80Error::Unsupported)
+    let header = expected_header(expected)?;
+    if bytes != header.as_slice() {
+        return Err(H80Error::Corrupt);
+    }
+    Ok(decoded(expected))
 }
 
 /// Inspect the entire reserved-file image while WalCreate or WalRotate is
 /// pending. Only absence, one exact proper header prefix, or H80 alone can
 /// match pending state; no frame or other suffix is allowed here.
 pub(crate) fn inspect_pending_h80_file(
-    _bytes: Option<&[u8]>,
-    _expected: &H80Descriptor<'_>,
+    bytes: Option<&[u8]>,
+    expected: &H80Descriptor<'_>,
 ) -> Result<PendingH80Inspection, H80Error> {
-    Err(H80Error::Unsupported)
+    let header = expected_header(expected)?;
+    match bytes {
+        None => Ok(PendingH80Inspection::AbsentPath),
+        Some(bytes) if bytes.len() < H80_LEN && bytes == &header[..bytes.len()] => {
+            Ok(PendingH80Inspection::ExactPrefix(bytes.len()))
+        }
+        Some(bytes) if bytes == header.as_slice() => {
+            Ok(PendingH80Inspection::Complete(decoded(expected)))
+        }
+        Some(_) => Err(H80Error::Corrupt),
+    }
 }
 
 #[cfg(test)]
