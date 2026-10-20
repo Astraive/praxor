@@ -1,7 +1,8 @@
 use super::*;
 use crate::core_catalog::codec::{Anchor, anchor_digest};
 use crate::core_catalog::physical_copy::{
-    CopyWireOperation, collect_protected_copy_admission, collect_protected_copy_ledger,
+    CopyWireOperation, collect_protected_copy_admission,
+    collect_protected_copy_admission_with_limits_for_test, collect_protected_copy_ledger,
 };
 use crate::core_catalog::value_witness::{
     ValueFileScanProbe, ValueRowLocator, collect_value_witness, validate_inline_catalog_schema_put,
@@ -17,6 +18,7 @@ use crate::core_records::transition::{
     Context as RecordContext, Rows as RecordRows, Summary as RecordSummary, check_bootstrap_ops,
     plan as plan_record,
 };
+use crate::manifest::ColumnFamilyGeneration;
 use crate::segments::format::SEGMENT_FOOTER_MAGIC;
 use crate::transactions::{BatchOp, WriteBatch};
 use crate::wal::record::{CoreRecordPrefix, CoreWalRecord, parse_core_record_prefix};
@@ -1002,8 +1004,322 @@ fn writer_produced_duplicate_allocator_at_s1_requires_private_copy_admission() {
 }
 
 #[test]
+fn writer_allocator_copies_refuse_wrong_generation_at_private_candidate_stage() {
+    let fixture = next_copy_fixture(NextCopyCase::IdenticalAllocator);
+    let root = fixture.lease.root();
+    let meta_cf = RecordRole::Meta.cf();
+    assert_eq!(meta_cf, "__praxor_record_meta_v1");
+    assert_eq!(fixture.original, fixture.written);
+    assert_eq!(fixture.original.version.sequence, 1);
+    assert_eq!(fixture.manifest.segments.len(), 2);
+    fixture.manifest.validate_v4(root).unwrap();
+    assert!(matches!(
+        inspect_v4_owner(&fixture.lease, &fixture.config, &CpuAccelerator),
+        Err(PraxisError::UnsupportedCatalogFeature {
+            feature: "v4 installed cut beyond narrow D0 bootstrap"
+        })
+    ));
+    assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+
+    with_wal_budget(root, &fixture.manifest, |budget| {
+        let baseline = budget.remaining_bytes();
+        let staged = collect_protected_segment_candidate(root, &fixture.manifest, budget)
+            .expect("the valid writer segments must be witnessed before generation tampering");
+        let held_balance = budget.remaining_bytes();
+        assert_eq!(
+            baseline - held_balance,
+            staged.retained_witness_bytes(),
+            "only authenticated file receipts remain charged"
+        );
+        let witnesses = &staged.witnesses;
+        let observed = &staged.rows;
+        assert_eq!(witnesses.len(), 2);
+        assert_eq!(observed.len(), 8);
+        for (witness, source, path, bytes, rows) in [
+            (
+                &witnesses[0],
+                SegmentSource {
+                    level: 0,
+                    id: 1,
+                    manifest_ordinal: 0,
+                },
+                &fixture.first_path,
+                &fixture.first_bytes,
+                7,
+            ),
+            (
+                &witnesses[1],
+                SegmentSource {
+                    level: 1,
+                    id: 2,
+                    manifest_ordinal: 1,
+                },
+                &fixture.second_path,
+                &fixture.second_bytes,
+                1,
+            ),
+        ] {
+            assert_eq!(witness.source, source);
+            assert_eq!(witness.path.as_path(), path.as_path());
+            assert_eq!(witness.len, bytes.len() as u64);
+            assert_eq!(witness.digest, blake3::hash(bytes));
+            assert_eq!(witness.observed_rows, rows);
+            assert_eq!(
+                witness.identity,
+                physical_id(&File::open(path).unwrap(), path).unwrap()
+            );
+        }
+        let copies = observed
+            .iter()
+            .filter(|row| row.cf == meta_cf && row.key.as_slice() == [1u8] && row.sequence == 1)
+            .collect::<Vec<_>>();
+        assert_eq!(copies.len(), 2);
+        assert_eq!(
+            (copies[0].source, copies[1].source),
+            (witnesses[0].source, witnesses[1].source)
+        );
+        assert_eq!(
+            (copies[0].block_offset, copies[0].row_ordinal),
+            fixture.first_location
+        );
+        assert_eq!(
+            (copies[1].block_offset, copies[1].row_ordinal),
+            fixture.second_location
+        );
+        let StoredValue::Put(ref allocator_bytes) = fixture.original.version.value else {
+            panic!("the writer Allocator@1 must be an inline Put")
+        };
+        assert_eq!(
+            allocator_bytes,
+            &fixed_copy_oracle("bootstrap_tag6", "record_allocator", meta_cf, &[1], 1)
+        );
+        for copy in copies {
+            assert_eq!(
+                copy.classification,
+                PhysicalRowClass::BoundProtected(ProtectedRole::Meta)
+            );
+            assert_eq!(
+                copy.value,
+                ObservedSegmentValue::Put(allocator_bytes.clone())
+            );
+        }
+        assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+
+        // The bytes and physical receipts were authentic under the installed
+        // generation. A forged in-memory manifest cannot transfer them to a
+        // different protected incarnation at the private admission boundary.
+        let mut wrong_generation = fixture.manifest.clone();
+        assert_eq!(
+            wrong_generation.column_family_generations[meta_cf],
+            ColumnFamilyGeneration {
+                id: 1,
+                visible_after_sequence: 0
+            }
+        );
+        wrong_generation.column_family_generations.insert(
+            meta_cf.into(),
+            ColumnFamilyGeneration {
+                id: 6,
+                visible_after_sequence: 0,
+            },
+        );
+        wrong_generation.next_column_family_generation = 7;
+        assert!(matches!(
+            wrong_generation.validate_v4(root),
+            Err(PraxisError::Corrupt { reason, .. })
+                if reason == "record role descriptor/incarnation mismatch"
+        ));
+        let error = match collect_protected_copy_admission(root, &wrong_generation, budget) {
+            Err(error) => error,
+            Ok(_candidate) => panic!("wrong-generation manifest staged a private candidate"),
+        };
+        assert!(matches!(
+            error,
+            PraxisError::Corrupt { reason, .. }
+                if reason == "record role descriptor/incarnation mismatch"
+        ));
+        assert_eq!(
+            budget.remaining_bytes(),
+            held_balance,
+            "exact admission refund"
+        );
+        assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+        staged.discard(root, budget).unwrap();
+        assert_eq!(budget.remaining_bytes(), baseline, "exact staged refund");
+    });
+    assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+    assert!(matches!(
+        inspect_v4_owner(&fixture.lease, &fixture.config, &CpuAccelerator),
+        Err(PraxisError::UnsupportedCatalogFeature {
+            feature: "v4 installed cut beyond narrow D0 bootstrap"
+        })
+    ));
+}
+
+#[test]
 fn rechecksummed_equal_length_head_at_s2_conflict_requires_private_copy_corrupt() {
     exercise_next_copy_case(NextCopyCase::ConflictingHead);
+}
+
+#[test]
+fn distinct_triple_cap_refuses_before_private_candidate_and_refunds() {
+    let fixture = next_copy_fixture(NextCopyCase::IdenticalAllocator);
+    let root = fixture.lease.root();
+    assert!(matches!(
+        inspect_v4_owner(&fixture.lease, &fixture.config, &CpuAccelerator),
+        Err(PraxisError::UnsupportedCatalogFeature {
+            feature: "v4 installed cut beyond narrow D0 bootstrap"
+        })
+    ));
+    assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+
+    with_wal_budget(root, &fixture.manifest, |budget| {
+        let mut observed = Vec::new();
+        let witnesses = visit_v4_segments(root, &fixture.manifest, budget, |row| {
+            observed.push(row);
+            Ok(())
+        })
+        .expect("the two writer-produced segments must authenticate");
+        assert_eq!(observed.len(), 8);
+        assert_eq!(witnesses.len(), 2);
+        for (witness, path, bytes, count) in [
+            (&witnesses[0], &fixture.first_path, &fixture.first_bytes, 7),
+            (
+                &witnesses[1],
+                &fixture.second_path,
+                &fixture.second_bytes,
+                1,
+            ),
+        ] {
+            assert_eq!(witness.path.as_path(), path.as_path());
+            assert_eq!(witness.observed_rows, count);
+            assert_eq!(witness.len, bytes.len() as u64);
+            assert_eq!(witness.digest, blake3::hash(bytes));
+            assert_eq!(
+                witness.identity,
+                physical_id(&File::open(path).unwrap(), path).unwrap()
+            );
+        }
+        assert_ne!(witnesses[0].identity, witnesses[1].identity);
+        let mut triples = observed
+            .iter()
+            .map(|row| (row.cf.clone(), row.key.clone(), row.sequence))
+            .collect::<Vec<_>>();
+        triples.sort();
+        triples.dedup();
+        assert_eq!(triples.len(), 7, "only Allocator@1 is physically repeated");
+        let allocator_rows = observed
+            .iter()
+            .filter(|row| {
+                row.cf == fixture.original.cf.0
+                    && row.key.as_slice() == fixture.original.key.as_ref()
+                    && row.sequence == fixture.original.version.sequence
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(allocator_rows.len(), 2);
+        assert_eq!(allocator_rows[0].source, witnesses[0].source);
+        assert_eq!(allocator_rows[1].source, witnesses[1].source);
+        assert_eq!(
+            (
+                allocator_rows[0].block_offset,
+                allocator_rows[0].row_ordinal
+            ),
+            fixture.first_location
+        );
+        assert_eq!(
+            (
+                allocator_rows[1].block_offset,
+                allocator_rows[1].row_ordinal
+            ),
+            fixture.second_location
+        );
+        assert_eq!(allocator_rows[0].value, allocator_rows[1].value);
+        assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+
+        let balance = budget.remaining_bytes();
+        match collect_protected_copy_admission_with_limits_for_test(
+            root,
+            &fixture.manifest,
+            budget,
+            8,
+            6,
+        ) {
+            Err(PraxisError::UnsupportedCatalogFeature { feature }) => assert_eq!(
+                feature,
+                "protected physical-copy metadata exceeds the private proof profile"
+            ),
+            Err(other) => panic!("wrong distinct-triple-cap refusal: {other:?}"),
+            Ok(candidate) => {
+                drop(candidate);
+                panic!("an incomplete private copy group escaped the triple cap")
+            }
+        }
+        assert_eq!(
+            budget.remaining_bytes(),
+            balance,
+            "refusal must refund exactly"
+        );
+        assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+
+        let candidate = collect_protected_copy_admission_with_limits_for_test(
+            root,
+            &fixture.manifest,
+            budget,
+            8,
+            7,
+        )
+        .expect("the authenticated seven-triple control must stage");
+        let ledger = candidate
+            .consume()
+            .expect("the seven-triple candidate must pass the consumption fence");
+        assert_eq!(ledger.segment_witnesses().len(), 2);
+        let copies = ledger.copies().collect::<Vec<_>>();
+        assert_eq!(copies.len(), 8);
+        let admitted_allocator = copies
+            .iter()
+            .filter(|copy| {
+                copy.cf == fixture.original.cf.0
+                    && copy.key == fixture.original.key.as_ref()
+                    && copy.sequence == fixture.original.version.sequence
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(admitted_allocator.len(), 2);
+        assert_eq!(
+            (
+                admitted_allocator[0].block_offset,
+                admitted_allocator[0].row_ordinal
+            ),
+            fixture.first_location
+        );
+        assert_eq!(
+            (
+                admitted_allocator[1].block_offset,
+                admitted_allocator[1].row_ordinal
+            ),
+            fixture.second_location
+        );
+        assert_eq!(
+            (admitted_allocator[0].source, admitted_allocator[1].source),
+            (witnesses[0].source, witnesses[1].source)
+        );
+        drop(admitted_allocator);
+        drop(copies);
+        drop(ledger);
+        assert_eq!(
+            budget.remaining_bytes(),
+            balance,
+            "control must refund exactly"
+        );
+        assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+    });
+
+    assert!(matches!(
+        inspect_v4_owner(&fixture.lease, &fixture.config, &CpuAccelerator),
+        Err(PraxisError::UnsupportedCatalogFeature {
+            feature: "v4 installed cut beyond narrow D0 bootstrap"
+        })
+    ));
+    assert_eq!(snapshot(fixture.dir.path()), fixture.before);
 }
 
 #[test]
@@ -2411,6 +2727,205 @@ fn writer_equal_record_fact_at_s3_reaches_named_private_gate() {
 #[test]
 fn writer_valid_changed_record_fact_at_s3_requires_actual_byte_conflict() {
     writer_record_fact_pair_case(true);
+}
+
+fn writer_same_segment_cross_block_head_pair(conflicting: bool) {
+    let (dir, config, lease) = flushed_create_fixture();
+    let root = lease.root();
+    let layout = DiskLayout::at(root);
+    let path = layout.segment_path(0, 1);
+    let manifest_path = layout.manifest_path();
+    let original_manifest =
+        Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+    assert_eq!(original_manifest.segments.len(), 1);
+    assert_eq!(original_manifest.segments[0].entries, 7);
+    let original_file = fs::read(&path).unwrap();
+    assert_eq!(
+        original_manifest.segments[0].file_digest,
+        blake3::hash(&original_file).to_hex().to_string()
+    );
+    let original_segment = decode_segment(&original_file, &path, &CpuAccelerator).unwrap();
+    let head_key = CatalogKey::Head.encode().unwrap();
+    let original = original_segment
+        .blocks
+        .iter()
+        .flatten()
+        .filter(|raw| {
+            raw.entry.cf.0 == CATALOG_CF
+                && raw.entry.key.as_ref() == head_key.as_slice()
+                && raw.entry.version.sequence == 2
+        })
+        .map(|raw| raw.entry.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(original.len(), 1);
+    let original = original[0].clone();
+    let StoredValue::Put(original_bytes) = &original.version.value else {
+        panic!("writer Head@2 must be a literal Put")
+    };
+    assert_eq!(
+        original_bytes,
+        &fixed_copy_oracle("create_tag7", "catalog_head_at_2", CATALOG_CF, &head_key, 2)
+    );
+    let mut peer = original.clone();
+    if conflicting {
+        let CatalogValue::Head(mut changed) =
+            CatalogValue::decode(&CatalogKey::Head, original_bytes, &path).unwrap()
+        else {
+            panic!("writer Head@2 must decode as Head")
+        };
+        assert_eq!(changed.revision, 2);
+        changed.collection_count += 1;
+        let changed_bytes = CatalogValue::Head(changed).encode().unwrap();
+        assert_eq!(changed_bytes.len(), original_bytes.len());
+        assert_ne!(&changed_bytes, original_bytes);
+        assert!(matches!(
+            CatalogValue::decode(&CatalogKey::Head, &changed_bytes, &path),
+            Ok(CatalogValue::Head(_))
+        ));
+        peer.version.value = StoredValue::Put(changed_bytes);
+    }
+
+    // A stable writer sort leaves the two same-(CF,key,S) rows adjacent. With
+    // one row per block they have one file identity and distinct real offsets.
+    let mut rows = original_segment
+        .blocks
+        .into_iter()
+        .flatten()
+        .map(|raw| raw.entry)
+        .collect::<Vec<_>>();
+    rows.push(peer.clone());
+    let manifest = rewrite_first_segment(
+        root,
+        rows,
+        Compression::None,
+        config.large_value_threshold,
+        1,
+    );
+    manifest.validate_v4(root).unwrap();
+    assert_eq!(manifest.segments.len(), 1);
+    assert_eq!(manifest.segments[0].entries, 8);
+    let file = fs::read(&path).unwrap();
+    assert_eq!(
+        manifest.segments[0].file_digest,
+        blake3::hash(&file).to_hex().to_string()
+    );
+    let decoded = decode_segment(&file, &path, &CpuAccelerator).unwrap();
+    assert_eq!((decoded.level, decoded.id), (0, 1));
+    assert_eq!(decoded.blocks.len(), 8);
+    assert!(decoded.blocks.iter().all(|block| block.len() == 1));
+    let offsets = literal_block_offsets(&file, 0, 1, decoded.blocks.len());
+    let physical_heads = decoded
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(block, rows)| {
+            let raw = &rows[0];
+            (raw.entry.cf.0 == CATALOG_CF
+                && raw.entry.key.as_ref() == head_key.as_slice()
+                && raw.entry.version.sequence == 2)
+                .then(|| {
+                    assert!(raw.blob_expiry.is_none());
+                    (offsets[block], 0_u32, raw.entry.clone())
+                })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(physical_heads.len(), 2);
+    assert!(physical_heads[0].0 < physical_heads[1].0);
+    assert_eq!(physical_heads[0].2, original);
+    assert_eq!(physical_heads[1].2, peer);
+    let source = SegmentSource {
+        level: 0,
+        id: 1,
+        manifest_ordinal: 0,
+    };
+    let identity = physical_id(&File::open(&path).unwrap(), &path).unwrap();
+    let before = snapshot(dir.path());
+
+    // The narrow public CREATE owner cannot accept an eighth installed row.
+    assert!(matches!(
+        inspect_v4_owner(&lease, &config, &CpuAccelerator),
+        Err(PraxisError::Corrupt { reason, .. })
+            if reason == "v4 CREATE segment metadata mismatch"
+    ));
+    assert_eq!(snapshot(dir.path()), before);
+
+    with_wal_budget(root, &manifest, |budget| {
+        let mut observed = Vec::new();
+        let witnesses = visit_v4_segments(root, &manifest, budget, |row| {
+            observed.push(row);
+            Ok(())
+        })
+        .expect("bounded visitor must retain both same-segment Head@2 copies");
+        assert_eq!(witnesses.len(), 1);
+        assert_eq!(witnesses[0].source, source);
+        assert_eq!(witnesses[0].path, path);
+        assert_eq!(witnesses[0].len, file.len() as u64);
+        assert_eq!(witnesses[0].digest, blake3::hash(&file));
+        assert_eq!(witnesses[0].identity, identity);
+        assert_eq!(witnesses[0].observed_rows, 8);
+        assert_eq!(observed.len(), 8);
+        let seen_heads = observed
+            .iter()
+            .filter(|row| row.cf == CATALOG_CF && row.key == head_key && row.sequence == 2)
+            .collect::<Vec<_>>();
+        assert_eq!(seen_heads.len(), 2);
+        for (seen, (offset, ordinal, expected)) in seen_heads.iter().zip(&physical_heads) {
+            assert_eq!(seen.source, source);
+            assert_eq!((seen.block_offset, seen.row_ordinal), (*offset, *ordinal));
+            assert_eq!(
+                seen.classification,
+                PhysicalRowClass::BoundProtected(ProtectedRole::Catalog)
+            );
+            assert_eq!(
+                seen.value,
+                ObservedSegmentValue::Put(match &expected.version.value {
+                    StoredValue::Put(bytes) => bytes.clone(),
+                    _ => unreachable!("writer Head@2 is literal"),
+                })
+            );
+        }
+        assert_eq!(snapshot(dir.path()), before);
+
+        let balance = budget.remaining_bytes();
+        let result = collect_protected_copy_ledger(root, &manifest, budget);
+        if conflicting {
+            match result {
+                Err(PraxisError::Corrupt { reason, .. }) => {
+                    assert_eq!(reason, "protected physical-copy actual bytes conflict");
+                }
+                Ok(candidate) => {
+                    candidate.discard(root, budget).unwrap();
+                    panic!("rechecksummed same-segment Head@2 conflict was admitted")
+                }
+                Err(other) => panic!("wrong same-segment Head@2 conflict result: {other:?}"),
+            }
+        } else {
+            match result {
+                Err(PraxisError::UnsupportedCatalogFeature {
+                    feature: "protected physical-copy bytes await authenticated replay",
+                }) => {}
+                Ok(candidate) => candidate.discard(root, budget).unwrap(),
+                Err(other) => panic!("equal same-segment Head@2 copies were refused: {other:?}"),
+            }
+        }
+        assert_eq!(
+            budget.remaining_bytes(),
+            balance,
+            "private result must refund exactly"
+        );
+        assert_eq!(snapshot(dir.path()), before);
+    });
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn writer_same_segment_cross_block_head_equal_reaches_private_gate() {
+    writer_same_segment_cross_block_head_pair(false);
+}
+
+#[test]
+fn writer_same_segment_cross_block_head_conflict_is_corrupt() {
+    writer_same_segment_cross_block_head_pair(true);
 }
 
 fn compressed_head_copy_fixture(conflicting: bool) -> NextCopyFixture {

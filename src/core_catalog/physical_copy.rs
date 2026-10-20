@@ -1740,9 +1740,10 @@ fn stage_protected_copy_attempt<'a>(
     root: &'a Path,
     manifest: &Manifest,
     budget: &'a mut PhysicalWitnessBudget,
+    limits: CopyProofLimits,
 ) -> Result<(CopyAttempt<'a>, CopyReplayWork)> {
     manifest.validate_v4(root)?;
-    let mut attempt = CopyAttempt::new(root, budget, COPY_PROOF_LIMITS);
+    let mut attempt = CopyAttempt::new(root, budget, limits);
     match collect_protected_segment_candidate(root, manifest, &mut *attempt.budget) {
         Ok(segment) => attempt.segment = Some(segment),
         Err(error) => return attempt.fail(error),
@@ -1847,7 +1848,7 @@ pub(crate) fn collect_protected_copy_ledger(
     manifest: &Manifest,
     budget: &mut PhysicalWitnessBudget,
 ) -> Result<ProtectedCopyLedgerCandidate> {
-    let (attempt, _work) = stage_protected_copy_attempt(root, manifest, budget)?;
+    let (attempt, _work) = stage_protected_copy_attempt(root, manifest, budget, COPY_PROOF_LIMITS)?;
     attempt.fail(pending_replay())
 }
 
@@ -1862,12 +1863,45 @@ pub(crate) fn collect_protected_copy_admission<'a>(
     manifest: &'a Manifest,
     budget: &'a mut PhysicalWitnessBudget,
 ) -> Result<ProtectedCopyAdmissionCandidate<'a>> {
-    let (attempt, work) = stage_protected_copy_attempt(root, manifest, budget)?;
+    collect_protected_copy_admission_with_limits(root, manifest, budget, COPY_PROOF_LIMITS)
+}
+
+fn collect_protected_copy_admission_with_limits<'a>(
+    root: &'a Path,
+    manifest: &'a Manifest,
+    budget: &'a mut PhysicalWitnessBudget,
+    limits: CopyProofLimits,
+) -> Result<ProtectedCopyAdmissionCandidate<'a>> {
+    let (attempt, work) = stage_protected_copy_attempt(root, manifest, budget, limits)?;
     Ok(ProtectedCopyAdmissionCandidate {
         manifest,
         attempt,
         work,
     })
+}
+
+/// Exercise the same private admission path with only lower row/triple caps.
+/// The production entry point always passes COPY_PROOF_LIMITS.
+#[cfg(test)]
+pub(crate) fn collect_protected_copy_admission_with_limits_for_test<'a>(
+    root: &'a Path,
+    manifest: &'a Manifest,
+    budget: &'a mut PhysicalWitnessBudget,
+    max_rows: usize,
+    max_triples: usize,
+) -> Result<ProtectedCopyAdmissionCandidate<'a>> {
+    assert!(max_rows <= MAX_PROTECTED_COPY_ROWS);
+    assert!(max_triples <= MAX_PROTECTED_COPY_TRIPLES);
+    collect_protected_copy_admission_with_limits(
+        root,
+        manifest,
+        budget,
+        CopyProofLimits {
+            max_rows,
+            max_triples,
+            max_metadata_bytes: MAX_COPY_LEDGER_RETAINED_BYTES,
+        },
+    )
 }
 
 #[cfg(test)]
