@@ -4,6 +4,9 @@ pub mod durability;
 pub mod page;
 pub mod record;
 pub mod writer;
+// Read-only v5 wire decoding is staged behind a synthetic, untrusted seam.
+#[allow(dead_code)]
+pub(crate) mod v5_header;
 
 #[cfg(test)]
 mod catalog_witness_tests;
