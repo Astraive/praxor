@@ -10,6 +10,7 @@ enum HeadAdmissionEdge {
     PutWithExpiry,
     Merge,
     Delete,
+    ReservedUnboundCf,
 }
 
 impl HeadAdmissionEdge {
@@ -20,6 +21,7 @@ impl HeadAdmissionEdge {
             }
             Self::PutWithExpiry | Self::Merge => "protected copy has an invalid wire operation",
             Self::Delete => "catalog copy has forbidden Delete",
+            Self::ReservedUnboundCf => "protected copy has no bound role",
         }
     }
 }
@@ -87,8 +89,12 @@ fn writer_head_admission_edge(case: HeadAdmissionEdge) {
         }
         HeadAdmissionEdge::Merge => head.version.value = StoredValue::Merge(valid_head_bytes),
         HeadAdmissionEdge::Delete => head.version.value = StoredValue::Delete,
+        HeadAdmissionEdge::ReservedUnboundCf => {
+            head.cf = ColumnFamily("__praxor_record_unbound_v1".into());
+        }
     }
     let changed_head = head.clone();
+    let changed_cf = changed_head.cf.0.as_str();
 
     // Re-encode all seven rows through the real segment writer with one row
     // per literal block; no raw test patch can bypass its CRC or footer.
@@ -121,7 +127,7 @@ fn writer_head_admission_edge(case: HeadAdmissionEdge) {
         .enumerate()
         .filter(|(_, block)| {
             let row = &block[0].entry;
-            row.cf.0 == CATALOG_CF && row.key.as_ref() == head_key.as_slice()
+            row.cf.0 == changed_cf && row.key.as_ref() == head_key.as_slice()
         })
         .collect::<Vec<_>>();
     assert_eq!(physical_heads.len(), 1);
@@ -175,7 +181,7 @@ fn writer_head_admission_edge(case: HeadAdmissionEdge) {
         assert_eq!(observed.len(), 7);
         let seen = observed
             .iter()
-            .filter(|row| row.cf == CATALOG_CF && row.key == head_key)
+            .filter(|row| row.cf == changed_cf && row.key == head_key)
             .collect::<Vec<_>>();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].source, expected_source);
@@ -183,10 +189,12 @@ fn writer_head_admission_edge(case: HeadAdmissionEdge) {
             (seen[0].block_offset, seen[0].row_ordinal),
             (expected_offset, 0)
         );
-        assert_eq!(
-            seen[0].classification,
+        let expected_class = if matches!(case, HeadAdmissionEdge::ReservedUnboundCf) {
+            PhysicalRowClass::ReservedUnbound
+        } else {
             PhysicalRowClass::BoundProtected(ProtectedRole::Catalog)
-        );
+        };
+        assert_eq!(seen[0].classification, expected_class);
         assert_eq!(seen[0].sequence, changed_head.version.sequence);
         assert_eq!(seen[0].value, expected_value);
         assert_eq!(snapshot(dir.path()), before);
@@ -257,4 +265,9 @@ fn writer_head_merge_refuses_private_admission_and_refunds() {
 #[test]
 fn writer_head_tombstone_refuses_private_admission_and_refunds() {
     writer_head_admission_edge(HeadAdmissionEdge::Delete);
+}
+
+#[test]
+fn writer_reserved_unbound_cf_refuses_private_admission_and_refunds() {
+    writer_head_admission_edge(HeadAdmissionEdge::ReservedUnboundCf);
 }
