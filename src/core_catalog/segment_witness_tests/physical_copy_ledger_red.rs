@@ -1451,6 +1451,139 @@ fn staged_private_candidate_rechecks_segment_mutation_and_refunds() {
     assert_eq!(snapshot(fixture.dir.path()), fixture.before);
 }
 
+#[test]
+fn writer_equal_copy_segment_collection_refuses_unlisted_entry_at_final_fence() {
+    let fixture = next_copy_fixture(NextCopyCase::IdenticalAllocator);
+    let root = fixture.lease.root();
+    let extra_path = DiskLayout::at(root).segment_path(1, 3);
+    assert!(!extra_path.exists());
+    assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+    let held = File::open(&fixture.second_path).unwrap();
+    let held_identity = physical_id(&held, &fixture.second_path).unwrap();
+    assert_eq!(
+        fs::read(&fixture.second_path).unwrap(),
+        fixture.second_bytes
+    );
+
+    with_wal_budget(root, &fixture.manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let mut injected = false;
+        // This deterministic seam is the segment collector's final namespace
+        // check, upstream of private copy admission. The whole copy collector
+        // has no in-flight injection hook.
+        let error = match collect_protected_segment_candidate_for_test(
+            root,
+            &fixture.manifest,
+            budget,
+            PROTECTED_STAGE_LIMITS,
+            |count| {
+                if count == 8 {
+                    assert!(!injected, "the final protected row must stage once");
+                    fs::copy(&fixture.second_path, &extra_path).unwrap();
+                    injected = true;
+                    assert_eq!(fs::read(&extra_path).unwrap(), fixture.second_bytes);
+                    assert_eq!(
+                        physical_id(&held, &fixture.second_path).unwrap(),
+                        held_identity
+                    );
+                }
+                Ok(())
+            },
+        ) {
+            Err(error) => error,
+            Ok(candidate) => {
+                candidate.discard(root, budget).unwrap();
+                panic!("an unlisted segment exposed a protected collection candidate")
+            }
+        };
+        assert!(injected, "the injection must follow all eight staged rows");
+        assert!(matches!(
+            error,
+            PraxisError::Corrupt { path, reason }
+                if path == extra_path && reason == "unlisted v4 segment during final recheck"
+        ));
+        assert_eq!(budget.remaining_bytes(), balance, "collection refund");
+        assert_eq!(
+            physical_id(&held, &fixture.second_path).unwrap(),
+            held_identity
+        );
+        assert_eq!(
+            fs::read(&fixture.second_path).unwrap(),
+            fixture.second_bytes
+        );
+        assert_ne!(snapshot(fixture.dir.path()), fixture.before);
+        fs::remove_file(&extra_path).unwrap();
+        assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+    });
+    drop(held);
+    assert!(matches!(
+        inspect_v4_owner(&fixture.lease, &fixture.config, &CpuAccelerator),
+        Err(PraxisError::UnsupportedCatalogFeature {
+            feature: "v4 installed cut beyond narrow D0 bootstrap"
+        })
+    ));
+    assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+}
+
+#[test]
+fn writer_equal_copy_consumption_refuses_unlisted_segment_and_refunds() {
+    let fixture = next_copy_fixture(NextCopyCase::IdenticalAllocator);
+    let root = fixture.lease.root();
+    let extra_path = DiskLayout::at(root).segment_path(1, 3);
+    assert!(!extra_path.exists());
+    assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+    let held = File::open(&fixture.second_path).unwrap();
+    let held_identity = physical_id(&held, &fixture.second_path).unwrap();
+    assert_eq!(
+        fs::read(&fixture.second_path).unwrap(),
+        fixture.second_bytes
+    );
+
+    with_wal_budget(root, &fixture.manifest, |budget| {
+        let balance = budget.remaining_bytes();
+        let candidate = collect_protected_copy_admission(root, &fixture.manifest, budget)
+            .expect("two authenticated equal Allocator copies must stage");
+        fs::copy(&fixture.second_path, &extra_path).unwrap();
+        assert_eq!(fs::read(&extra_path).unwrap(), fixture.second_bytes);
+        assert_eq!(
+            physical_id(&held, &fixture.second_path).unwrap(),
+            held_identity
+        );
+        let error = match candidate.consume() {
+            Err(error) => error,
+            Ok(ledger) => {
+                drop(ledger);
+                panic!("an unlisted segment exposed a private consumed ledger")
+            }
+        };
+        assert!(matches!(
+            error,
+            PraxisError::Corrupt { path, reason }
+                if path == extra_path && reason == "unlisted v4 segment during copy replay"
+        ));
+        assert_eq!(budget.remaining_bytes(), balance, "consumption refund");
+        assert_eq!(
+            physical_id(&held, &fixture.second_path).unwrap(),
+            held_identity
+        );
+        assert_eq!(
+            fs::read(&fixture.second_path).unwrap(),
+            fixture.second_bytes
+        );
+        assert_ne!(snapshot(fixture.dir.path()), fixture.before);
+        fs::remove_file(&extra_path).unwrap();
+        assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+    });
+    drop(held);
+    assert!(matches!(
+        inspect_v4_owner(&fixture.lease, &fixture.config, &CpuAccelerator),
+        Err(PraxisError::UnsupportedCatalogFeature {
+            feature: "v4 installed cut beyond narrow D0 bootstrap"
+        })
+    ));
+    assert_eq!(snapshot(fixture.dir.path()), fixture.before);
+}
+
 #[derive(Clone, Copy)]
 enum CandidateBoundary {
     ConsumptionCap,
