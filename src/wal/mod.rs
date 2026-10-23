@@ -10,6 +10,9 @@ pub(crate) mod v5_header;
 // Synthetic, read-only typed-frame seam. No WAL owner or repair path calls it.
 #[allow(dead_code)]
 pub(crate) mod v5_frame;
+// Read-only active-tail classification remains sealed from WAL repair and owners.
+#[allow(dead_code)]
+pub(crate) mod v5_tail;
 
 #[cfg(test)]
 mod catalog_witness_tests;
