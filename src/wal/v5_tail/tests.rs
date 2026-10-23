@@ -76,6 +76,35 @@ fn inspect(
     inspect_installed_v5_wal(image, descriptor, state, required_sequence_through)
 }
 
+fn set_frame_payload_len(frame: &mut [u8], payload_len: u32) {
+    frame[8..12].copy_from_slice(&(payload_len + 100).to_le_bytes());
+    frame[28..32].copy_from_slice(&payload_len.to_le_bytes());
+}
+
+// Independent bitwise reference, not the historical IEEE checksum alias.
+fn crc32c_reference(bytes: &[u8]) -> u32 {
+    let mut crc = !0_u32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0x82f6_3b78 & (0_u32.wrapping_sub(crc & 1)));
+        }
+    }
+    !crc
+}
+
+fn reseal_frame(frame: &mut [u8], context: &FrameContext) {
+    let crc_at = frame.len() - 36;
+    let crc = crc32c_reference(&frame[..crc_at]);
+    frame[crc_at..crc_at + 4].copy_from_slice(&crc.to_le_bytes());
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"praxor/wal-frame/v5");
+    hasher.update(&context.header_digest);
+    hasher.update(&context.previous_hash);
+    hasher.update(&frame[..crc_at + 4]);
+    frame[crc_at + 4..].copy_from_slice(hasher.finalize().as_bytes());
+}
+
 #[test]
 fn every_cut_of_all_four_frozen_frames_has_exact_active_status() {
     let vectors = vectors();
@@ -407,5 +436,232 @@ fn required_retained_sequence_cannot_be_hidden_by_a_terminal_prefix() {
         ),
         TailInspection::Corrupt,
         "required S2 cannot disappear at a clean EOF either"
+    );
+}
+
+#[test]
+fn visible_h64_chain_kind_and_reserved_conflicts_refuse_as_prefixes() {
+    let vectors = vectors();
+    let descriptor = descriptor(&vectors);
+    let header = header(&vectors);
+    let record = frame(&vectors, "record_bootstrap");
+    let user = frame(&vectors, "user_put");
+
+    for (name, source, cut, offset, replacement, prior, required) in [
+        ("version", &record, 5, 4, 0, None, 0),
+        ("flags", &record, 7, 6, 1, None, 0),
+        ("kind", &record, 21, 20, 0xff, None, 0),
+        ("reserved", &record, 22, 21, 1, None, 0),
+        ("sequence", &user, 13, 12, 3, Some(&record), 1),
+        ("previous hash", &user, 33, 32, 0, Some(&record), 1),
+    ] {
+        let mut bad = source[..cut].to_vec();
+        assert_ne!(bad[offset], replacement, "{name} mutation is effective");
+        bad[offset] = replacement;
+        let prior = prior.map_or(&[][..], Vec::as_slice);
+        assert_eq!(
+            inspect(
+                &image(&header, prior, &bad),
+                &descriptor,
+                InstalledWalState::Active,
+                required,
+            ),
+            TailInspection::Corrupt,
+            "{name} visible at cut {cut} cannot become a canonical H64"
+        );
+    }
+}
+
+#[test]
+fn operation_prefix_residues_and_utf8_feasibility_are_decided_jointly() {
+    let vectors = vectors();
+    let descriptor = descriptor(&vectors);
+    let header = header(&vectors);
+    let record = frame(&vectors, "record_bootstrap");
+    let user = frame(&vectors, "user_put");
+
+    for (name, cut, start, bytes) in [
+        ("wrong first ordinal", 69, 68, &[1][..]),
+        ("unknown operation tag", 73, 72, &[0xff][..]),
+        ("zero generation", 81, 73, &[0; 8][..]),
+        ("invalid UTF-8 lead", 84, 83, &[0xff][..]),
+    ] {
+        let mut bad = user[..cut].to_vec();
+        bad[start..start + bytes.len()].copy_from_slice(bytes);
+        assert_eq!(
+            inspect(
+                &image(&header, &record, &bad),
+                &descriptor,
+                InstalledWalState::Active,
+                1,
+            ),
+            TailInspection::Corrupt,
+            "{name} cannot be completed even before the payload ends"
+        );
+    }
+
+    let mut unfinishable_utf8 = user[..84].to_vec();
+    assert_eq!(&unfinishable_utf8[81..83], &1_u16.to_le_bytes());
+    unfinishable_utf8[83] = 0xc3;
+    assert_eq!(
+        inspect(
+            &image(&header, &record, &unfinishable_utf8),
+            &descriptor,
+            InstalledWalState::Active,
+            1,
+        ),
+        TailInspection::Corrupt,
+        "a valid UTF-8 lead cannot finish within a one-byte name"
+    );
+
+    let mut extendable_utf8 = user[..84].to_vec();
+    set_frame_payload_len(&mut extendable_utf8, 31);
+    extendable_utf8[81..83].copy_from_slice(&2_u16.to_le_bytes());
+    extendable_utf8[83] = 0xc3;
+    assert_eq!(
+        inspect(
+            &image(&header, &record, &extendable_utf8),
+            &descriptor,
+            InstalledWalState::Active,
+            1,
+        ),
+        TailInspection::EligibleTerminalPrefix {
+            complete_frames: 1,
+            prefix_len: 84,
+        },
+        "one visible multibyte lead can be completed within the name length"
+    );
+
+    let mut impossible_key_len = user[..87].to_vec();
+    set_frame_payload_len(&mut impossible_key_len, 1_048_606);
+    impossible_key_len[84..87].copy_from_slice(&[1, 0, 16]);
+    assert_eq!(
+        inspect(
+            &image(&header, &record, &impossible_key_len),
+            &descriptor,
+            InstalledWalState::Active,
+            1,
+        ),
+        TailInspection::Corrupt,
+        "LE key-length residue 1,048,577 exceeds the 1-MiB cap"
+    );
+
+    let mut impossible_value_budget = user[..93].to_vec();
+    set_frame_payload_len(&mut impossible_value_budget, 67_108_864);
+    impossible_value_budget[89..93].copy_from_slice(&67_108_865_u32.to_le_bytes());
+    assert_eq!(
+        inspect(
+            &image(&header, &record, &impossible_value_budget),
+            &descriptor,
+            InstalledWalState::Active,
+            1,
+        ),
+        TailInspection::Corrupt,
+        "visible value length cannot fit inside the 64-MiB payload cap"
+    );
+}
+
+#[test]
+fn complete_resealed_bad_control_and_operation_never_become_terminal_tears() {
+    let vectors = vectors();
+    let descriptor = descriptor(&vectors);
+    let header = header(&vectors);
+    let record = frame(&vectors, "record_bootstrap");
+    let user = frame(&vectors, "user_put");
+    let first_context = FrameContext {
+        header_digest: descriptor.header_digest,
+        previous_hash: descriptor.header_digest,
+        expected_sequence: 1,
+        database_id: descriptor.database_id,
+    };
+    let next_context = FrameContext {
+        header_digest: descriptor.header_digest,
+        previous_hash: record[record.len() - 32..].try_into().expect("trailer"),
+        expected_sequence: 2,
+        database_id: descriptor.database_id,
+    };
+
+    let mut unchanged_record = record.clone();
+    reseal_frame(&mut unchanged_record, &first_context);
+    assert_eq!(unchanged_record, record, "resealer matches frozen S1 bytes");
+    let mut unchanged_user = user.clone();
+    reseal_frame(&mut unchanged_user, &next_context);
+    assert_eq!(unchanged_user, user, "resealer matches frozen S2 bytes");
+
+    let mut bad_control = record.clone();
+    bad_control[74] = 0xff; // PRR1 control kind is closed.
+    reseal_frame(&mut bad_control, &first_context);
+    assert_eq!(
+        inspect(
+            &image(&header, &[], &bad_control),
+            &descriptor,
+            InstalledWalState::Active,
+            0,
+        ),
+        TailInspection::Corrupt,
+        "a complete hash-valid frame with unknown control kind is corrupt"
+    );
+
+    let mut bad_operation = user.clone();
+    bad_operation[72] = 0xff; // Ordinary operation tag is closed.
+    reseal_frame(&mut bad_operation, &next_context);
+    assert_eq!(
+        inspect(
+            &image(&header, &record, &bad_operation),
+            &descriptor,
+            InstalledWalState::Active,
+            1,
+        ),
+        TailInspection::Corrupt,
+        "a complete hash-valid frame with unknown operation is corrupt"
+    );
+
+    let mut bad_trailer = record;
+    let trailer_at = bad_trailer.len() - 32;
+    bad_trailer[trailer_at] ^= 1;
+    assert_eq!(
+        inspect(
+            &image(&header, &[], &bad_trailer),
+            &descriptor,
+            InstalledWalState::Active,
+            0,
+        ),
+        TailInspection::Corrupt,
+        "a complete bad trailer is not an eligible prefix"
+    );
+}
+
+#[test]
+fn impossible_h64_count_and_payload_cap_refuse_without_body_allocation() {
+    let vectors = vectors();
+    let descriptor = descriptor(&vectors);
+    let header = header(&vectors);
+    let record = frame(&vectors, "record_bootstrap");
+    let user = frame(&vectors, "user_put");
+
+    let mut impossible_count = user[..64].to_vec();
+    set_frame_payload_len(&mut impossible_count, 4);
+    assert_eq!(
+        inspect(
+            &image(&header, &record, &impossible_count),
+            &descriptor,
+            InstalledWalState::Active,
+            1,
+        ),
+        TailInspection::Corrupt,
+        "one ordinary operation cannot fit in a four-byte payload"
+    );
+
+    let mut oversized = user[..64].to_vec();
+    set_frame_payload_len(&mut oversized, 67_108_865);
+    assert_eq!(
+        inspect(
+            &image(&header, &record, &oversized),
+            &descriptor,
+            InstalledWalState::Active,
+            1,
+        ),
+        TailInspection::Corrupt,
+        "a 64-MiB-plus-one payload is impossible without allocating it"
     );
 }
