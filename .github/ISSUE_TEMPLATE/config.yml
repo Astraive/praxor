@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+- name: Contribution workflow
+  url: https://github.com/Astraive/praxor/blob/main/GIT.md
+  about: Read the repo-specific issue, specification, PR and verification policy.
+- name: Unified SuperDB roadmap
+  url: https://github.com/Astraive/poiesis/issues/8
+  about: Find the owning repository and existing work before creating a duplicate.

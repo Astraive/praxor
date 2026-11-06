@@ -1,0 +1,208 @@
+name: Specification or investigation
+description: Specification or investigation with scope, acceptance, verification and native delivery tracking.
+title: '[PRX-AREA-N] '
+labels:
+- type:spike
+- needs-spec
+projects:
+- Astraive/2
+type: Task
+body:
+- type: markdown
+  attributes:
+    value: Read [GIT.md](https://github.com/Astraive/praxor/blob/main/GIT.md). Use a real parent and prerequisite
+      URL; maintainers must set native relationships, actual labels, milestone and Project fields after submission.
+      Form answers alone do not configure those properties.
+- type: input
+  id: ticket
+  attributes:
+    label: Ticket ID
+    description: Allocate an unused canonical ID; search existing open and closed issues first.
+    placeholder: PRX-AREA-N
+  validations:
+    required: true
+- type: input
+  id: parent
+  attributes:
+    label: Parent issue
+    description: Actual GitHub issue URL, or explain why this is a top-level roadmap.
+  validations:
+    required: true
+- type: dropdown
+  id: type
+  attributes:
+    label: Type
+    description: Maintainers mirror this answer into native metadata; XL requires bounded sub-issues.
+    options:
+    - feature
+    - task
+    - spike
+    - chore
+    - docs
+    - test
+    - epic
+    - bug
+  validations:
+    required: true
+- type: dropdown
+  id: priority
+  attributes:
+    label: Priority
+    description: Maintainers mirror this answer into native metadata; XL requires bounded sub-issues.
+    options:
+    - P0
+    - P1
+    - P2
+    - P3
+  validations:
+    required: true
+- type: dropdown
+  id: size
+  attributes:
+    label: Size
+    description: Maintainers mirror this answer into native metadata; XL requires bounded sub-issues.
+    options:
+    - S
+    - M
+    - L
+    - XL
+  validations:
+    required: true
+- type: dropdown
+  id: milestone
+  attributes:
+    label: Milestone
+    description: Maintainers mirror this answer into native metadata; XL requires bounded sub-issues.
+    options:
+    - M0 · Foundation and ownership
+    - M1 · Single-node correctness
+    - M2 · Relational and SQL
+    - M3 · Multimodel and hybrid retrieval
+    - M4 · Integrated versioning
+    - M5 · Operations and clients
+    - M6 · Distributed and managed operation
+    - M7 · Release validation and comparison
+  validations:
+    required: true
+- type: input
+  id: area
+  attributes:
+    label: Area
+    description: 'Choose an existing area:* label. Owning surfaces: storage, transactions, query compilation, catalog,
+      retrieval and replication'
+  validations:
+    required: true
+- type: dropdown
+  id: platform
+  attributes:
+    label: Platforms
+    description: Select real required verification targets.
+    options:
+    - all
+    - windows
+    - linux
+    - macos
+    - web
+    - wasm
+    multiple: true
+  validations:
+    required: true
+- type: textarea
+  id: summary
+  attributes:
+    label: Summary
+    description: What concrete outcome does this issue deliver?
+  validations:
+    required: true
+- type: textarea
+  id: why
+  attributes:
+    label: Why it matters
+    description: Impact and the named delivery gate this affects.
+  validations:
+    required: true
+- type: textarea
+  id: context
+  attributes:
+    label: Context
+    description: Pinned revision, source/report evidence, current behavior and owner.
+  validations:
+    required: true
+- type: textarea
+  id: scope
+  attributes:
+    label: Scope
+    description: Separate in-scope and out-of-scope behavior; name every public boundary.
+  validations:
+    required: true
+- type: textarea
+  id: requirements
+  attributes:
+    label: Requirements
+    description: Number testable requirements, limits, errors and unresolved decisions.
+  validations:
+    required: true
+- type: textarea
+  id: decisions
+  attributes:
+    label: Decisions and alternatives
+    description: Considered alternatives, chosen contract, unresolved questions and approval needed.
+  validations:
+    required: true
+- type: textarea
+  id: technical
+  attributes:
+    label: Technical notes
+    description: Actual/proposed files, versions, compatibility, failure/authority boundaries and risks.
+  validations:
+    required: true
+- type: textarea
+  id: where
+  attributes:
+    label: Where to look
+    description: Verified current file/interface hints; distinguish proposed paths.
+  validations:
+    required: true
+- type: textarea
+  id: assets
+  attributes:
+    label: Assets and fixtures
+    description: Reproducible valid/invalid inputs and expected outcomes; say none when appropriate.
+  validations:
+    required: true
+- type: textarea
+  id: acceptance
+  attributes:
+    label: Acceptance criteria
+    description: Checkbox outcomes with independently observable evidence.
+  validations:
+    required: true
+- type: textarea
+  id: tests
+  attributes:
+    label: Test plan
+    description: Positive, negative, boundary/fault and integration checks; exact commands when known.
+  validations:
+    required: true
+- type: textarea
+  id: references
+  attributes:
+    label: References
+    description: Clickable spec, source, issue and authoritative external documentation links.
+  validations:
+    required: true
+- type: textarea
+  id: dependencies
+  attributes:
+    label: Dependencies
+    description: Depends on and unblocks, with actual URLs and the artifact each edge requires. Native blockers
+      must match.
+  validations:
+    required: true
+- type: textarea
+  id: tracking
+  attributes:
+    label: Tracking
+    description: 'Parent/roadmap URLs, Project #2, milestone, owner and affected docs.'
+  validations:
+    required: true

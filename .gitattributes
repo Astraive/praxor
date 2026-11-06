@@ -1,1 +1,8 @@
 scripts/run_write_matrix_linux_probe.sh text eol=lf
+
+# Portable governance hooks need a valid POSIX shebang on every checkout.
+.githooks/* text eol=lf
+.gitattributes text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+*.md text eol=lf

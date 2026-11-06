@@ -1,5 +1,46 @@
 # Praxis Engine and Storage Kernel Architecture
 
+## Current authority and readiness checkpoint
+
+This architecture preserves the existing detailed design below. Design targets and
+research directions are not a readiness matrix. The current capability map is
+[status and roadmap](status-roadmap.md), with build/review guidance in
+[development](development.md) and [GIT.md](../GIT.md).
+
+At merged main `4a276cfaca0ee6291f965f8788e0d8ca905c7682` (read 2026-11-06):
+
+- The repository is Praxor; Cargo package/library/binary remain `praxis`.
+- Praxor owns parser, binder, logical representation, planner, executor, semantic
+  catalog and storage. Poiesis owns runtime/session/auth/protocol context;
+  optional PoiesisQL tooling consumes engine contracts. No sibling engine
+  dependency or second canonical compiler is introduced.
+- Fresh v3 `CoreDatabase` and its record/service views share one writer and
+  commit authority. Retained record snapshots are owner-bound process-local
+  capabilities, not durable Pit roots or numeric historical selectors.
+- Q1 is a bounded typed SELECT/filter/projection compiler against a process-local
+  catalog. Q2 is a fallible retained-view gateway for controlled v1 fixture
+  documents. Its production acceleration backend remains unavailable/scan-only;
+  synthetic acceleration tests do not qualify a maintained durable scalar index.
+- `CatalogDatabase` entry points currently fail closed. Private v4 catalog
+  codecs/witnesses do not establish writable CREATE, schema-bound rows or DML.
+  The [catalog operation](https://github.com/Astraive/praxor/issues/63) retains
+  its own physical-admission and publication gates.
+- PVD1, H80 and H64 are bounded read-only decoders. They grant no v5 writer,
+  replay, repair, installed-effect, owner or ancestry authority. See the
+  [PVD1](provenance/pvd1-directory-v1.md),
+  [H80](provenance/wal-v5-h80.md) and [H64](provenance/wal-v5-h64.md) contracts.
+- Core numeric RIDs, page RIDs and logical document IDs are distinct domains.
+  Shared visibility requires reviewed adapters, not casts or string joins.
+- The retained live core, pointer and page protocols still have separate
+  compatibility/admission rules. A unified destination is not permission to
+  delete a live owner or combine its WAL with another protocol.
+
+[PR 103](https://github.com/Astraive/praxor/pull/103) was open and draft at this
+checkpoint; its completion document is not merged evidence. Broader catalog,
+page publication, provenance, legacy migration, integrated history, full
+relational/multimodel execution and distributed rollout remain separately gated.
+
+
 Page primitive ownership and v1 compatibility are documented in [Page database ownership](page-record-ownership.md).
 
 Astraive/praxor (package `praxis`) owns the canonical query semantic pipeline
@@ -343,7 +384,7 @@ Production storage paths must use `slog` only.
 - Include `request_id`, `operation`, `record_id`, `snapshot_id`, `segment_id`, `index_type`, `duration_ms`, `bytes_read`, `bytes_written`, `rows_scanned`, `backend`, `fallback_used`, `outcome`, and `error_code` when applicable.
 - Measure latency, amplification, IO cost, memory cost, CPU cost, cache behavior, and background-work budgets.
 
-## Implementation Roadmap
+## Design roadmap (targets, not readiness evidence)
 
 ### Short Term
 
