@@ -10,5 +10,5 @@
 - Preserve wire, storage, and recovery invariants; unsupported paths must fail explicitly rather than route through a legacy fallback.
 - Use locked Rust dependencies, two build jobs, and an explicit target directory on D: or F:; record the exact revision, command, and result.
 - Verify durability, recovery, and performance only with the required fault/restart or benchmark evidence.
-- Set author and committer to NeerajCodz <neerajcodz@gmail.com>; use type(scope): message and no co-author trailers.
+- Use your own accurate Git identity and type(scope): message subjects; standard co-author trailers are allowed for accurate shared credit.
 - Follow GIT.md for review and normal merge rules; update status claims only from verified evidence.

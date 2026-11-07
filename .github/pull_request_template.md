@@ -25,6 +25,6 @@ Describe affected formats/APIs/platforms, migration or rollback, resource limits
 ## Delivery checklist
 
 - [ ] The approved spec, issue criteria and affected docs match this diff.
-- [ ] Author and committer are NeerajCodz <neerajcodz@gmail.com>; every new subject is type(scope): message; no co-author trailers.
+- [ ] Commit subjects use type(scope): message and author/co-author credits are accurate.
 - [ ] Required checks and independent review pass at the current head; intentional RED or incomplete work stays draft.
 - [ ] Normal two-parent merge retains exact project attribution; close only verified scope, update Project #2 and delete the completed branch.

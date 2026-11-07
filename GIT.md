@@ -68,27 +68,13 @@ Implement the approved leaf in bounded commits. Keep tests independent enough to
 
 Update the specification if implementation changes the contract. Do not mark it Implemented while requirements or current-head verification remain open. Mark superseded designs explicitly and link their replacement; retain historical evidence with its original revision and limitations.
 
-## Commit identity and messages
+## Commit authorship and messages
 
-Every new commit must have **both author and committer** exactly:
+Use your own accurate Git author and committer identity. This repository does not pin commit identity to one person. Standard Co-authored-by trailers are allowed and should accurately credit collaborators who contributed.
 
-```text
-NeerajCodz <neerajcodz@gmail.com>
-```
+Keep commit subjects in type(scope): message form, with a focused scope and a clear result. Keep subjects within 120 characters. Use a BREAKING CHANGE footer when a public contract changes incompatibly. A ticket or issue link in the body is useful when the change belongs to tracked work.
 
-Configure this repository locally and verify the resulting commit object:
-
-```sh
-git config --local user.name NeerajCodz
-git config --local user.email neerajcodz@gmail.com
-git var GIT_AUTHOR_IDENT
-git var GIT_COMMITTER_IDENT
-```
-
-Do not add `Co-authored-by` trailers. Do not rewrite unrelated existing history to satisfy this rule. Resolve an identity mismatch before creating a new commit. Server-side merges are forbidden for this authorized work. Construct the normal merge locally and verify its exact author and committer.
-
-Use substantive conventional subjects: `fix(wal): reject inconsistent frame lengths`, `feat(query): retain one fallible read view`, `test(records): cover final-pin reclamation`, `docs(status): distinguish decoders from writer readiness`. The subject describes behavior, not a vague activity such as “updates.” The body explains material rationale and evidence when useful.
-
+Check git var GIT_AUTHOR_IDENT and git var GIT_COMMITTER_IDENT if you need to confirm the identity Git will use. Do not fabricate contributor attribution.
 ## Checks and pull requests
 
 Run the repository governance checks included with this workflow:
@@ -106,15 +92,17 @@ Record the tested head, tree, toolchain, platform and command exit statuses. A l
 
 ## Normal merges only
 
-Merge reviewed, passing changes with a normal **two-parent merge commit**. Do not squash, rebase-merge, force-update main or bypass required checks. Verify that the merge parents are the intended base and reviewed feature head, the merge tree contains the approved changes, and author/committer identity matches the required values without coauthor trailers.
+Use a normal merge commit that preserves the reviewed commits; do not squash, rebase-merge or force-update the default branch. Check the current base, reviewed head, merge tree and required checks before integration. Respect branch protection and do not bypass a failed or missing required check.
 
-After merge, confirm the default branch contains the expected commit and inspect relevant current-head checks. Update native relationships, project Status/Spec status and issue acceptance based on what actually shipped. Preserve open parent/release gates when only one bounded slice completed.
+After integration, confirm the default branch contains the intended tree, record the actual result, update native issue relationships and Project fields, and close only the bounded acceptance scope that is complete.
+## Pull requests, direct pushes and hooks
 
+Routine implementation work uses an issue-linked pull request with the real specification, dependencies, acceptance criteria, validation commands/results and known limitations. Attach each PR to its issue and Project #2 where applicable. Use closing keywords only for the complete scope delivered by that PR.
 
-## Identity-preserving integration procedure
+A maintainer may explicitly authorize a focused non-force direct push for documentation or governance work. That exception never overrides branch protection, required checks or the need to preserve unrelated work. Never use force-push to replace reviewed history.
 
-This authorized project work uses a locally authored normal two-parent merge. Do not use the web merge button, `gh pr merge`, squash or rebase-merge: a hosting service can substitute its own committer. Use a clean isolated integration worktree and the reviewed PR head. Fetch main, verify the exact current head's checks and independent review, then create the merge with both Git identities set to NeerajCodz <neerajcodz@gmail.com> and a conventional subject such as `chore(merge): integrate verified documentation`.
+The normal integration is a non-squash merge commit. After it, verify the published default branch and PR state, update issue and Project fields, and delete only a fully merged remote branch. Preserve unfinished branches and dirty worktrees.
 
-Compare the merge tree with the reviewed intended result. Push the merge to main without force only if the fetched base is still current; a rejected non-fast-forward push requires a fresh integration and revalidation. Respect server protections; if the authorized identity-preserving route is rejected, report it rather than bypassing required checks. Read back the published tree, author, committer, PR merged state and resulting checks. Update native issue/Project state and delete the completed remote branch with `gh api --method DELETE repos/OWNER/REPO/git/refs/heads/BRANCH` only after confirming its PR is merged. Preserve unfinished branches and dirty worktrees.
+The commit-msg hook requires Python 3.12+. In a standalone checkout, configure it with git config core.hooksPath .githooks. For a linked worktree, avoid changing shared configuration unless that effect is intended; a command-scoped setting such as git -c core.hooksPath=.githooks commit can use the repository hook for one commit. Run python scripts/governance.py check and python scripts/governance.py self-test when your change or the contribution foundation requires those checks. The validator checks message shape and contribution metadata; it does not restrict author/committer identity or standard co-author trailers. Keep subjects within 120 characters.
 
-The commit-msg hook requires Python 3.12+. In a standalone checkout use `git config core.hooksPath .githooks`; in a linked worktree with worktree configuration enabled use `git config --worktree core.hooksPath .githooks` to avoid changing another checkout. Run `python scripts/governance.py self-test` and `python scripts/governance.py check`; CI additionally checks only the new base-to-head commit range and PR issue/spec/evidence metadata. Keep the subject within 120 characters. Metadata forms request Project #2 automatically only when their submitter can write that project; maintainers verify actual membership and fields for every issue.
+Issue forms can add an item to Project #2 only when the submitter has permission to edit that project. Verify the actual project item, fields, milestone and native issue relationships instead of assuming a form request succeeded.

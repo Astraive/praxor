@@ -12,7 +12,6 @@ import unittest
 from urllib.parse import unquote, urlsplit
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-IDENTITY = ('NeerajCodz', 'neerajcodz@gmail.com')
 REPOSITORY = 'Astraive/praxor'
 GOVERNANCE_ISSUE_URL = 'https://github.com/Astraive/praxor/issues/104'
 GOVERNANCE_TICKET = 'PRX-GOV-001'
@@ -24,24 +23,15 @@ ISSUE = re.compile(r'https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/
 def git(*args):
     return subprocess.check_output(['git', *args], cwd=ROOT, text=True, encoding='utf-8').strip()
 
-def message_errors(message, author=None, committer=None):
-    lines=message.lstrip('\ufeff').splitlines()
-    subject=lines[0] if lines else ''
-    errors=[]
-    if not HEADER.fullmatch(subject) or len(subject)>120:
+def message_errors(message):
+    lines = message.lstrip('\ufeff').splitlines()
+    subject = lines[0] if lines else ''
+    errors = []
+    if not HEADER.fullmatch(subject) or len(subject) > 120:
         errors.append('Use type(scope): message, at most 120 characters in the subject.')
-    if re.search(r'^\s*co-authored-by\s*:',message,re.I|re.M):
-        errors.append('Co-author trailers are not allowed for this project work.')
-    for label,ident in [('author',author),('committer',committer)]:
-        if ident is not None and tuple(ident)!=IDENTITY:
-            errors.append('New '+label+' must be NeerajCodz <neerajcodz@gmail.com>.')
     return errors
 
-def identity(kind):
-    value=git('var','GIT_'+kind+'_IDENT')
-    match=re.fullmatch(r'(.*) <([^<>]+)> \d+ [+-]\d{4}',value)
-    if not match:raise ValueError('Cannot read Git '+kind.lower()+' identity')
-    return match[1],match[2]
+
 
 def pr_errors(title,body):
     errors=message_errors(title)
@@ -101,7 +91,7 @@ def markdown_targets(content):
 
 def documentation_errors(root):
     errors=[]
-    required=['README.md','GIT.md','AGENTS.md','docs/architecture.md','docs/development.md','docs/status-roadmap.md','docs/specs/README.md','docs/specs/TEMPLATE.md']
+    required=['README.md','CONTRIBUTING.md','GIT.md','AGENTS.md','docs/architecture.md','docs/development.md','docs/status-roadmap.md','docs/specs/README.md','docs/specs/TEMPLATE.md']
     for relative in required:
         if not (root/relative).is_file():errors.append('Missing required documentation: '+relative)
     agents=root/'AGENTS.md'
@@ -126,8 +116,8 @@ def check(base=None,head='HEAD',event=None):
             if not re.fullmatch(r'[0-9a-fA-F]{40,64}|HEAD',revision):raise ValueError('Expected a full Git revision')
         commits=git('rev-list','--reverse',base+'..'+head).splitlines()
         for sha in commits:
-            values=git('show','-s','--format=%an%n%ae%n%cn%n%ce%n%B',sha).splitlines()
-            errors.extend(sha[:12]+': '+e for e in message_errors('\n'.join(values[4:]),values[:2],values[2:4]))
+            message = git('show', '-s', '--format=%B', sha)
+            errors.extend(sha[:12] + ': ' + error for error in message_errors(message))
     if event:
         payload=json.loads(pathlib.Path(event).read_text(encoding='utf-8'))
         pr=payload.get('pull_request')
@@ -136,36 +126,57 @@ def check(base=None,head='HEAD',event=None):
 
 class GovernanceTests(unittest.TestCase):
     def test_actual_hook_in_checkout_with_spaces(self):
-        hook=ROOT/'.githooks/commit-msg'
-        if not hook.is_file():self.skipTest('Hook is installed by the contribution foundation.')
-        shell=shutil.which('sh')
-        if not shell and os.name=='nt':
-            candidate=pathlib.Path(shutil.which('git')).parents[1]/'bin/sh.exe'
-            if candidate.is_file():shell=str(candidate)
-        if not shell:self.fail('POSIX sh/Git Bash is required for the hook fixture.')
+        hook = ROOT / '.githooks/commit-msg'
+        if not hook.is_file():
+            self.skipTest('Hook is installed by the contribution foundation.')
+        shell = shutil.which('sh')
+        if not shell and os.name == 'nt':
+            candidate = pathlib.Path(shutil.which('git')).parents[1] / 'bin/sh.exe'
+            if candidate.is_file():
+                shell = str(candidate)
+        if not shell:
+            self.fail('POSIX sh/Git Bash is required for the hook fixture.')
         with tempfile.TemporaryDirectory(prefix='governance hook fixture ') as folder:
-            target=pathlib.Path(folder)
-            subprocess.run(['git','init','-q',str(target)],check=True,capture_output=True)
-            (target/'scripts').mkdir();(target/'.githooks').mkdir()
-            shutil.copyfile(__file__,target/'scripts/governance.py');shutil.copyfile(hook,target/'.githooks/commit-msg')
-            message=target/'commit message.txt'
-            env=dict(os.environ,GIT_AUTHOR_NAME=IDENTITY[0],GIT_AUTHOR_EMAIL=IDENTITY[1],GIT_COMMITTER_NAME=IDENTITY[0],GIT_COMMITTER_EMAIL=IDENTITY[1])
-            cases=[('docs(governance): verify hook\r\n',0,False),('update docs\n',1,False),('docs(git): rules\n\nCo-authored-by: Somebody <somebody@example.invalid>\n',1,False),('docs(git): rules\n',1,True)]
-            for text,wanted,wrong_committer in cases:
-                message.write_bytes(text.encode())
-                case_env=dict(env)
-                if wrong_committer:case_env['GIT_COMMITTER_NAME']='GitHub'
-                result=subprocess.run([shell,str(target/'.githooks/commit-msg'),str(message)],cwd=target,env=case_env,capture_output=True,text=True)
-                with self.subTest(text=text,wrong_committer=wrong_committer):self.assertEqual(result.returncode,wanted,result.stderr)
+            target = pathlib.Path(folder)
+            subprocess.run(['git', 'init', '-q', str(target)], check=True, capture_output=True)
+            (target / 'scripts').mkdir()
+            (target / '.githooks').mkdir()
+            shutil.copyfile(__file__, target / 'scripts/governance.py')
+            shutil.copyfile(hook, target / '.githooks/commit-msg')
+            message = target / 'commit message.txt'
+            env = dict(
+                os.environ,
+                GIT_AUTHOR_NAME='Ada Contributor',
+                GIT_AUTHOR_EMAIL='ada@example.invalid',
+                GIT_COMMITTER_NAME='Build Service',
+                GIT_COMMITTER_EMAIL='builder@example.invalid',
+            )
+            cases = [
+                ('docs(governance): verify hook\r\n', 0),
+                ('docs(git): rules\n\nCo-authored-by: Collaborator <collaborator@example.invalid>\n', 0),
+                ('update docs\n', 1),
+            ]
+            for value, wanted in cases:
+                message.write_bytes(value.encode())
+                result = subprocess.run(
+                    [shell, str(target / '.githooks/commit-msg'), str(message)],
+                    cwd=target, env=env, capture_output=True, text=True,
+                )
+                with self.subTest(message=value):
+                    self.assertEqual(result.returncode, wanted, result.stderr)
+
     def test_normal_conventional_and_merge_messages(self):
         for message in [f'docs(governance): document contribution rules\n\nRefs: {GOVERNANCE_ISSUE_URL}\n','chore(merge): integrate verified documentation','feat(query)!: version typed parameters\r\n\r\nBREAKING CHANGE: explicit types\r\n']:
-            with self.subTest(message=message):self.assertEqual(message_errors(message,IDENTITY,IDENTITY),[])
-    def test_malformed_and_coauthor_messages(self):
-        for message in ['update docs','feat: missing scope','fix(query): ','docs(git): rules\n\nCo-authored-by: Someone <someone@example.invalid>','docs(git): rules\r\n\r\nco-AUTHORED-by: Someone <someone@example.invalid>']:
-            with self.subTest(message=message):self.assertTrue(message_errors(message,IDENTITY,IDENTITY))
-    def test_identity_is_checked_for_author_and_committer(self):
-        self.assertTrue(message_errors('docs(git): rules',('Codex','codex@example.invalid'),IDENTITY))
-        self.assertTrue(message_errors('docs(git): rules',IDENTITY,('GitHub','noreply@github.com')))
+            with self.subTest(message=message):self.assertEqual(message_errors(message),[])
+    def test_malformed_subjects_are_rejected(self):
+        for message in ['update docs', 'feat: missing scope', 'fix(query): ']:
+            with self.subTest(message=message):
+                self.assertTrue(message_errors(message))
+
+    def test_standard_coauthor_trailer_is_accepted(self):
+        message = 'docs(git): rules\n\nCo-authored-by: Collaborator <collaborator@example.invalid>'
+        self.assertEqual(message_errors(message), [])
+
     def test_pr_requires_issue_spec_and_evidence_sections(self):
         body=f'Refs: {GOVERNANCE_ISSUE_URL}\nSpec: {GOVERNANCE_SPEC_URL}\n'+ '\n'.join('## '+h+'\nConcrete evidence.' for h in ['Summary','Acceptance criteria','Verification','Dependencies','Compatibility and risks'])
         self.assertEqual(pr_errors(f'docs(governance): define workflow [{GOVERNANCE_TICKET}]',body),[])
@@ -180,7 +191,7 @@ class GovernanceTests(unittest.TestCase):
     def test_local_links_and_crisp_agents(self):
         with tempfile.TemporaryDirectory(prefix='governance fixture ') as folder:
             root=pathlib.Path(folder)
-            for relative in ['README.md','GIT.md','AGENTS.md','docs/architecture.md','docs/development.md','docs/status-roadmap.md','docs/specs/README.md','docs/specs/TEMPLATE.md']:
+            for relative in ['README.md','CONTRIBUTING.md','GIT.md','AGENTS.md','docs/architecture.md','docs/development.md','docs/status-roadmap.md','docs/specs/README.md','docs/specs/TEMPLATE.md']:
                 p=root/relative;p.parent.mkdir(exist_ok=True,parents=True);p.write_text('# Documentation\n',encoding='utf-8')
             (root/'README.md').write_text('[Architecture](docs/architecture.md)\r\n',encoding='utf-8')
             self.assertEqual(documentation_errors(root),[])
@@ -201,7 +212,7 @@ def main():
         return 0 if result.wasSuccessful() else 1
     if args.command=='commit-msg':
         text=pathlib.Path(args.file).read_text(encoding='utf-8-sig')
-        errors=message_errors(text,identity('AUTHOR'),identity('COMMITTER'))
+        errors=message_errors(text)
     else:errors=check(args.base,args.head,args.event)
     for error in errors:print(error,file=sys.stderr)
     if errors:return 1

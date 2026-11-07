@@ -1,6 +1,6 @@
 # praxor contribution foundation
 
-Status: implements the user-authorized documentation/governance rollout; exact-head PR review is the merge gate.
+Status: contribution foundation; this rollout is explicitly authorized for direct publication to main after focused review and verification. Routine changes use linked PRs.
 Owner: Astraive/praxor
 Issue: https://github.com/Astraive/praxor/issues/104
 Baseline revision: 4a276cfaca0ee6291f965f8788e0d8ca905c7682
@@ -14,19 +14,19 @@ Provide truthful repository-specific README, maintainer GIT notes, concise AGENT
 1. README and docs distinguish committed behavior, local unpublished work and target architecture. AGENTS is a short entry point; detailed policy belongs in GIT/docs.
 2. Task, bug, epic, specification and verification forms capture concrete scope, requirements, fixtures, acceptance, references, dependencies and tracking. Maintainers configure native parent/blocker links and actual metadata; prose IDs alone are insufficient.
 3. Issue type/area/priority/size/platform labels, milestone and Project #2 values agree. Todo does not imply specification approval. Use Astraive organization issue types where available; repository labels remain available for metadata that the host cannot represent.
-4. New commit subjects use type(scope): message, with at most 120 characters. This authorized work uses NeerajCodz <neerajcodz@gmail.com> as both author and committer and rejects co-author trailers. Historical base commits are excluded from new-commit validation.
+4. New commit subjects use type(scope): message, with at most 120 characters. The validator checks subject form only; contributors use their own accurate Git identities, and standard co-author trailers are permitted.
 5. A POSIX commit-msg hook supports Git Bash/Linux/macOS with Python 3.12+. CI checks the actual PR head with full history and reads PR JSON as inert data, using read-only permissions. Existing product CI remains intact.
 6. PRs link an actual owning issue and an existing in-repo spec path or HTTPS spec URL; a not-applicable exemption needs a reason. Required evidence sections and canonical ticket title are checked.
-7. Current-head checks and independent review precede a normal two-parent merge with exact project attribution. Close only the completed scope and clean up its branch.
+7. Routine changes use independent review and current-head checks before a normal non-squash merge. A focused documentation/governance change may be directly pushed only with explicit maintainer authorization and after required verification; branch protection is never bypassed. Close only the completed scope and clean up its branch.
 8. One-time issue publication scripts, catalogs, credentials and run ledgers stay outside this repository.
 
 ## Verification and limits
 
-The governance self-tests accept valid conventional/merge and CRLF messages and reject malformed subjects, coauthors, wrong author/committer, missing issue/spec metadata and broken checked Markdown targets. Local relative inline/reference Markdown links are checked; remote page availability, heading anchors, server-required check settings, Project permissions and semantic completeness still require review/readback. CI runs on Linux and Windows. Documentation checks do not prove engine/runtime/UI/WASM behavior.
+The governance self-tests accept conventional/merge and CRLF messages, arbitrary contributor identities and standard co-author trailers; they reject malformed subjects, missing issue/spec metadata and broken checked Markdown targets. Local relative inline/reference Markdown links are checked; remote page availability, heading anchors, server-required check settings, Project permissions and semantic completeness still require review/readback. CI runs on Linux and Windows. Documentation checks do not prove engine/runtime/UI/WASM behavior.
 
 ## Acceptance
 
 - [ ] Custom documentation accurately describes this repo and links to real owning work.
 - [ ] Local checks and new-commit/PR cases pass; hook shebang/mode and cross-platform CI are verified.
 - [ ] Independent review resolves factual and governance findings at the tested head.
-- [ ] PR is normally merged, exact published attribution is verified and completed scope is reflected in GitHub tracking.
+- [ ] The authorized publication route is verified (routine PR merge, or explicitly authorized direct push); commit attribution is accurate and completed scope is reflected in GitHub tracking.

@@ -84,6 +84,6 @@ Tests for process exit, OS crash and power loss demonstrate different guarantees
 
 ## Complete a scoped change
 
-Before opening or updating a PR, check the approved specification and concrete blockers, run relevant checks, review the diff and update affected documentation. Use real issue URLs and accurate `Refs`/`Closes` language. Confirm both commit author and committer and omit coauthor trailers. Follow normal two-parent merge and exact-head verification rules in [GIT.md](../GIT.md).
+Before opening or updating a PR, check the approved specification and concrete blockers, run relevant checks, review the diff and update affected documentation. Use real issue URLs and accurate `Refs`/`Closes` language. Use your own accurate author and committer identity; standard co-author trailers are allowed when they truthfully credit collaborators. Follow normal two-parent merge and exact-head verification rules in [GIT.md](../GIT.md).
 
 Status advances only for the verified scope. Completing a decoder, fresh format, fixture gateway or local service adapter does not complete persisted SQL, legacy migration, durable history, public protocol adoption or the unified SuperDB demonstration.

@@ -56,7 +56,7 @@ Logical `document::RecordId { collection, key }`, core `store::RecordId(u64)` an
 
 ## Contributing and delivery
 
-Start with an approved bounded specification, a concrete oracle and the appropriate existing issue. [GIT.md](GIT.md) defines native issue hierarchy/blockers, labels, project/milestone fields, commits and normal merges. [AGENTS.md](AGENTS.md) gives the short operational rules for coding agents.
+Start with [CONTRIBUTING.md](CONTRIBUTING.md), then use an approved bounded specification, a concrete oracle and the appropriate existing issue. [GIT.md](GIT.md) defines native issue hierarchy/blockers, labels, project/milestone fields, commits and normal merges. [AGENTS.md](AGENTS.md) gives the short operational rules for coding agents.
 
 The cross-repository roadmap is tracked in the [SuperDB master issue](https://github.com/Astraive/poiesis/issues/8) and [Astraive Project 2](https://github.com/orgs/Astraive/projects/2). The existing [engine epic](https://github.com/Astraive/praxor/issues/3) remains active. A large backlog, a closed decoder issue or a draft completion document does not mean the unified database is finished.
 

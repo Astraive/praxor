@@ -2,7 +2,7 @@
 name = "praxis"
 version = "0.0.1"
 edition = "2024"
-authors = ["NeerajCodz <neerajcodz@gmail.com>"]
+authors = ["Astraive contributors"]
 description = "Primitive-first universal storage kernel for Poiesis"
 license = "Apache-2.0"
 
