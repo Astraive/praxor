@@ -13,6 +13,10 @@ from urllib.parse import unquote, urlsplit
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 IDENTITY = ('NeerajCodz', 'neerajcodz@gmail.com')
+REPOSITORY = 'Astraive/praxor'
+GOVERNANCE_ISSUE_URL = 'https://github.com/Astraive/praxor/issues/104'
+GOVERNANCE_TICKET = 'PRX-GOV-001'
+GOVERNANCE_SPEC_URL = 'https://github.com/Astraive/praxor/blob/main/docs/specs/2026-11-06-contribution-foundation.md'
 HEADER = re.compile(r'^(feat|fix|docs|test|build|chore|perf|refactor|ci|revert)\([a-z0-9][a-z0-9._/-]*\)!?: \S.*$')
 TICKET = re.compile(r'\[[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*-\d+\]')
 ISSUE = re.compile(r'https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/[1-9]\d*\b')
@@ -154,7 +158,7 @@ class GovernanceTests(unittest.TestCase):
                 result=subprocess.run([shell,str(target/'.githooks/commit-msg'),str(message)],cwd=target,env=case_env,capture_output=True,text=True)
                 with self.subTest(text=text,wrong_committer=wrong_committer):self.assertEqual(result.returncode,wanted,result.stderr)
     def test_normal_conventional_and_merge_messages(self):
-        for message in ['docs(governance): document contribution rules\n\nRefs: https://github.com/Astraive/poiesis/issues/13\n','chore(merge): integrate verified documentation','feat(query)!: version typed parameters\r\n\r\nBREAKING CHANGE: explicit types\r\n']:
+        for message in [f'docs(governance): document contribution rules\n\nRefs: {GOVERNANCE_ISSUE_URL}\n','chore(merge): integrate verified documentation','feat(query)!: version typed parameters\r\n\r\nBREAKING CHANGE: explicit types\r\n']:
             with self.subTest(message=message):self.assertEqual(message_errors(message,IDENTITY,IDENTITY),[])
     def test_malformed_and_coauthor_messages(self):
         for message in ['update docs','feat: missing scope','fix(query): ','docs(git): rules\n\nCo-authored-by: Someone <someone@example.invalid>','docs(git): rules\r\n\r\nco-AUTHORED-by: Someone <someone@example.invalid>']:
@@ -163,13 +167,13 @@ class GovernanceTests(unittest.TestCase):
         self.assertTrue(message_errors('docs(git): rules',('Codex','codex@example.invalid'),IDENTITY))
         self.assertTrue(message_errors('docs(git): rules',IDENTITY,('GitHub','noreply@github.com')))
     def test_pr_requires_issue_spec_and_evidence_sections(self):
-        body='Refs: https://github.com/Astraive/poiesis/issues/13\nSpec: https://github.com/Astraive/poiesis/issues/13\n'+ '\n'.join('## '+h+'\nConcrete evidence.' for h in ['Summary','Acceptance criteria','Verification','Dependencies','Compatibility and risks'])
-        self.assertEqual(pr_errors('docs(governance): define workflow [POI-GOV-001]',body),[])
+        body=f'Refs: {GOVERNANCE_ISSUE_URL}\nSpec: {GOVERNANCE_SPEC_URL}\n'+ '\n'.join('## '+h+'\nConcrete evidence.' for h in ['Summary','Acceptance criteria','Verification','Dependencies','Compatibility and risks'])
+        self.assertEqual(pr_errors(f'docs(governance): define workflow [{GOVERNANCE_TICKET}]',body),[])
         self.assertTrue(pr_errors('docs(governance): define workflow',body))
-        self.assertTrue(pr_errors('docs(governance): define workflow [POI-GOV-001]',body.replace('https://github.com/Astraive/poiesis/issues/13','POI-GOV-001')))
-        self.assertTrue(pr_errors('docs(governance): define workflow [POI-GOV-001]',body.replace('Spec:','Missing:')))
-        self.assertTrue(pr_errors('docs(governance): define workflow [POI-GOV-001]',body.replace('Spec: https://github.com/Astraive/poiesis/issues/13','Spec: docs/specs/DOES-NOT-EXIST.md')))
-        self.assertTrue(pr_errors('docs(governance): define workflow [POI-GOV-001]',body.replace('Spec: https://github.com/Astraive/poiesis/issues/13','Spec: not applicable')))
+        self.assertTrue(pr_errors(f'docs(governance): define workflow [{GOVERNANCE_TICKET}]',body.replace(GOVERNANCE_ISSUE_URL,GOVERNANCE_TICKET)))
+        self.assertTrue(pr_errors(f'docs(governance): define workflow [{GOVERNANCE_TICKET}]',body.replace('Spec:','Missing:')))
+        self.assertTrue(pr_errors(f'docs(governance): define workflow [{GOVERNANCE_TICKET}]',body.replace('Spec: '+GOVERNANCE_SPEC_URL,'Spec: docs/specs/DOES-NOT-EXIST.md')))
+        self.assertTrue(pr_errors(f'docs(governance): define workflow [{GOVERNANCE_TICKET}]',body.replace('Spec: '+GOVERNANCE_SPEC_URL,'Spec: not applicable')))
     def test_markdown_destinations(self):
         self.assertEqual(list(markdown_targets('[A](docs/a(b).md)\n[B](docs/b.md \'title\')\n`[ignored](absent.md)`\n~~~\n[ignored](absent.md)\n~~~\n[C][ref]\n[ref]: docs/c.md "title"')),['docs/a(b).md','docs/b.md','docs/c.md'])
         self.assertEqual(list(markdown_targets('[Unknown][missing]')),['MISSING-REFERENCE:missing'])

@@ -17,7 +17,7 @@ rewriting preserved dirty workspace/PQL sources.
 
 ## Repository baseline
 
-At the initial inventory on 2026-10-17, the identified remotes were Astraive/praxor (the original Astraive/praxis URL now redirects), NeerajCodz/poiesis and NeerajCodz/pit, all with default branch main and no preexisting open or draft PRs. Existing local main checkouts contain substantial uncommitted changes and are preserved. Separate worktrees start from fetched origin/main. The engine package on the remote is still named praxis; renaming it to match local praxor requires an explicit integration change. At that inventory, Poietica and PoiesiSQL had local source but no standalone remote, and poiesis-wasm was empty. Separate private Astraive remotes now exist as README-only baselines; importing and verifying their preserved source remains open work.
+At the initial inventory on 2026-10-17, the identified remotes were Astraive/praxor (the original Astraive/praxis URL now redirects), NeerajCodz/poiesis and NeerajCodz/pit, all with default branch main and no preexisting open or draft PRs. Poiesis and Pit have since moved under Astraive; their live links below use the current repository locations. Existing local main checkouts contain substantial uncommitted changes and are preserved. Separate worktrees start from fetched origin/main. The engine package on the remote is still named praxis; renaming it to match local praxor requires an explicit integration change. At that inventory, Poietica and PoiesiSQL had local source but no standalone remote, and poiesis-wasm was empty. Separate private Astraive remotes now exist as README-only baselines; importing and verifying their preserved source remains open work.
 
 ## Required invariants
 
@@ -62,8 +62,8 @@ These references inform invariants and tests; the existing implementation remain
 - [WAL tail recovery](https://github.com/Astraive/praxor/issues/6)
 - [Snapshot and merge retention](https://github.com/Astraive/praxor/issues/7)
 - [Flush and WAL reclamation](https://github.com/Astraive/praxor/issues/8)
-- [Poiesis and client integration epic](https://github.com/NeerajCodz/poiesis/issues/1)
-- [Pit completion epic](https://github.com/NeerajCodz/pit/issues/1)
+- [Poiesis and client integration epic](https://github.com/Astraive/poiesis/issues/1)
+- [Pit completion epic](https://github.com/Astraive/pit/issues/1)
 
 ## Limits of this batch
 

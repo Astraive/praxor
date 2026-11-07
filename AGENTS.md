@@ -1,33 +1,14 @@
 # Praxor agent instructions
 
-- Read [README.md](README.md), [GIT.md](GIT.md), [architecture](docs/architecture.md), [development](docs/development.md) and [status](docs/status-roadmap.md) before changing relevant contracts.
-- Repository: Astraive/praxor. Cargo package/library/binary: `praxis`; preserve existing public names.
-- Praxor owns parser, binder, IR, planner, executor, catalog, storage, transactions and indexes.
-- Poiesis owns runtime/auth/protocols; Pit owns commit/ref/merge policy; PoiesisQL is tooling; Poietica consumes product APIs.
-- Work from the real issue/spec and current main. Do not equate historical audit prose or a draft PR with a current defect or merged capability.
-- Preserve unrelated/unpublished changes. Use a clean branch/worktree; never reset/clean/force-push to simplify the task.
-- Reuse existing issue scopes. Native parent/sub-issue and blocked-by links are authoritative; no child depends on completion of its own ancestor.
-- Follow existing type/area/priority/size/platform labels, Project 2 fields and M0–M7 milestones described in GIT.md.
-- Draft/Todo is not implementation-ready. Resolve the spec and blockers before implementing the leaf.
-- Keep leaves S/M/L; split broader work. Do not commit one-time issue-publication scripts.
-- Freeze format/effect contracts and independent oracles before storage/catalog/provenance implementation.
-- Preserve supported wire bytes and distinguish the legacy IEEE checksum alias from true v5 Castagnoli CRC32C.
-- PVD1/H80/H64 decode is read-only and untrusted; it grants no writer, replay, repair, owner or ancestry authority.
-- `CatalogDatabase` entry points currently fail closed; do not claim shipped persisted DDL/DML from private codec coverage.
-- The Q1 compiler is bounded SELECT/filter/projection with typed parameters; Q2 is a scan-only controlled-fixture retained gateway.
-- Do not silently route unsupported query features through the legacy parser or hide storage errors as absent/empty rows.
-- Core record snapshot tokens are process-local and owner-bound; no durable Pit/AS OF capability is implied.
-- Logical document IDs, core numeric RIDs and page RIDs are distinct; use reviewed adapters, never guessed casts.
-- Retained live engines have distinct admission/compatibility contracts. Do not delete or merge them as dead duplicate code.
-- Share existing writer, commit and snapshot authorities; do not create a second WAL, pin registry or payload truth.
-- Production storage logging uses structured `slog` events; follow existing logging/storage-boundary gates.
-- Use Rust 1.99.0 and locked dependencies. Run focused semantic tests plus required format/lint/native checks.
-- Run `python scripts/governance.py check` and `python scripts/governance.py self-test` for this governance workflow.
-- Record exact revision, platform, commands and exit status; never present historical or skipped checks as fresh passes.
-- Feature compilation does not prove real GPU execution; process-exit tests do not prove power-cut durability.
-- Keep raw data/credentials out of source and logs; include only evidence necessary for review.
-- Every new commit author AND committer must be `NeerajCodz <neerajcodz@gmail.com>`; add no Co-authored-by trailers.
-- Use substantive conventional commit subjects and focused PR descriptions with real issue links.
-- Normal two-parent merges only; no squash/rebase merge, force-push or check bypass.
-- Verify actual merge parents, tree, identity and required exact-head checks before claiming delivery.
-- Update docs/status and scoped acceptance truthfully; a decoder or one milestone does not complete SuperDB.
+- Read README.md, GIT.md, the relevant architecture/development docs, and the linked issue/spec first.
+- Confirm the current default-branch revision; distinguish committed behavior from historical reports and unpublished sources.
+- Praxor owns canonical parsing, binding, planning, execution, catalog, storage, transactions, and indexes.
+- Keep runtime/session/auth work in Poiesis, history/ref/merge work in Pit, optional tooling in PoiesiSQL, and UI work in Poietica.
+- Preserve existing public package names and unrelated checkout changes; use an isolated branch/worktree.
+- Implement only after the spec is approved and prerequisites are resolved; native parent/blocker links and Project #2 fields are authoritative.
+- Keep issue scope bounded, and never make a child depend on its own ancestor.
+- Preserve wire, storage, and recovery invariants; unsupported paths must fail explicitly rather than route through a legacy fallback.
+- Use locked Rust dependencies, two build jobs, and an explicit target directory on D: or F:; record the exact revision, command, and result.
+- Verify durability, recovery, and performance only with the required fault/restart or benchmark evidence.
+- Set author and committer to NeerajCodz <neerajcodz@gmail.com>; use type(scope): message and no co-author trailers.
+- Follow GIT.md for review and normal merge rules; update status claims only from verified evidence.

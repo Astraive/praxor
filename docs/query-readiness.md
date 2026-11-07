@@ -120,7 +120,7 @@ query AS OF selectors or establish Pit's durable history semantics.
 one persisted catalog DDL/data atomic operation after Q1/Q2. The current
 semantic catalog's serde and separate page catalog are not that protocol.
 
-Runtime adoption reuses [Poiesis #5](https://github.com/NeerajCodz/poiesis/issues/5);
+Runtime adoption reuses [Poiesis #5](https://github.com/Astraive/poiesis/issues/5);
 optional PQL adoption reuses [PoiesiSQL #2](https://github.com/Astraive/poiesisql/issues/2).
 No duplicate pipeline, catalog writer or required integration is introduced by
 Q0. Durable history, page migration, product routing and ecosystem completion

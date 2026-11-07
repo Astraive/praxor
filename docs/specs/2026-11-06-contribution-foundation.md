@@ -13,7 +13,7 @@ Provide truthful repository-specific README, maintainer GIT notes, concise AGENT
 
 1. README and docs distinguish committed behavior, local unpublished work and target architecture. AGENTS is a short entry point; detailed policy belongs in GIT/docs.
 2. Task, bug, epic, specification and verification forms capture concrete scope, requirements, fixtures, acceptance, references, dependencies and tracking. Maintainers configure native parent/blocker links and actual metadata; prose IDs alone are insufficient.
-3. Issue type/area/priority/size/platform labels, milestone and Project #2 values agree. Todo does not imply specification approval. Native org types are used where available; personal Pit uses type labels.
+3. Issue type/area/priority/size/platform labels, milestone and Project #2 values agree. Todo does not imply specification approval. Use Astraive organization issue types where available; repository labels remain available for metadata that the host cannot represent.
 4. New commit subjects use type(scope): message, with at most 120 characters. This authorized work uses NeerajCodz <neerajcodz@gmail.com> as both author and committer and rejects co-author trailers. Historical base commits are excluded from new-commit validation.
 5. A POSIX commit-msg hook supports Git Bash/Linux/macOS with Python 3.12+. CI checks the actual PR head with full history and reads PR JSON as inert data, using read-only permissions. Existing product CI remains intact.
 6. PRs link an actual owning issue and an existing in-repo spec path or HTTPS spec URL; a not-applicable exemption needs a reason. Required evidence sections and canonical ticket title are checked.
