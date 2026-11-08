@@ -3,6 +3,7 @@
 //! No caller may turn these observations into an owner proof until the later
 //! protected-copy, installed-relation, and WAL-history proofs are complete.
 
+use super::authority::CATALOG_CF;
 use crate::config::Compression;
 use crate::disk::DiskLayout;
 use crate::errors::{PraxisError, Result};
@@ -33,6 +34,26 @@ const SEGMENT_HEADER_BYTES: usize = 21;
 const SEGMENT_TRAILER_BYTES: usize = 12;
 const BLOCK_HEADER_BYTES: usize = 12;
 const HASH_CHUNK_BYTES: usize = 64 * 1024;
+const LZ4_HEAD_BYTES: usize = 48;
+const LZ4_HEAD_REPLAY_TRANSIENT_BYTES: usize = 12 * 1024 * 1024;
+
+// A selected compressed Head remains a small private proof. Keep the existing
+// three-pass parser below CopyReplayWork's 16 MiB transient ceiling.
+const LZ4_HEAD_REPLAY_PROFILE: ProofProfile = ProofProfile {
+    max_physical_file_bytes: MAX_LITERAL_SEGMENT_BYTES as u64,
+    max_physical_visit_bytes: MAX_LITERAL_SEGMENT_BYTES as u64,
+    max_encoded_block_bytes: MAX_LITERAL_SEGMENT_BYTES as u64,
+    max_decoded_block_bytes: MAX_LITERAL_SEGMENT_BYTES as u64,
+    max_footer_bytes: MAX_LITERAL_SEGMENT_BYTES as u64,
+    max_decoded_file_bytes: (4 * MAX_LITERAL_SEGMENT_BYTES) as u64,
+    max_decoded_visit_bytes: (4 * MAX_LITERAL_SEGMENT_BYTES) as u64,
+    max_blocks_file: 4_096,
+    max_blocks_visit: 4_096,
+    max_rows_file: 65_536,
+    max_rows_visit: 65_536,
+    max_parser_owned_peak_bytes: 8 * 1024 * 1024,
+    max_zstd_native_workspace_bytes: 0,
+};
 
 /// Private proof policy for compressed files only. Literal admission is unchanged.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1150,6 +1171,163 @@ pub(crate) struct SegmentFileWitness {
     pub(crate) observed_rows: u64,
 }
 
+/// The exact physical row to replay; MANIFEST order is part of the source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // The private copy ledger consumes this after its GREEN slice.
+pub(crate) struct PhysicalRowLocator {
+    pub(crate) source: SegmentSource,
+    pub(crate) block_offset: u64,
+    pub(crate) row_ordinal: u32,
+}
+
+/// A literal Put must replay the same logical triple and wire operation.
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // The private copy ledger consumes this after its GREEN slice.
+pub(crate) struct ExpectedLiteralPut<'a> {
+    pub(crate) cf: &'a str,
+    pub(crate) key: &'a [u8],
+    pub(crate) sequence: u64,
+}
+
+/// Additional replay limits are separate from the initial segment visitor.
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // Lowered only by focused replay tests until ledger integration.
+pub(crate) struct CopyReplayLimits {
+    pub(crate) max_physical_bytes: u64,
+    pub(crate) max_file_opens: u64,
+    pub(crate) max_transient_bytes: usize,
+}
+
+pub(crate) const PRODUCTION_COPY_REPLAY_LIMITS: CopyReplayLimits = CopyReplayLimits {
+    max_physical_bytes: 512 * 1024 * 1024,
+    max_file_opens: 8_192,
+    max_transient_bytes: 16 * 1024 * 1024,
+};
+
+/// One monotone meter for additional segment and value replay, including both
+/// all-witness fences. The private copy ledger must retain this same instance
+/// from its first selected row through consumption.
+#[allow(dead_code)] // Produced by the private copy ledger in the next slice.
+pub(crate) struct CopyReplayWork {
+    limits: CopyReplayLimits,
+    physical_bytes: u64,
+    file_opens: u64,
+    peak_transient_bytes: usize,
+}
+
+#[allow(dead_code)] // The focused tests exercise this before ledger integration.
+impl CopyReplayWork {
+    pub(crate) fn production() -> Self {
+        Self {
+            limits: PRODUCTION_COPY_REPLAY_LIMITS,
+            physical_bytes: 0,
+            file_opens: 0,
+            peak_transient_bytes: 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_limits_for_test(limits: CopyReplayLimits) -> Self {
+        assert!(limits.max_physical_bytes <= PRODUCTION_COPY_REPLAY_LIMITS.max_physical_bytes);
+        assert!(limits.max_file_opens <= PRODUCTION_COPY_REPLAY_LIMITS.max_file_opens);
+        assert!(limits.max_transient_bytes <= PRODUCTION_COPY_REPLAY_LIMITS.max_transient_bytes);
+        Self {
+            limits,
+            physical_bytes: 0,
+            file_opens: 0,
+            peak_transient_bytes: 0,
+        }
+    }
+
+    pub(crate) fn reserve(
+        &mut self,
+        physical_bytes: u64,
+        opens: u64,
+        transient: usize,
+    ) -> Result<()> {
+        let next_bytes = self
+            .physical_bytes
+            .checked_add(physical_bytes)
+            .filter(|total| *total <= self.limits.max_physical_bytes)
+            .ok_or_else(|| unsupported("physical-copy replay reads exceed proof profile"))?;
+        let next_opens = self
+            .file_opens
+            .checked_add(opens)
+            .filter(|total| *total <= self.limits.max_file_opens)
+            .ok_or_else(|| unsupported("physical-copy replay opens exceed proof profile"))?;
+        if transient > self.limits.max_transient_bytes {
+            return Err(unsupported(
+                "physical-copy replay transient capture exceeds proof profile",
+            ));
+        }
+        self.physical_bytes = next_bytes;
+        self.file_opens = next_opens;
+        self.peak_transient_bytes = self.peak_transient_bytes.max(transient);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn physical_bytes(&self) -> u64 {
+        self.physical_bytes
+    }
+
+    /// Preserve all prior charges while forcing the next physical read to
+    /// cross the cap. Used to test the candidate's consumption boundary.
+    #[cfg(test)]
+    pub(crate) fn exhaust_physical_reads_for_test(&mut self) {
+        self.limits.max_physical_bytes = self.physical_bytes;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn file_opens(&self) -> u64 {
+        self.file_opens
+    }
+
+    /// The ledger retains one small, charged canonical value while the
+    /// selected literal replay holds its bounded full-file capture. Account
+    /// for the simultaneous peak before either callback can allocate bytes.
+    pub(crate) fn reserve_literal_comparison_buffer(&mut self, allowance: usize) -> Result<()> {
+        let peak = (MAX_LITERAL_SEGMENT_BYTES * 2 + 64)
+            .checked_add(allowance)
+            .ok_or_else(|| unsupported("literal copy comparison buffer exceeds proof profile"))?;
+        self.reserve(0, 0, peak)
+    }
+}
+
+/// The charge precedes capture allocation and remains live through callback
+/// and rechecks. Drop also refunds an early error or callback unwind.
+struct LiteralReplayCapture<'a> {
+    bytes: Vec<u8>,
+    budget: &'a mut PhysicalWitnessBudget,
+    path: &'a Path,
+    charge: usize,
+}
+
+impl Drop for LiteralReplayCapture<'_> {
+    fn drop(&mut self) {
+        drop(std::mem::take(&mut self.bytes));
+        if self.budget.release(self.path, self.charge).is_err() {
+            std::process::abort();
+        }
+    }
+}
+
+/// Keep the parser's charged workspace live across all three authenticated
+/// passes and the callback. Errors and unwinds refund it after allocations drop.
+struct CompressedReplayCharge<'a> {
+    budget: &'a mut PhysicalWitnessBudget,
+    path: &'a Path,
+    charge: usize,
+}
+
+impl Drop for CompressedReplayCharge<'_> {
+    fn drop(&mut self) {
+        if self.budget.release(self.path, self.charge).is_err() {
+            std::process::abort();
+        }
+    }
+}
+
 struct SegmentLocator {
     source: SegmentSource,
     path: PathBuf,
@@ -2045,6 +2223,573 @@ fn capture_literal(file: &mut File, path: &Path) -> Result<(Vec<u8>, u64)> {
         return Err(corrupt(path, "v4 segment length changed during capture"));
     }
     Ok((bytes, len))
+}
+
+fn replay_existing<T>(
+    path: &Path,
+    missing_reason: &'static str,
+    result: std::io::Result<T>,
+) -> Result<T> {
+    result.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            corrupt(path, missing_reason)
+        } else {
+            error.into()
+        }
+    })
+}
+
+fn replay_check_real(path: &Path) -> Result<()> {
+    match check_real(path) {
+        Err(PraxisError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Err(
+            corrupt(path, "v4 segment disappeared during physical-copy replay"),
+        ),
+        other => other,
+    }
+}
+
+fn reserve_copy_replay_path(root: &Path, work: &mut CopyReplayWork) -> Result<usize> {
+    let root_bytes = root.as_os_str().as_encoded_bytes().len();
+    if root_bytes > MAX_ROOT_ENCODED_BYTES || root.to_str().is_none() {
+        return Err(unsupported("copy replay root exceeds private path profile"));
+    }
+    let allowance = root_bytes
+        .checked_add(128)
+        .and_then(|bytes| bytes.checked_mul(2))
+        .and_then(|bytes| bytes.checked_add(64))
+        .ok_or_else(|| unsupported("copy replay transient path exceeds proof profile"))?;
+    work.reserve(0, 0, allowance)?;
+    Ok(allowance)
+}
+
+/// A selected-row replay is deliberately insufficient for copy admission:
+/// another listed file can change while this row is compared. The ledger must
+/// call this complete, receipt-backed fence after all callbacks and again at
+/// its consumption boundary. Its result is bound to the exact witness slice.
+#[must_use]
+#[allow(dead_code)] // Consumed by the private copy ledger after integration.
+pub(crate) struct CompleteCopyReplayFence {
+    fingerprint: blake3::Hash,
+}
+
+#[allow(dead_code)] // The private ledger checks its own retained witness set.
+impl CompleteCopyReplayFence {
+    pub(crate) fn confirms(&self, witnesses: &[SegmentFileWitness]) -> bool {
+        self.fingerprint == copy_replay_witness_fingerprint(witnesses)
+    }
+}
+
+fn copy_replay_witness_fingerprint(witnesses: &[SegmentFileWitness]) -> blake3::Hash {
+    let mut hasher = blake3::Hasher::new();
+    for witness in witnesses {
+        hasher.update(&witness.source.level.to_le_bytes());
+        hasher.update(&witness.source.id.to_le_bytes());
+        hasher.update(&(witness.source.manifest_ordinal as u64).to_le_bytes());
+        hasher.update(&witness.identity.volume.to_le_bytes());
+        hasher.update(&witness.identity.file);
+        hasher.update(&witness.len.to_le_bytes());
+        hasher.update(witness.digest.as_bytes());
+        hasher.update(&witness.observed_rows.to_le_bytes());
+        let path = witness.path.as_os_str().as_encoded_bytes();
+        hasher.update(&(path.len() as u64).to_le_bytes());
+        hasher.update(path);
+    }
+    hasher.finalize()
+}
+
+/// A fixed 4,096-bit stack ledger closes duplicate/omission holes in a
+/// non-snapshot directory enumeration without another heap allocation.
+fn mark_copy_replay_witness_seen(seen: &mut [u64; 64], position: usize, path: &Path) -> Result<()> {
+    let word = seen
+        .get_mut(position / 64)
+        .ok_or_else(|| corrupt(path, "copy replay witness position exceeds profile"))?;
+    let bit = 1_u64 << (position % 64);
+    if *word & bit != 0 {
+        return Err(corrupt(
+            path,
+            "copy replay witnessed file repeated in namespace",
+        ));
+    }
+    *word |= bit;
+    Ok(())
+}
+
+fn all_copy_replay_witnesses_seen(seen: &[u64; 64], count: usize) -> bool {
+    count <= MAX_SEGMENT_FILES
+        && (0..count).all(|position| seen[position / 64] & (1_u64 << (position % 64)) != 0)
+}
+
+/// One O(M log M) all-file recheck, with each full-file read and handle open
+/// pre-reserved on the additional replay ledger. It does not grant an owner.
+#[allow(dead_code)] // Called after every literal/other copy comparison by the private ledger.
+pub(crate) fn recheck_all_copy_replay_witnesses(
+    root: &Path,
+    manifest: &Manifest,
+    witnesses: &[SegmentFileWitness],
+    work: &mut CopyReplayWork,
+) -> Result<CompleteCopyReplayFence> {
+    if manifest.format_version != 4 {
+        return Err(corrupt(root, "copy replay requires a v4 MANIFEST"));
+    }
+    manifest.validate_v4(&root.join("MANIFEST"))?;
+    if witnesses.len() > MAX_SEGMENT_FILES || witnesses.len() != manifest.segments.len() {
+        return Err(corrupt(
+            root,
+            "copy replay witness count differs from MANIFEST",
+        ));
+    }
+    let path_allowance = reserve_copy_replay_path(root, work)?;
+    let layout = DiskLayout::at(root);
+    for (index, witness) in witnesses.iter().enumerate() {
+        if index > 0
+            && (
+                witnesses[index - 1].source.level,
+                witnesses[index - 1].source.id,
+            ) >= (witness.source.level, witness.source.id)
+        {
+            return Err(corrupt(
+                &witness.path,
+                "copy replay witnesses are not unique and ordered",
+            ));
+        }
+        let meta = manifest
+            .segments
+            .get(witness.source.manifest_ordinal)
+            .ok_or_else(|| corrupt(&witness.path, "copy replay witness source is unlisted"))?;
+        let path = layout.segment_path(witness.source.level, witness.source.id);
+        if path.capacity() > path_allowance {
+            return Err(unsupported(
+                "copy replay transient path exceeds proof profile",
+            ));
+        }
+        if witness.source.level != meta.level
+            || witness.source.id != meta.id
+            || path != witness.path
+            || path.to_str() != Some(meta.path.as_str())
+            || witness.digest.to_hex().as_str() != meta.file_digest
+            || witness.observed_rows != meta.entries
+        {
+            return Err(corrupt(
+                &witness.path,
+                "copy replay witness differs from MANIFEST",
+            ));
+        }
+    }
+    let segment_root = layout.segment_root();
+    replay_check_real(&segment_root)?;
+    if !replay_existing(
+        &segment_root,
+        "v4 segment root disappeared",
+        fs::symlink_metadata(&segment_root),
+    )?
+    .is_dir()
+    {
+        return Err(corrupt(
+            &segment_root,
+            "v4 segment root changed during copy replay",
+        ));
+    }
+    let namespace_peak = path_allowance
+        .checked_add(std::mem::size_of::<[u64; 64]>())
+        .ok_or_else(|| unsupported("copy replay transient namespace exceeds proof profile"))?;
+    work.reserve(0, 0, namespace_peak)?;
+    let mut seen = [0_u64; 64];
+    work.reserve(0, 1, 0)?;
+    let mut observed = 0;
+    for (levels, level_entry) in replay_existing(
+        &segment_root,
+        "v4 segment root disappeared",
+        fs::read_dir(&segment_root),
+    )?
+    .enumerate()
+    {
+        if levels == MAX_SEGMENT_LEVELS {
+            return Err(corrupt(
+                &segment_root,
+                "v4 segment level-entry limit exceeded",
+            ));
+        }
+        let level_path =
+            replay_existing(&segment_root, "v4 segment level disappeared", level_entry)?.path();
+        replay_check_real(&level_path)?;
+        if !replay_existing(
+            &level_path,
+            "v4 segment level disappeared",
+            fs::symlink_metadata(&level_path),
+        )?
+        .is_dir()
+        {
+            return Err(corrupt(
+                &level_path,
+                "v4 segment level changed during copy replay",
+            ));
+        }
+        let level = parse_level(&level_path)?;
+        work.reserve(0, 1, 0)?;
+        for file_entry in replay_existing(
+            &level_path,
+            "v4 segment level disappeared",
+            fs::read_dir(&level_path),
+        )? {
+            observed = next_observed_file(&level_path, observed)?;
+            let path =
+                replay_existing(&level_path, "v4 segment entry disappeared", file_entry)?.path();
+            replay_check_real(&path)?;
+            if !replay_existing(
+                &path,
+                "v4 segment file disappeared",
+                fs::symlink_metadata(&path),
+            )?
+            .is_file()
+            {
+                return Err(corrupt(&path, "v4 segment file changed during copy replay"));
+            }
+            let id = parse_segment_id(&path)?;
+            let position = witnesses
+                .binary_search_by_key(&(level, id), |witness| {
+                    (witness.source.level, witness.source.id)
+                })
+                .map_err(|_| corrupt(&path, "unlisted v4 segment during copy replay"))?;
+            let witness = &witnesses[position];
+            if path != witness.path {
+                return Err(corrupt(&path, "copy replay witnessed path changed"));
+            }
+            mark_copy_replay_witness_seen(&mut seen, position, &path)?;
+            let physical_reads = witness
+                .len
+                .checked_add(1)
+                .ok_or_else(|| unsupported("copy replay physical reads exceed proof profile"))?;
+            work.reserve(physical_reads, 2, 0)?;
+            let mut file =
+                replay_existing(&path, "v4 segment file disappeared", File::open(&path))?;
+            if !file.metadata()?.is_file()
+                || file.metadata()?.len() != witness.len
+                || physical_id(&file, &path)? != witness.identity
+                || hash_exact(&mut file, witness.len, &path)? != witness.digest
+            {
+                return Err(corrupt(&path, "copy replay file bytes or identity changed"));
+            }
+            replay_check_real(&path)?;
+            let reopened =
+                replay_existing(&path, "v4 segment file disappeared", File::open(&path))?;
+            if !reopened.metadata()?.is_file()
+                || reopened.metadata()?.len() != witness.len
+                || physical_id(&reopened, &path)? != witness.identity
+            {
+                return Err(corrupt(&path, "copy replay namespace identity changed"));
+            }
+            replay_check_real(&path)?;
+        }
+    }
+    if observed != witnesses.len() || !all_copy_replay_witnesses_seen(&seen, witnesses.len()) {
+        return Err(corrupt(
+            &segment_root,
+            "listed v4 segment disappeared during copy replay",
+        ));
+    }
+    Ok(CompleteCopyReplayFence {
+        fingerprint: copy_replay_witness_fingerprint(witnesses),
+    })
+}
+
+/// Replay one exact writer-framed Put: an uncompressed literal or the narrow
+/// LZ4 Catalog Head. The callback receives authenticated selected bytes, but
+/// its return is provisional until selected-file checks finish. A successful
+/// call is insufficient for ledger admission: complete witness fences must
+/// cover all retained files after callbacks and again at consumption.
+#[allow(dead_code)] // The private copy ledger calls this after its GREEN slice.
+#[allow(clippy::too_many_arguments)] // The source, locator, work, and shared receipt are independent proof inputs.
+pub(crate) fn with_authenticated_literal_put<F>(
+    root: &Path,
+    manifest: &Manifest,
+    witness: &SegmentFileWitness,
+    locator: PhysicalRowLocator,
+    expected: ExpectedLiteralPut<'_>,
+    work: &mut CopyReplayWork,
+    budget: &mut PhysicalWitnessBudget,
+    on_value: F,
+) -> Result<()>
+where
+    F: FnOnce(&[u8]) -> Result<()>,
+{
+    let path = &witness.path;
+    if locator.source != witness.source || manifest.format_version != 4 {
+        return Err(corrupt(
+            path,
+            "literal replay source or manifest version mismatch",
+        ));
+    }
+    if manifest.segments.len() > MAX_SEGMENT_FILES {
+        return Err(corrupt(path, "v4 segment listed-file limit exceeded"));
+    }
+    let path_allowance = reserve_copy_replay_path(root, work)?;
+    let meta = manifest
+        .segments
+        .get(locator.source.manifest_ordinal)
+        .ok_or_else(|| corrupt(path, "literal replay manifest ordinal missing"))?;
+    {
+        let canonical = DiskLayout::at(root).segment_path(locator.source.level, locator.source.id);
+        if canonical.capacity() > path_allowance {
+            return Err(unsupported(
+                "copy replay transient path exceeds proof profile",
+            ));
+        }
+        if meta.level != locator.source.level
+            || meta.id != locator.source.id
+            || canonical != *path
+            || canonical.to_str() != Some(meta.path.as_str())
+            || witness.digest.to_hex().as_str() != meta.file_digest
+        {
+            return Err(corrupt(
+                path,
+                "literal replay source is not canonical manifest file",
+            ));
+        }
+    }
+    if witness.len > MAX_LITERAL_SEGMENT_BYTES as u64 {
+        return Err(unsupported(
+            "v4 segment exceeds the 1 MiB literal replay profile",
+        ));
+    }
+    if meta.partitioned_bloom_filter.is_some() {
+        return Err(unsupported(
+            "partitioned v4 segment Bloom is not yet proven",
+        ));
+    }
+    let physical_reads = witness
+        .len
+        .checked_add(1)
+        .and_then(|read| read.checked_mul(2))
+        .and_then(|read| read.checked_add(SEGMENT_HEADER_BYTES as u64))
+        .ok_or_else(|| unsupported("literal copy replay physical reads exceed proof profile"))?;
+    // capture_literal bounds actual Vec capacity to this fixed allowance.
+    let capture_allowance = MAX_LITERAL_SEGMENT_BYTES * 2 + 64;
+    work.reserve(physical_reads, 2, capture_allowance)?;
+    replay_check_real(path)?;
+    let mut file = replay_existing(path, "v4 segment file disappeared", File::open(path))?;
+    if !file.metadata()?.is_file()
+        || file.metadata()?.len() != witness.len
+        || physical_id(&file, path)? != witness.identity
+    {
+        return Err(corrupt(
+            path,
+            "literal replay opened file identity or length mismatch",
+        ));
+    }
+    let mut header = [0_u8; SEGMENT_HEADER_BYTES];
+    file.read_exact(&mut header)
+        .map_err(|_| corrupt(path, "short v4 segment header"))?;
+    let mut reader = BinaryReader::new(&header, path);
+    if reader.read_u32()? != SEGMENT_MAGIC || reader.read_u32()? != SEGMENT_VERSION {
+        return Err(corrupt(path, "bad v4 segment magic or version"));
+    }
+    let compression = reader.read_u8()?;
+    if reader.read_u32()? != locator.source.level || reader.read_u64()? != locator.source.id {
+        return Err(corrupt(path, "v4 segment header level or id mismatch"));
+    }
+    match compression {
+        0 => {}
+        1 if expected.cf == CATALOG_CF && expected.key == [0_u8].as_slice() => {
+            return with_authenticated_lz4_head_put(
+                path, meta, witness, locator, expected, work, budget, file, on_value,
+            );
+        }
+        1 | 2 => {
+            return Err(unsupported(
+                "compressed physical-copy replay not implemented",
+            ));
+        }
+        _ => return Err(corrupt(path, "unknown v4 segment compression tag")),
+    }
+    budget.charge(path, capture_allowance)?;
+    let mut capture = LiteralReplayCapture {
+        bytes: Vec::new(),
+        budget,
+        path,
+        charge: capture_allowance,
+    };
+    file.seek(SeekFrom::Start(0))?;
+    let (bytes, len) = capture_literal(&mut file, path)?;
+    if bytes.capacity() > capture_allowance || len != witness.len {
+        return Err(corrupt(
+            path,
+            "literal replay capture capacity or length mismatch",
+        ));
+    }
+    capture.bytes = bytes;
+    let digest = blake3::hash(&capture.bytes);
+    if digest != witness.digest || digest.to_hex().as_str() != meta.file_digest {
+        return Err(corrupt(path, "literal replay full-file digest mismatch"));
+    }
+    let mut captured_header = BinaryReader::new(&capture.bytes[..SEGMENT_HEADER_BYTES], path);
+    if captured_header.read_u32()? != SEGMENT_MAGIC
+        || captured_header.read_u32()? != SEGMENT_VERSION
+        || captured_header.read_u8()? != 0
+        || captured_header.read_u32()? != locator.source.level
+        || captured_header.read_u64()? != locator.source.id
+    {
+        return Err(corrupt(path, "literal replay captured header mismatch"));
+    }
+    let first = walk_literal(&capture.bytes, path, |_, _, _| Ok(()))?;
+    if u64::try_from(first.rows).ok() != Some(meta.entries)
+        || u64::try_from(first.rows).ok() != Some(witness.observed_rows)
+        || first.first_key.unwrap_or_default() != meta.min_key.as_slice()
+        || first.last_key.unwrap_or_default() != meta.max_key.as_slice()
+    {
+        return Err(corrupt(path, "literal replay count or key range mismatch"));
+    }
+    let mut pending = Some(on_value);
+    let second = walk_literal(&capture.bytes, path, |block_offset, row_ordinal, row| {
+        if block_offset != locator.block_offset || row_ordinal != locator.row_ordinal {
+            return Ok(());
+        }
+        if row.cf != expected.cf || row.key != expected.key || row.sequence != expected.sequence {
+            return Err(corrupt(path, "literal replay row key or sequence mismatch"));
+        }
+        let BorrowedValue::Put(value) = row.value else {
+            return Err(corrupt(path, "literal replay row is not a plain Put"));
+        };
+        let callback = pending
+            .take()
+            .ok_or_else(|| corrupt(path, "literal replay row locator repeated"))?;
+        callback(value)
+    })?;
+    if second != first || pending.is_some() {
+        return Err(corrupt(
+            path,
+            "literal replay row missing or semantic pass changed",
+        ));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    if hash_exact(&mut file, len, path)? != witness.digest
+        || file.metadata()?.len() != witness.len
+        || physical_id(&file, path)? != witness.identity
+    {
+        return Err(corrupt(path, "literal replay same-handle recheck failed"));
+    }
+    replay_check_real(path)?;
+    let reopened = replay_existing(path, "v4 segment file disappeared", File::open(path))?;
+    if !reopened.metadata()?.is_file()
+        || reopened.metadata()?.len() != witness.len
+        || physical_id(&reopened, path)? != witness.identity
+    {
+        return Err(corrupt(path, "literal replay namespace identity changed"));
+    }
+    replay_check_real(path)?;
+    Ok(())
+}
+
+/// A narrow LZ4 Head replay uses the already bounded segment parser. Its
+/// callback sees only a fixed stack copy after every pass has authenticated
+/// the complete selected file. The caller still owes complete witness fences.
+#[allow(clippy::too_many_arguments)] // The exact row, manifest receipt, and two ledgers are distinct proof inputs.
+fn with_authenticated_lz4_head_put<F>(
+    path: &Path,
+    meta: &SegmentMetadata,
+    witness: &SegmentFileWitness,
+    locator: PhysicalRowLocator,
+    expected: ExpectedLiteralPut<'_>,
+    work: &mut CopyReplayWork,
+    budget: &mut PhysicalWitnessBudget,
+    mut opened: File,
+    on_value: F,
+) -> Result<()>
+where
+    F: FnOnce(&[u8]) -> Result<()>,
+{
+    // The caller already reserved two opens and 2*(len+1)+header bytes.
+    // Each parser pass may preread a trailer and footer before its contiguous
+    // full-file read. Five more file lengths cover all three passes and the
+    // final same-handle hash; three more opens cover the passes and namespace.
+    let additional_reads = witness
+        .len
+        .checked_mul(5)
+        .and_then(|bytes| bytes.checked_add(2))
+        .ok_or_else(|| unsupported("compressed Head replay physical reads exceed proof profile"))?;
+    work.reserve(additional_reads, 3, LZ4_HEAD_REPLAY_TRANSIENT_BYTES)?;
+    budget.charge(path, LZ4_HEAD_REPLAY_TRANSIENT_BYTES)?;
+    let _charge = CompressedReplayCharge {
+        budget,
+        path,
+        charge: LZ4_HEAD_REPLAY_TRANSIENT_BYTES,
+    };
+
+    let mut parser = WorkLedger::new(LZ4_HEAD_REPLAY_PROFILE);
+    let first = scan_lz4_pass1(path, witness.identity, meta, &mut parser, |_| {})?;
+    if first.len != witness.len
+        || first.digest != witness.digest
+        || first.work.rows != witness.observed_rows
+    {
+        return Err(corrupt(
+            path,
+            "compressed Head replay differs from segment witness",
+        ));
+    }
+    let first_pass = parser.first_pass();
+    parser.accept_authenticated_file(first_pass, first.work, path)?;
+    let second = scan_lz4_pass2(path, witness.identity, meta, &parser, first, |_| {})?;
+    if second != first {
+        return Err(corrupt(path, "compressed Head Bloom replay changed"));
+    }
+
+    let mut selected = [0_u8; LZ4_HEAD_BYTES];
+    let mut selected_count = 0_u8;
+    let mut invalid_selected = false;
+    let third = scan_lz4_pass3(
+        path,
+        witness.identity,
+        meta,
+        locator.source,
+        &parser,
+        first,
+        |row| {
+            if (row.block_offset, row.row_ordinal) != (locator.block_offset, locator.row_ordinal) {
+                return Ok(());
+            }
+            selected_count = selected_count.saturating_add(1);
+            if row.source != locator.source
+                || row.cf.as_str() != expected.cf
+                || row.key.as_slice() != expected.key
+                || row.sequence != expected.sequence
+            {
+                invalid_selected = true;
+            } else if let ObservedSegmentValue::Put(value) = row.value {
+                if value.len() == LZ4_HEAD_BYTES {
+                    selected.copy_from_slice(&value);
+                } else {
+                    invalid_selected = true;
+                }
+            } else {
+                invalid_selected = true;
+            }
+            Ok(())
+        },
+    )?;
+    if third != first || third != second {
+        return Err(corrupt(path, "compressed Head selected-row replay changed"));
+    }
+    if selected_count != 1 || invalid_selected {
+        return Err(corrupt(path, "compressed Head exact row locator changed"));
+    }
+    on_value(&selected)?;
+
+    opened.seek(SeekFrom::Start(0))?;
+    if hash_exact(&mut opened, witness.len, path)? != witness.digest
+        || opened.metadata()?.len() != witness.len
+        || physical_id(&opened, path)? != witness.identity
+    {
+        return Err(corrupt(path, "compressed Head same-handle recheck failed"));
+    }
+    replay_check_real(path)?;
+    let reopened = replay_existing(path, "v4 segment file disappeared", File::open(path))?;
+    if !reopened.metadata()?.is_file()
+        || reopened.metadata()?.len() != witness.len
+        || physical_id(&reopened, path)? != witness.identity
+    {
+        return Err(corrupt(path, "compressed Head namespace identity changed"));
+    }
+    replay_check_real(path)?;
+    Ok(())
 }
 
 /// A pass reads only from its admitted File. Every parsed byte is hashed as
@@ -3652,6 +4397,484 @@ pub(super) fn collect_protected_segment_candidate_for_test(
     assert!(limits.max_rows <= PROTECTED_STAGE_LIMITS.max_rows);
     assert!(limits.max_bytes <= PROTECTED_STAGE_LIMITS.max_bytes);
     collect_protected_segment_candidate_inner(root, manifest, budget, limits, after_staged)
+}
+
+#[cfg(test)]
+mod literal_replay_tests {
+    use super::*;
+    use crate::accel::cpu::scalar::CpuAccelerator;
+    use crate::config::Compression;
+    use crate::core_catalog::physical_tests::flushed_create_fixture;
+    use crate::manifest::ManifestStore;
+    use crate::segments::codec::decode_segment;
+    use crate::segments::{SegmentWriteOptions, SegmentWriter};
+    use crate::values::ValueLog;
+    use crate::wal::catalog_witness::{WalCut, scan_v4_wals_with_budget};
+    use std::io::Write;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[test]
+    fn complete_fence_rejects_repeated_position_and_missing_witness() {
+        let path = Path::new("duplicate-namespace-entry.tseg");
+        let mut seen = [0_u64; 64];
+        mark_copy_replay_witness_seen(&mut seen, 0, path).unwrap();
+        assert!(!all_copy_replay_witnesses_seen(&seen, 2));
+        assert!(matches!(
+            mark_copy_replay_witness_seen(&mut seen, 0, path),
+            Err(PraxisError::Corrupt { .. })
+        ));
+        assert!(!all_copy_replay_witnesses_seen(&seen, 2));
+        mark_copy_replay_witness_seen(&mut seen, 1, path).unwrap();
+        assert!(all_copy_replay_witnesses_seen(&seen, 2));
+
+        let mut full = [u64::MAX; 64];
+        assert!(all_copy_replay_witnesses_seen(&full, MAX_SEGMENT_FILES));
+        full[63] &= !(1_u64 << 63);
+        assert!(!all_copy_replay_witnesses_seen(&full, MAX_SEGMENT_FILES));
+        mark_copy_replay_witness_seen(&mut full, MAX_SEGMENT_FILES - 1, path).unwrap();
+        assert!(all_copy_replay_witnesses_seen(&full, MAX_SEGMENT_FILES));
+    }
+
+    #[test]
+    fn writer_head_literal_replay_is_exact_and_refunds_capture_on_all_paths() {
+        let (_dir, _config, lease) = flushed_create_fixture();
+        let root = lease.root();
+        let manifest_path = DiskLayout::at(root).manifest_path();
+        let manifest =
+            Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+        let cut = WalCut {
+            flushed_sequence: manifest.flushed_sequence,
+            last_sequence: manifest.last_sequence,
+            flushed_wal_id: manifest.flushed_wal_id,
+            active_wal_id: manifest.active_wal_id,
+            next_wal_id: manifest.next_wal_id,
+        };
+        let (_wals, mut budget) = scan_v4_wals_with_budget(root, cut, |_, _, _, _| Ok(())).unwrap();
+        let candidate = collect_protected_segment_candidate(root, &manifest, &mut budget).unwrap();
+        let row = candidate
+            .rows
+            .iter()
+            .find(|row| {
+                row.cf == "__praxor_record_catalog_v1" && row.key == [0] && row.sequence == 2
+            })
+            .unwrap();
+        let ObservedSegmentValue::Put(expected_bytes) = &row.value else {
+            panic!("writer Head@2 must be a literal Put")
+        };
+        assert_eq!(expected_bytes.len(), 48);
+        let witness = candidate
+            .witnesses
+            .iter()
+            .find(|witness| witness.source == row.source)
+            .unwrap();
+        let locator = PhysicalRowLocator {
+            source: row.source,
+            block_offset: row.block_offset,
+            row_ordinal: row.row_ordinal,
+        };
+        let expected = ExpectedLiteralPut {
+            cf: &row.cf,
+            key: &row.key,
+            sequence: row.sequence,
+        };
+        let balance = budget.remaining_bytes();
+        let mut work = CopyReplayWork::production();
+        let mut callbacks = 0;
+        with_authenticated_literal_put(
+            root,
+            &manifest,
+            witness,
+            locator,
+            expected,
+            &mut work,
+            &mut budget,
+            |bytes| {
+                callbacks += 1;
+                assert_eq!(bytes, expected_bytes);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(callbacks, 1);
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert!(work.physical_bytes >= witness.len * 2);
+        assert_eq!(work.file_opens, 2);
+        assert!(work.peak_transient_bytes >= MAX_LITERAL_SEGMENT_BYTES);
+        let fence =
+            recheck_all_copy_replay_witnesses(root, &manifest, &candidate.witnesses, &mut work)
+                .unwrap();
+        assert!(fence.confirms(&candidate.witnesses));
+        let mut changed_set = candidate.witnesses.clone();
+        changed_set[0].len += 1;
+        assert!(!fence.confirms(&changed_set));
+        assert!(work.file_opens >= 6);
+        assert_eq!(budget.remaining_bytes(), balance);
+
+        let mut wrong = CopyReplayWork::production();
+        let error = with_authenticated_literal_put(
+            root,
+            &manifest,
+            witness,
+            PhysicalRowLocator {
+                row_ordinal: u32::MAX,
+                ..locator
+            },
+            expected,
+            &mut wrong,
+            &mut budget,
+            |_| {
+                callbacks += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, PraxisError::Corrupt { .. }));
+        assert_eq!(callbacks, 1);
+        assert_eq!(budget.remaining_bytes(), balance);
+
+        let mut oversized = witness.clone();
+        oversized.len = MAX_LITERAL_SEGMENT_BYTES as u64 + 1;
+        let mut oversized_work = CopyReplayWork::production();
+        let error = with_authenticated_literal_put(
+            root,
+            &manifest,
+            &oversized,
+            locator,
+            expected,
+            &mut oversized_work,
+            &mut budget,
+            |_| {
+                callbacks += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            PraxisError::UnsupportedCatalogFeature { .. }
+        ));
+        assert_eq!(
+            (oversized_work.physical_bytes, oversized_work.file_opens),
+            (0, 0)
+        );
+        assert_eq!(callbacks, 1);
+        assert_eq!(budget.remaining_bytes(), balance);
+
+        let mut forged = witness.clone();
+        forged.identity.file[0] ^= 1;
+        let mut wrong_identity = CopyReplayWork::production();
+        let error = with_authenticated_literal_put(
+            root,
+            &manifest,
+            &forged,
+            locator,
+            expected,
+            &mut wrong_identity,
+            &mut budget,
+            |_| {
+                callbacks += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, PraxisError::Corrupt { .. }));
+        assert_eq!(callbacks, 1);
+        assert_eq!(budget.remaining_bytes(), balance);
+
+        let mut tight = CopyReplayWork::with_limits_for_test(CopyReplayLimits {
+            max_physical_bytes: (SEGMENT_HEADER_BYTES - 1) as u64,
+            max_file_opens: 2,
+            max_transient_bytes: PRODUCTION_COPY_REPLAY_LIMITS.max_transient_bytes,
+        });
+        let error = with_authenticated_literal_put(
+            root,
+            &manifest,
+            witness,
+            locator,
+            expected,
+            &mut tight,
+            &mut budget,
+            |_| {
+                callbacks += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            PraxisError::UnsupportedCatalogFeature { .. }
+        ));
+        assert_eq!(callbacks, 1);
+        assert_eq!(budget.remaining_bytes(), balance);
+        assert_eq!((tight.physical_bytes, tight.file_opens), (0, 0));
+
+        let mut refused = CopyReplayWork::production();
+        let error = with_authenticated_literal_put(
+            root,
+            &manifest,
+            witness,
+            locator,
+            expected,
+            &mut refused,
+            &mut budget,
+            |_| Err(unsupported("test literal replay callback refused")),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            PraxisError::UnsupportedCatalogFeature {
+                feature: "test literal replay callback refused"
+            }
+        ));
+        assert_eq!(budget.remaining_bytes(), balance);
+
+        let capture_allowance = MAX_LITERAL_SEGMENT_BYTES * 2 + 64;
+        let held = balance - (capture_allowance - 1);
+        budget.charge(&witness.path, held).unwrap();
+        let near_limit = budget.remaining_bytes();
+        let mut no_budget = CopyReplayWork::production();
+        let error = with_authenticated_literal_put(
+            root,
+            &manifest,
+            witness,
+            locator,
+            expected,
+            &mut no_budget,
+            &mut budget,
+            |_| {
+                callbacks += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, PraxisError::Corrupt { .. }));
+        assert_eq!(budget.remaining_bytes(), near_limit);
+        assert_eq!(callbacks, 1);
+        budget.release(&witness.path, held).unwrap();
+        assert_eq!(budget.remaining_bytes(), balance);
+
+        let mut unwound = CopyReplayWork::production();
+        let panic_result = catch_unwind(AssertUnwindSafe(|| {
+            let _ = with_authenticated_literal_put(
+                root,
+                &manifest,
+                witness,
+                locator,
+                expected,
+                &mut unwound,
+                &mut budget,
+                |_| -> Result<()> { panic!("injected literal replay callback unwind") },
+            );
+        }));
+        assert!(panic_result.is_err());
+        assert_eq!(budget.remaining_bytes(), balance);
+
+        let original = fs::read(&witness.path).unwrap();
+        let mut mutator = fs::OpenOptions::new()
+            .write(true)
+            .open(&witness.path)
+            .unwrap();
+        let mut changed = CopyReplayWork::production();
+        let error = with_authenticated_literal_put(
+            root,
+            &manifest,
+            witness,
+            locator,
+            expected,
+            &mut changed,
+            &mut budget,
+            |_| {
+                mutator.seek(SeekFrom::Start(0))?;
+                mutator.write_all(&[original[0] ^ 1])?;
+                mutator.sync_data()?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, PraxisError::Corrupt { .. }));
+        assert_eq!(budget.remaining_bytes(), balance);
+        mutator.seek(SeekFrom::Start(0)).unwrap();
+        mutator.write_all(&original[..1]).unwrap();
+        mutator.sync_data().unwrap();
+        drop(mutator);
+        let mut after_restore = CopyReplayWork::production();
+        assert!(
+            recheck_all_copy_replay_witnesses(
+                root,
+                &manifest,
+                &candidate.witnesses,
+                &mut after_restore,
+            )
+            .is_ok()
+        );
+
+        fs::remove_file(&witness.path).unwrap();
+        let mut missing = CopyReplayWork::production();
+        let error = with_authenticated_literal_put(
+            root,
+            &manifest,
+            witness,
+            locator,
+            expected,
+            &mut missing,
+            &mut budget,
+            |_| {
+                callbacks += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, PraxisError::Corrupt { .. }));
+        assert_eq!(callbacks, 1);
+        assert_eq!(budget.remaining_bytes(), balance);
+        candidate.discard(root, &mut budget).unwrap();
+    }
+
+    #[test]
+    fn peer_mutation_after_selected_callback_refuses_complete_witness_fence() {
+        let (_dir, config, lease) = flushed_create_fixture();
+        let root = lease.root();
+        let layout = DiskLayout::at(root);
+        let manifest_path = layout.manifest_path();
+        let mut manifest =
+            Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+        let first_path = layout.segment_path(0, 1);
+        let first = decode_segment(
+            &fs::read(&first_path).unwrap(),
+            &first_path,
+            &CpuAccelerator,
+        )
+        .unwrap();
+        let head = first
+            .blocks
+            .into_iter()
+            .flatten()
+            .find(|row| {
+                row.entry.cf.0 == "__praxor_record_catalog_v1"
+                    && row.entry.key.as_ref() == [0u8].as_slice()
+                    && row.entry.version.sequence == 2
+            })
+            .unwrap()
+            .entry;
+        let second_path = layout.segment_path(1, 2);
+        fs::create_dir_all(second_path.parent().unwrap()).unwrap();
+        let value_path = layout.value_log_path(2);
+        let mut value_log = ValueLog::open(&value_path).unwrap();
+        let second_meta = SegmentWriter::write(
+            SegmentWriteOptions {
+                path: &second_path,
+                id: 2,
+                level: 1,
+                compression: Compression::None,
+                accelerator: &CpuAccelerator,
+                value_log: &mut value_log,
+                large_value_threshold: config.large_value_threshold,
+                block_size: config.block_size,
+                partitioned_bloom: None,
+                direct_io: false,
+            },
+            vec![head],
+        )
+        .unwrap();
+        drop(value_log);
+        fs::remove_file(value_path).unwrap();
+        assert_eq!(second_meta.entries, 1);
+        manifest.segments.push(second_meta);
+        manifest.next_segment_id = 3;
+        ManifestStore::new(manifest_path.clone())
+            .save(&manifest)
+            .unwrap();
+        let manifest =
+            Manifest::decode(&fs::read(&manifest_path).unwrap(), &manifest_path).unwrap();
+        let cut = WalCut {
+            flushed_sequence: manifest.flushed_sequence,
+            last_sequence: manifest.last_sequence,
+            flushed_wal_id: manifest.flushed_wal_id,
+            active_wal_id: manifest.active_wal_id,
+            next_wal_id: manifest.next_wal_id,
+        };
+        let (_wals, mut budget) = scan_v4_wals_with_budget(root, cut, |_, _, _, _| Ok(())).unwrap();
+        let candidate = collect_protected_segment_candidate(root, &manifest, &mut budget).unwrap();
+        assert_eq!(candidate.witnesses.len(), 2);
+        let selected = candidate
+            .rows
+            .iter()
+            .find(|row| {
+                row.source.id == 1
+                    && row.cf == "__praxor_record_catalog_v1"
+                    && row.key == [0]
+                    && row.sequence == 2
+            })
+            .unwrap();
+        let selected_witness = candidate
+            .witnesses
+            .iter()
+            .find(|witness| witness.source == selected.source)
+            .unwrap();
+        let locator = PhysicalRowLocator {
+            source: selected.source,
+            block_offset: selected.block_offset,
+            row_ordinal: selected.row_ordinal,
+        };
+        let expected = ExpectedLiteralPut {
+            cf: &selected.cf,
+            key: &selected.key,
+            sequence: selected.sequence,
+        };
+        let peer_original = fs::read(&second_path).unwrap();
+        let mut peer_mutator = fs::OpenOptions::new()
+            .write(true)
+            .open(&second_path)
+            .unwrap();
+        let balance = budget.remaining_bytes();
+        let mut work = CopyReplayWork::production();
+        with_authenticated_literal_put(
+            root,
+            &manifest,
+            selected_witness,
+            locator,
+            expected,
+            &mut work,
+            &mut budget,
+            |_| {
+                peer_mutator.seek(SeekFrom::Start(0))?;
+                peer_mutator.write_all(&[peer_original[0] ^ 1])?;
+                peer_mutator.sync_data()?;
+                Ok(())
+            },
+        )
+        .unwrap(); // Selected-row proof is explicitly provisional.
+        assert_eq!(budget.remaining_bytes(), balance);
+        let error =
+            recheck_all_copy_replay_witnesses(root, &manifest, &candidate.witnesses, &mut work)
+                .err()
+                .expect("changed peer must refuse the complete witness fence");
+        assert!(matches!(error, PraxisError::Corrupt { .. }));
+        peer_mutator.seek(SeekFrom::Start(0)).unwrap();
+        peer_mutator.write_all(&peer_original[..1]).unwrap();
+        peer_mutator.sync_data().unwrap();
+        drop(peer_mutator);
+        let fence = recheck_all_copy_replay_witnesses(
+            root,
+            &manifest,
+            &candidate.witnesses,
+            &mut CopyReplayWork::production(),
+        )
+        .unwrap();
+        assert!(fence.confirms(&candidate.witnesses));
+        assert_eq!(budget.remaining_bytes(), balance);
+        fs::remove_file(&second_path).unwrap();
+        let error = recheck_all_copy_replay_witnesses(
+            root,
+            &manifest,
+            &candidate.witnesses,
+            &mut CopyReplayWork::production(),
+        )
+        .err()
+        .expect("omitted peer must refuse the complete witness fence");
+        assert!(matches!(error, PraxisError::Corrupt { .. }));
+        candidate.discard(root, &mut budget).unwrap();
+    }
 }
 
 #[cfg(test)]

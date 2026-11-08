@@ -21,6 +21,8 @@ mod external_value;
 #[allow(dead_code)] // Private candidate; the public owner remains fenced until #75.
 mod value_witness;
 
+mod physical_copy;
+
 #[cfg(test)]
 mod frame_tests;
 #[cfg(test)]

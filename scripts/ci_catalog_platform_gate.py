@@ -28,12 +28,16 @@ JUNCTION = (
     "segment_level_junction_refuses_without_following_parked_directory"
 )
 FOCUSED = "core_catalog::segment_witness_tests::"
+LITERAL_COPY_REPLAY = "core_catalog::physical_copy::literal_comparison_tests::"
+VALUE_COPY_REPLAY = "core_catalog::value_witness::direct_replay_tests::"
 COMMON_STAGES = (
     "00-workflow-provenance", "00-parser-selftests", "01-rustc-version",
     "02-cargo-version", "03-pwsh-version", "04-vendor", "05-format",
     "06-check", "07-clippy", "08-lib-list", "09-native",
 )
 TAIL_STAGES = (
+    "10a-copy-list", "10a-copy-ignored-list", "10a-copy-run",
+    "10b-value-list", "10b-value-ignored-list", "10b-value-run",
     "11-focused-list", "12-focused-ignored-list", "13-focused-run",
     "14-full-list", "15-full-ignored-list", "16-full-run",
     "17-storage-slog", "18-storage-boundary",
@@ -132,6 +136,31 @@ def main() -> None:
             [library_path, junction_path],
         )
 
+    def scoped_replay_suite(name: str, stage: str, prefix: str) -> dict:
+        listed_path = run(
+            f"{stage}-list", "cargo", "test", "--locked", "--jobs", "2",
+            "--lib", prefix, "--", "--list",
+        )
+        ignored_path = run(
+            f"{stage}-ignored-list", "cargo", "test", "--locked", "--jobs", "2",
+            "--lib", prefix, "--", "--list", "--ignored",
+        )
+        run_path = run(
+            f"{stage}-run", "cargo", "test", "--locked", "--jobs", "2",
+            "--lib", prefix, "--", "--test-threads", "1",
+        )
+        return evidence(
+            name,
+            verify_suite(
+                inventory(listed_path), inventory(ignored_path), results(run_path),
+                reference=library, prefix=prefix,
+            ),
+            [library_path, listed_path, ignored_path, run_path],
+        )
+
+    literal_copy = scoped_replay_suite("literal-copy", "10a-copy", LITERAL_COPY_REPLAY)
+    value_copy = scoped_replay_suite("value-copy", "10b-value", VALUE_COPY_REPLAY)
+
     focused_path = run(
         "11-focused-list", "cargo", "test", "--locked", "--jobs", "2", "--lib",
         FOCUSED, "--", "--list",
@@ -172,7 +201,10 @@ def main() -> None:
     run("17-storage-slog", "pwsh", "-NoProfile", "-File", "scripts/verify_slog_storage.ps1")
     run("18-storage-boundary", "pwsh", "-NoProfile", "-File", "scripts/verify_storage_boundary.ps1")
 
-    expected_evidence = ["native.evidence.json", "focused.evidence.json", "full.evidence.json"]
+    expected_evidence = [
+        "native.evidence.json", "literal-copy.evidence.json",
+        "value-copy.evidence.json", "focused.evidence.json", "full.evidence.json",
+    ]
     if args.platform == "windows":
         expected_evidence.append("junction.evidence.json")
     for name in expected_evidence:
@@ -186,6 +218,8 @@ def main() -> None:
             "stages": gate.stages,
             "native": native,
             "junction": junction,
+            "literal_copy": {key: value for key, value in literal_copy.items() if key != "groups"},
+            "value_copy": {key: value for key, value in value_copy.items() if key != "groups"},
             "focused": {key: value for key, value in focused.items() if key != "groups"},
             "full": {key: value for key, value in full.items() if key != "groups"},
             "qualification": "requires independent raw-artifact and current-head CI review",
